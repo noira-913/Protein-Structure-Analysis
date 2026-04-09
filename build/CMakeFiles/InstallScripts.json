@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/cmake_install.cmake",
+		"C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/_deps/pybind11-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

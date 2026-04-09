@@ -1,0 +1,6 @@
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/CMakeFiles/protein_physics.dir
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/CMakeFiles/example.dir
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/CMakeFiles/edit_cache.dir
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/CMakeFiles/rebuild_cache.dir
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/_deps/pybind11-build/CMakeFiles/edit_cache.dir
+C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build/_deps/pybind11-build/CMakeFiles/rebuild_cache.dir

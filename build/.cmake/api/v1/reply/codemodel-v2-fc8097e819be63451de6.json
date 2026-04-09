@@ -1,0 +1,228 @@
+{
+	"configurations" : 
+	[
+		{
+			"abstractTargets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "Git::Git::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-Git__Git-Release-d5536010447255f7cc1b.json",
+					"name" : "Git::Git",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "OpenMP::OpenMP_CXX::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-OpenMP__OpenMP_CXX-Release-d166bf9b0d5cb9c8d1a1.json",
+					"name" : "OpenMP::OpenMP_CXX",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::_ClassicPythonLibraries::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11___ClassicPythonLibraries-Release-7b0da90149c839cd2299.json",
+					"name" : "pybind11::_ClassicPythonLibraries",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::embed::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__embed-Release-30fa356feef15046f21a.json",
+					"name" : "pybind11::embed",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::lto::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__lto-Release-297e795bc49569a6d05e.json",
+					"name" : "pybind11::lto",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::module::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__module-Release-7cfe6c42715a701a5756.json",
+					"name" : "pybind11::module",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::opt_size::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__opt_size-Release-6df50bbb2715f5474d77.json",
+					"name" : "pybind11::opt_size",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::pybind11::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__pybind11-Release-8b80e0278d89531aa63f.json",
+					"name" : "pybind11::pybind11",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::python_headers::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__python_headers-Release-f785307d1304982cdb07.json",
+					"name" : "pybind11::python_headers",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::python_link_helper::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__python_link_helper-Release-eb195fe0db3d20efc11b.json",
+					"name" : "pybind11::python_link_helper",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::thin_lto::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__thin_lto-Release-ec7e47e05bb8c7387c1b.json",
+					"name" : "pybind11::thin_lto",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11::windows_extras::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11__windows_extras-Release-61bf7074d9ce2fd0ad01.json",
+					"name" : "pybind11::windows_extras",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "pybind11_headers::@1ce1e7db1c911fd22b77",
+					"jsonFile" : "target-pybind11_headers-Release-1a0ab4c79314d97f3766.json",
+					"name" : "pybind11_headers",
+					"projectIndex" : 1
+				}
+			],
+			"directories" : 
+			[
+				{
+					"abstractTargetIndexes" : 
+					[
+						0,
+						1
+					],
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1
+					],
+					"jsonFile" : "directory-.-Release-f040eec181a89de70dbe.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.18"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"abstractTargetIndexes" : 
+					[
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10,
+						11,
+						12
+					],
+					"build" : "_deps/pybind11-build",
+					"jsonFile" : "directory-_deps.pybind11-build-Release-ea3ca004fb19d64e6e53.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.5"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 1,
+					"source" : "build/_deps/pybind11-src"
+				}
+			],
+			"name" : "Release",
+			"projects" : 
+			[
+				{
+					"abstractTargetIndexes" : 
+					[
+						0,
+						1
+					],
+					"childIndexes" : 
+					[
+						1
+					],
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "protein_physics_project",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"abstractTargetIndexes" : 
+					[
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10,
+						11,
+						12
+					],
+					"directoryIndexes" : 
+					[
+						1
+					],
+					"name" : "pybind11",
+					"parentIndex" : 0
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "example::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-example-Release-667dc1998cb2a2d356d6.json",
+					"name" : "example",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "protein_physics::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-protein_physics-Release-fd8a3e61e1cd19c526f6.json",
+					"name" : "protein_physics",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing/build",
+		"source" : "C:/Users/jgi01/Documents/ALMA/Protein Structure Analysis - local computing"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 10
+	}
+}
