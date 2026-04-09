@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: protein_physics
+Version: 0.2.0
+Summary: Implicit-solvent protein physics engine with OpenMP acceleration
+Author: 
+Requires-Python: >=3.8
+Requires-Dist: pybind11>=2.10
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
