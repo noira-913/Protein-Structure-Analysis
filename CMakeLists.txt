@@ -34,7 +34,7 @@ find_package(OpenMP)
 
 # ── 타겟 1: 핵심 물리 엔진 ──────────────────
 # ▶ 수정: main.cpp 제거 — main.cpp는 'example' 모듈로 심볼 충돌 발생
-pybind11_add_module(protein_physics physics_engine.cpp)
+pybind11_add_module(protein_physics src/physics_engine.cpp)
 
 if(OpenMP_CXX_FOUND)
   target_link_libraries(protein_physics PRIVATE OpenMP::OpenMP_CXX)
@@ -44,5 +44,5 @@ else()
 endif()
 
 # ── 타겟 2: pybind11 예제 (별도 모듈) ────────
-pybind11_add_module(example main.cpp)
+pybind11_add_module(example src/main.cpp)
 message(STATUS "example module (main.cpp) separate build")

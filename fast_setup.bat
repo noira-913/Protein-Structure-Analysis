@@ -7,5 +7,5 @@ echo [2/3] C++ 물리 엔진 빌드 중 (MSVC 컴파일러 필요)...
 python setup.py build_ext --inplace
 
 echo [3/3] 프로그램 실행...
-python gui_main.py
+python python/gui_main.py
 pause

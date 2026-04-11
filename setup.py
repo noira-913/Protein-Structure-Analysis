@@ -58,7 +58,7 @@ else:
 
 ext = Pybind11Extension(
     "protein_physics",
-    sources=["physics_engine.cpp"],
+    sources=["src/physics_engine.cpp"],
     extra_compile_args=extra_compile,
     extra_link_args=extra_link,
 )
