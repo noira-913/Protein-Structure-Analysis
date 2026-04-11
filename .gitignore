@@ -3,14 +3,16 @@ build/
 dist/
 *.egg-info/
 
-# Compiled Python / C extensions
+# Compiled extensions (built inplace by setup.py)
 *.pyc
 *.pyo
 __pycache__/
 *.so
+*.pyd
 
-# Downloaded PDB files (fetched at runtime)
+# Downloaded structure files (fetched at runtime, not committed)
 *.ent
+data/*.pdb
 
 # CMake
 CMakeCache.txt
@@ -20,7 +22,6 @@ compile_commands.json
 build.ninja
 
 # Editor / OS
-.vscode/
 .idea/
 *.DS_Store
 Thumbs.db

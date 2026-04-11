@@ -1,22 +1,26 @@
 """
-pip install -e .          # 개발 모드
-pip install .             # 일반 설치
+pip install -e .          # dev mode (CPU only)
+pip install .             # normal install (CPU only)
+python setup.py build_ext --inplace   # builds both CPU and GPU if CUDA found
 
-환경별 자동 감지:
-  - OpenMP 있으면 멀티코어 병렬화
-  - 없으면 단일 스레드 폴백 (LG 그램 등)
+Auto-detection:
+  - OpenMP   -> multi-core CPU parallelism
+  - CUDA     -> GPU-accelerated engine (protein_physics_cuda)
 """
 
 import sys
 import os
+import glob
+import shutil
+import sysconfig
 import subprocess
 import tempfile
-from setuptools import setup, Extension
+from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 
+# ── OpenMP detection ─────────────────────────────────────────────
 def has_openmp() -> bool:
-    #OpenMP 지원 여부를 컴파일 테스트로 확인
     test_src = "#include <omp.h>\nint main(){return omp_get_max_threads();}\n"
     flag = "/openmp" if sys.platform == "win32" else "-fopenmp"
     try:
@@ -24,7 +28,8 @@ def has_openmp() -> bool:
             f.write(test_src)
             fname = f.name
         ret = subprocess.run(
-            ["c++", flag, fname, "-o", os.devnull],
+            ["cl", flag, fname, "/Fe" + os.devnull] if sys.platform == "win32"
+            else ["c++", flag, fname, "-o", os.devnull],
             capture_output=True, timeout=10
         )
         return ret.returncode == 0
@@ -37,7 +42,111 @@ def has_openmp() -> bool:
             pass
 
 
-# ── 컴파일 플래그 ────────────────────────────
+# ── CUDA detection ───────────────────────────────────────────────
+def find_cuda():
+    """Return (cuda_home, nvcc_path) or (None, None)."""
+    # 1. Environment variables set by the CUDA installer
+    cuda_home = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
+
+    # 2. Standard Windows install locations
+    if not cuda_home:
+        candidates = glob.glob(
+            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*")
+        if candidates:
+            cuda_home = sorted(candidates)[-1]
+
+    # 3. nvcc on PATH -> infer cuda_home
+    if not cuda_home:
+        nvcc_on_path = shutil.which("nvcc")
+        if nvcc_on_path:
+            cuda_home = os.path.dirname(os.path.dirname(nvcc_on_path))
+
+    if not cuda_home or not os.path.isdir(cuda_home):
+        return None, None
+
+    nvcc_name = "nvcc.exe" if sys.platform == "win32" else "nvcc"
+    nvcc = os.path.join(cuda_home, "bin", nvcc_name)
+    return (cuda_home, nvcc) if os.path.exists(nvcc) else (None, None)
+
+
+# ── MSVC cl.exe detection (needed by nvcc as host compiler) ──────
+def find_cl_exe():
+    """Return the directory containing cl.exe, or None if not found."""
+    if shutil.which("cl"):
+        return None  # already on PATH, no action needed
+
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        r"Microsoft Visual Studio\Installer\vswhere.exe",
+    )
+    if not os.path.exists(vswhere):
+        return None
+    try:
+        result = subprocess.run(
+            [vswhere, "-latest", "-products", "*",
+             "-requires", "Microsoft.VisualCpp.Build.Tools",
+             "-find", r"VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        if lines:
+            return os.path.dirname(lines[-1])  # directory of cl.exe
+    except Exception:
+        pass
+    return None
+
+
+# ── Build CUDA extension via nvcc subprocess ─────────────────────
+def build_cuda_extension(cuda_home, nvcc):
+    """
+    Compile protein_physics_cuda using nvcc directly (bypasses setuptools).
+    Returns True on success.
+    """
+    import pybind11
+
+    py_include  = sysconfig.get_path("include")
+    pb11_include = pybind11.get_include()
+    cuda_include = os.path.join(cuda_home, "include")
+
+    # Output filename must match Python's extension suffix
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+    output = f"protein_physics_cuda{ext_suffix}"
+
+    is_win = sys.platform == "win32"
+    cuda_lib = os.path.join(cuda_home, "lib", "x64" if is_win else "../lib64")
+    host_opts = "/MD /O2 /EHsc /D_USE_MATH_DEFINES" if is_win else "-fPIC"
+    compiler_flag = "--compiler-options" if is_win else "-Xcompiler"
+
+    cmd = [
+        nvcc, "-O2",
+        compiler_flag, host_opts,
+        f"-I{py_include}", f"-I{pb11_include}", f"-I{cuda_include}",
+        "--shared",
+        "src/physics_engine_cuda.cu",
+        "-o", output,
+        f"-L{cuda_lib}", "-lcudart",
+    ]
+    if is_win:
+        py_ver = f"python{sys.version_info.major}{sys.version_info.minor}"
+        cmd.append(os.path.join(sys.prefix, "libs", f"{py_ver}.lib"))
+
+    # Ensure cl.exe is on PATH for nvcc's host compiler
+    env = os.environ.copy()
+    cl_dir = find_cl_exe()
+    if cl_dir:
+        env["PATH"] = cl_dir + os.pathsep + env.get("PATH", "")
+        print(f"  cl.exe found at: {cl_dir}")
+
+    print(f"Building CUDA extension: {output}")
+    ret = subprocess.run(cmd, capture_output=False, env=env)
+    if ret.returncode != 0:
+        print("CUDA build failed — GPU backend will not be available.")
+        return False
+    print(f"CUDA extension built: {output}")
+    return True
+
+
+# ── Compile flags ────────────────────────────────────────────────
 if sys.platform == "win32":
     extra_compile = ["/O2", "/arch:AVX2"]
     extra_link    = []
@@ -51,25 +160,41 @@ openmp_available = has_openmp()
 if openmp_available:
     extra_compile.append(omp_flag)
     extra_link.append(omp_flag)
-    print("OpenMP detected -> multi-core  build enabled")
+    print("OpenMP detected -> multi-core CPU build enabled")
 else:
-    print("OpenMP undetected -> single-thread build enabled")
+    print("OpenMP undetected -> single-thread CPU build")
+
+cuda_home, nvcc = find_cuda()
+if cuda_home:
+    print(f"CUDA detected at: {cuda_home}")
+else:
+    print("CUDA not found -> GPU backend will not be built")
 
 
-ext = Pybind11Extension(
+# ── CPU extension ────────────────────────────────────────────────
+cpu_ext = Pybind11Extension(
     "protein_physics",
     sources=["src/physics_engine.cpp"],
     extra_compile_args=extra_compile,
     extra_link_args=extra_link,
 )
 
+
+# ── Custom build_ext: builds CPU via setuptools, CUDA via nvcc ───
+class CustomBuildExt(build_ext):
+    def run(self):
+        super().run()
+        if cuda_home and nvcc:
+            build_cuda_extension(cuda_home, nvcc)
+
+
 setup(
     name="protein_physics",
     version="0.2.0",
     author="",
-    description="Implicit-solvent protein physics engine with OpenMP acceleration",
-    ext_modules=[ext],
-    cmdclass={"build_ext": build_ext},
+    description="Implicit-solvent protein physics engine (CPU + optional GPU)",
+    ext_modules=[cpu_ext],
+    cmdclass={"build_ext": CustomBuildExt},
     python_requires=">=3.8",
     install_requires=["pybind11>=2.10"],
 )

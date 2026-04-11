@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.18)
-project(protein_physics_project LANGUAGES CXX)
+
+# Enable CUDA only if the toolkit is present
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  project(protein_physics_project LANGUAGES CXX CUDA)
+  set(CUDA_AVAILABLE TRUE)
+else()
+  project(protein_physics_project LANGUAGES CXX)
+  set(CUDA_AVAILABLE FALSE)
+  message(STATUS "CUDA not found -> GPU target skipped")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,6 +54,31 @@ else()
   message(STATUS "OpenMP undetected -> single-thread build")
 endif()
 
-# ── 타겟 2: pybind11 예제 (별도 모듈) ────────
+# ── Target 2: GPU physics engine (optional) ─────────────────────
+if(CUDA_AVAILABLE)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+  pybind11_add_module(protein_physics_cuda src/physics_engine_cuda.cu)
+
+  # Pass CUDA arch for the installed GPU (sm_75 = Turing, sm_86 = Ampere, sm_89 = Ada)
+  # Falls back to a broad virtual arch if not set
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75;86;89")
+  endif()
+
+  set_target_properties(protein_physics_cuda PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+  )
+
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(protein_physics_cuda PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+
+  target_link_libraries(protein_physics_cuda PRIVATE CUDA::cudart)
+  message(STATUS "CUDA enabled -> protein_physics_cuda target added")
+endif()
+
+# ── Target 3: pybind11 example (separate module) ─────────────────
 pybind11_add_module(example src/main.cpp)
 message(STATUS "example module (main.cpp) separate build")
