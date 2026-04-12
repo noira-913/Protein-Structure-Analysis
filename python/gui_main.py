@@ -1,13 +1,15 @@
-import sys, os, requests, traceback
+import sys, os, requests, traceback, tempfile
 import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QMessageBox, QFrame,
     QProgressBar, QSplitter, QGridLayout,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtCore import QUrl
 from Bio.PDB import PDBParser, PDBList
 import protein_physics
 
@@ -327,6 +329,8 @@ class ProteinApp(QMainWindow):
 
         self._ensemble = []
         self._energies = []
+        self._view_mode = "layered"       # "layered" | "sidebyside"
+        self._current_cand_idx = 0
         self._build_ui()
         self.setStyleSheet(STYLE)
 
@@ -430,18 +434,35 @@ class ProteinApp(QMainWindow):
         viewer_v.setSpacing(0)
 
         viewer_header = QWidget()
-        viewer_header.setFixedHeight(32)
+        viewer_header.setFixedHeight(36)
         vh_layout = QHBoxLayout(viewer_header)
         vh_layout.setContentsMargins(12,0,12,0)
+        vh_layout.setSpacing(8)
         viewer_title = QLabel("3D STRUCTURE VIEWER")
         viewer_title.setStyleSheet("color:#64748b;font-size:10px;letter-spacing:2px;")
         vh_layout.addWidget(viewer_title)
         vh_layout.addStretch()
+        # Centre label — updated whenever a candidate is selected
+        self.viewer_cand_lbl = QLabel("")
+        self.viewer_cand_lbl.setStyleSheet("font-size:10px;letter-spacing:1px;")
+        self.viewer_cand_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vh_layout.addWidget(self.viewer_cand_lbl)
+        vh_layout.addStretch()
+        self.view_mode_btn = QPushButton("◧  SIDE-BY-SIDE")
+        self.view_mode_btn.setObjectName("sec-btn")
+        self.view_mode_btn.clicked.connect(self._toggle_view_mode)
+        self.view_mode_btn.setFixedHeight(24)
+        vh_layout.addWidget(self.view_mode_btn)
         self._candidate_btns = []
         viewer_v.addWidget(viewer_header)
 
         self.web = QWebEngineView()
         self.web.setStyleSheet("border:none;")
+        # Allow local temp-file pages to load 3Dmol.js from the CDN
+        self.web.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        self.web.loadFinished.connect(self._on_load_finished)
+        self._html_tmpfile = os.path.join(tempfile.gettempdir(), "alma_viewer.html")
         self._render_empty()
         viewer_v.addWidget(self.web)
 
@@ -451,6 +472,15 @@ class ProteinApp(QMainWindow):
         self.ebar_widget.setVisible(False)
         ebar_layout = QHBoxLayout(self.ebar_widget)
         ebar_layout.setContentsMargins(12,4,12,4)
+        ebar_layout.setSpacing(6)
+        # Permanent legend label — text is filled in by _build_candidate_bar
+        self.ebar_legend_lbl = QLabel("")
+        self.ebar_legend_lbl.setStyleSheet("font-size:9px;")
+        ebar_layout.addWidget(self.ebar_legend_lbl)
+        ebar_vsep = QFrame()
+        ebar_vsep.setFrameShape(QFrame.Shape.VLine)
+        ebar_vsep.setStyleSheet("color:#e2e8f0;")
+        ebar_layout.addWidget(ebar_vsep)
         self.ebar_labels = []
         viewer_v.addWidget(self.ebar_widget)
 
@@ -505,7 +535,7 @@ class ProteinApp(QMainWindow):
         self._log("─" * 36)
 
         self._build_candidate_bar(energies, best_idx)
-        self._render(ensemble[best_idx], best_idx)
+        self._render(best_idx)
 
     def _on_error(self, msg):
         self.run_btn.setEnabled(True)
@@ -517,10 +547,19 @@ class ProteinApp(QMainWindow):
     def _show_best(self):
         if not self._ensemble: return
         best_idx = int(np.argmin(self._energies))
-        self._render(self._ensemble[best_idx], best_idx)
+        self._render(best_idx)
 
     def _log(self, msg):
         self.log.append(msg)
+
+    def _on_load_finished(self, ok):
+        self._log(f"[WEB] loadFinished → {'OK' if ok else 'FAILED'}")
+
+    def _set_html(self, html):
+        """Write HTML to a temp file and load via setUrl — avoids setHtml's 2MB data: URL limit."""
+        with open(self._html_tmpfile, "w", encoding="utf-8") as f:
+            f.write(html)
+        self.web.setUrl(QUrl.fromLocalFile(self._html_tmpfile))
 
     # ── Candidate energy bar ──────────────────
 
@@ -532,6 +571,19 @@ class ProteinApp(QMainWindow):
 
         e_min, e_max = min(energies), max(energies)
         e_range = max(abs(e_max - e_min), 1.0)
+
+        # Build the best-colour (green) and worst-colour (red) for the legend
+        best_col  = f"#{22:02x}{163:02x}{74:02x}"          # #16a34a  (lowest energy)
+        worst_col = f"#{min(22+210,255):02x}{max(163-120,0):02x}{0:02x}"  # #dc2b00 (highest energy)
+        self.ebar_legend_lbl.setText(
+            f'<span style="color:{best_col}">■</span>'
+            f' LOWEST ENERGY (BEST) &nbsp;·····&nbsp; '
+            f'<span style="color:{worst_col}">■</span>'
+            f' HIGHEST ENERGY (WORST) &nbsp;&nbsp;'
+            f'<span style="color:#94a3b8">'
+            f'{e_min:.0f} → {e_max:.0f} kcal/mol'
+            f'</span>'
+        )
 
         for i, e in enumerate(energies):
             norm = (e - e_min) / e_range   # 0=best, 1=worst
@@ -552,7 +604,7 @@ class ProteinApp(QMainWindow):
                     f"border:1.5px solid {color};border-radius:3px;"
                     f"font-size:10px;padding:4px 10px;")
             idx = i
-            btn.clicked.connect(lambda _, ii=idx: self._render(self._ensemble[ii], ii))
+            btn.clicked.connect(lambda _, ii=idx: self._render(ii))
             layout.addWidget(btn)
             self._candidate_btns.append(btn)
         layout.addStretch()
@@ -571,72 +623,133 @@ class ProteinApp(QMainWindow):
   </div>
 </body></html>""")
 
-    def _render(self, particles, cand_idx=0):
-        # Compute per-atom deviation from best structure
-        deviations = None
-        is_best = True
-        if self._ensemble and len(self._energies) > 1:
-            best_idx = int(np.argmin(self._energies))
-            is_best = (cand_idx == best_idx)
-            if not is_best:
-                ref = self._ensemble[best_idx]
-                if len(ref) == len(particles):
-                    devs = [
-                        ((p.x - r.x)**2 + (p.y - r.y)**2 + (p.z - r.z)**2) ** 0.5
-                        for p, r in zip(particles, ref)
-                    ]
-                    max_dev = max(devs) if max(devs) > 0 else 1.0
-                    # Store (1 - normalized) so rwb gradient gives:
-                    #   blue = low deviation (similar to best)
-                    #   red  = high deviation (differs from best)
-                    deviations = [1.0 - (d / max_dev) for d in devs]
+    def _toggle_view_mode(self):
+        if self._view_mode == "layered":
+            self._view_mode = "sidebyside"
+            self.view_mode_btn.setText("⊞  LAYERED")
+        else:
+            self._view_mode = "layered"
+            self.view_mode_btn.setText("◧  SIDE-BY-SIDE")
+        if self._ensemble:
+            self._render(self._current_cand_idx)
 
-        # Build PDB with deviation encoded in B-factor column
+    def _build_pdb_str(self, particles):
         lines = []
         for i, p in enumerate(particles):
-            bf = deviations[i] if deviations is not None else 0.5
             lines.append(
                 f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
-                f"{p.x:8.3f}{p.y:8.3f}{p.z:8.3f}  1.00{bf:6.2f}           C")
-        pdb = "\n".join(lines)
-
-        energy_str = ""
-        if cand_idx < len(self._energies):
-            energy_str = f" &nbsp;·&nbsp; {self._energies[cand_idx]:.1f} kcal/mol"
-
-        if deviations is not None:
-            # Comparison candidate: light/washed-out colors (low opacity)
-            # so it reads as clearly secondary against the white background
-            style_js = (
-                'v.setStyle({},{'
-                '"cartoon":{"colorscheme":{"prop":"b","gradient":"rwb","min":0,"max":1},"thickness":0.5,"opacity":0.28},'
-                '"sphere":{"colorscheme":{"prop":"b","gradient":"rwb","min":0,"max":1},"radius":0.5,"opacity":0.22}'
-                '});'
+                f"{p.x:8.3f}{p.y:8.3f}{p.z:8.3f}  1.00  0.50           C"
             )
+        return "\n".join(lines)
+
+    def _update_candidate_bar_selection(self, active_idx):
+        if not self._candidate_btns or not self._energies:
+            return
+        best_idx = int(np.argmin(self._energies))
+        n = len(self._energies)
+
+        # Update the centre title label in the viewer header
+        if active_idx < n:
+            e = self._energies[active_idx]
+            if active_idx == best_idx:
+                tag_html = '&nbsp;&nbsp;<span style="color:#16a34a;font-weight:bold;">★ BEST</span>'
+            else:
+                tag_html = f'&nbsp;&nbsp;<span style="color:#94a3b8;">(best: C{best_idx+1})</span>'
+            self.viewer_cand_lbl.setText(
+                f'<b>CANDIDATE {active_idx+1} / {n}</b>'
+                f'&nbsp;&nbsp;·&nbsp;&nbsp;{e:.1f} kcal/mol{tag_html}'
+            )
+
+        e_min, e_max = min(self._energies), max(self._energies)
+        e_range = max(abs(e_max - e_min), 1.0)
+        for i, btn in enumerate(self._candidate_btns):
+            if i >= len(self._energies):
+                break
+            norm = (self._energies[i] - e_min) / e_range
+            r = int(22 + 210 * norm)
+            g = int(163 - 120 * norm)
+            bv = int(74 * (1 - norm))
+            col = f"#{r:02x}{g:02x}{bv:02x}"
+            is_best   = (i == best_idx)
+            is_active = (i == active_idx)
+            if is_best and is_active:
+                btn.setStyleSheet(
+                    f"background:{col};color:#fff;border:2px solid #fff;"
+                    f"border-radius:3px;font-size:10px;font-weight:bold;padding:4px 10px;")
+            elif is_best:
+                btn.setStyleSheet(
+                    f"background:{col};color:#fff;border:none;"
+                    f"border-radius:3px;font-size:10px;font-weight:bold;padding:4px 10px;")
+            elif is_active:
+                btn.setStyleSheet(
+                    f"background:#eff6ff;color:{col};border:2px solid {col};"
+                    f"border-radius:3px;font-size:10px;font-weight:bold;padding:4px 10px;")
+            else:
+                btn.setStyleSheet(
+                    f"background:#ffffff;color:{col};border:1.5px solid {col};"
+                    f"border-radius:3px;font-size:10px;padding:4px 10px;")
+
+    def _render(self, cand_idx=0):
+        self._log(f"[RENDER] mode={self._view_mode}  cand={cand_idx}  "
+                  f"ensemble={len(self._ensemble)}  energies={len(self._energies)}")
+        self._current_cand_idx = cand_idx
+        if self._energies:
+            self._update_candidate_bar_selection(cand_idx)
+        if not self._ensemble:
+            self._log("[RENDER] ensemble empty — aborting")
+            return
+        try:
+            if self._view_mode == "sidebyside":
+                self._render_sidebyside(cand_idx)
+            else:
+                self._render_layered(cand_idx)
+        except Exception as ex:
+            self._log(f"[RENDER ERROR] {ex}\n{traceback.format_exc()}")
+
+    def _render_layered(self, selected_idx):
+        self._log(f"[LAYERED] entry  selected_idx={selected_idx}  "
+                  f"ensemble_len={len(self._ensemble)}")
+        best_idx = int(np.argmin(self._energies))
+        best_particles = self._ensemble[best_idx]
+        n_atoms = len(best_particles)
+        self._log(f"[LAYERED] best_idx={best_idx}  n_atoms={n_atoms}")
+
+        pdb_best = self._build_pdb_str(best_particles)
+        self._log(f"[LAYERED] pdb_best size={len(pdb_best.encode())} bytes")
+        best_e = (f"{self._energies[best_idx]:.1f} kcal/mol"
+                  if best_idx < len(self._energies) else "")
+        sel_e  = (f"{self._energies[selected_idx]:.1f} kcal/mol"
+                  if selected_idx < len(self._energies) else "")
+
+        best_model_js = (
+            f'  var mBest=v.addModel(`{pdb_best}`,"pdb");\n'
+            f'  mBest.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});'
+        )
+
+        if selected_idx != best_idx:
+            pdb_sel = self._build_pdb_str(self._ensemble[selected_idx])
+            self._log(f"[LAYERED] pdb_sel size={len(pdb_sel.encode())} bytes")
+            sel_model_js = (
+                f'  var mSel=v.addModel(`{pdb_sel}`,"pdb");\n'
+                f'  mSel.setStyle({{}},{{cartoon:{{color:"#0891b2",thickness:0.6,opacity:0.65}},sphere:{{color:"#0891b2",radius:0.50,opacity:0.60}}}});'
+            )
+            label = (f"LAYERED &nbsp; C{selected_idx+1} ({sel_e})"
+                     f" &nbsp;over&nbsp; C{best_idx+1} BEST ({best_e})")
             legend_html = (
                 '<div id="legend">'
-                'DEVIATION FROM BEST &nbsp;'
-                '<span style="color:#93c5fd">&#9632;</span> SIMILAR &nbsp;'
-                '<span style="color:#fca5a5">&#9632;</span> DIVERGES'
+                'OVERLAY &nbsp; '
+                '<span style="color:#1d4ed8">&#9632;</span> BEST &nbsp;'
+                '<span style="color:#0891b2">&#9632;</span> SELECTED'
                 '</div>'
             )
-            label = f"CANDIDATE {cand_idx+1:02d}"
         else:
-            # Best candidate: deep, saturated colors — prominent on the white background
-            style_js = (
-                'v.setStyle({},{'
-                '"cartoon":{"color":"spectrum","thickness":0.8,"opacity":1.0},'
-                '"sphere":{"color":"spectrum","radius":0.55,"opacity":1.0}'
-                '});'
-            )
+            sel_model_js = ""
+            label = f"&#9733; BEST &nbsp; C{best_idx+1} &nbsp;&middot;&nbsp; {best_e}"
             legend_html = (
                 '<div id="legend">'
-                'BEST CANDIDATE &nbsp;'
-                '<span style="color:#7c3aed">&#9632;</span>&rarr;'
-                '<span style="color:#b91c1c">&#9632;</span> N&rarr;C TERMINUS'
+                '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
                 '</div>'
             )
-            label = f"&#9733; BEST &nbsp; C{cand_idx+1}"
 
         html = f"""<!DOCTYPE html><html><head>
 <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
@@ -661,20 +774,147 @@ class ProteinApp(QMainWindow):
 </style>
 </head><body>
 <div id="v"></div>
-<div id="info">{label} &nbsp;·&nbsp; {len(particles)} ATOMS{energy_str}</div>
+<div id="info">{label} &nbsp;&middot;&nbsp; {n_atoms} ATOMS</div>
 {legend_html}
 <script>
 (function(){{
-  const v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
-  v.addModel(`{pdb}`,"pdb");
-  {style_js}
-  v.zoomTo();
-  v.zoom(0.85);
-  v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }}, 50);
+  var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
+{best_model_js}
+{sel_model_js}
+  v.zoomTo(); v.zoom(0.85); v.render();
+  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
 }})();
 </script></body></html>"""
-        self.web.setHtml(html)
+        html_bytes = len(html.encode())
+        self._log(f"[LAYERED] html size={html_bytes} bytes "
+                  f"({'OVER' if html_bytes > 2_000_000 else 'under'} 2MB limit)")
+        self._set_html(html)
+        self._log("[LAYERED] setUrl called")
+
+    def _render_sidebyside(self, selected_idx):
+        self._log(f"[SBS] entry  selected_idx={selected_idx}  "
+                  f"ensemble_len={len(self._ensemble)}")
+        best_idx = int(np.argmin(self._energies))
+        best_particles = self._ensemble[best_idx]
+        sel_particles  = self._ensemble[selected_idx]
+        n_atoms = len(best_particles)
+        self._log(f"[SBS] best_idx={best_idx}  n_atoms={n_atoms}")
+
+        pdb_best = self._build_pdb_str(best_particles)
+        self._log(f"[SBS] pdb_best size={len(pdb_best.encode())} bytes")
+        best_e = (f"{self._energies[best_idx]:.1f} kcal/mol"
+                  if best_idx < len(self._energies) else "")
+        sel_e  = (f"{self._energies[selected_idx]:.1f} kcal/mol"
+                  if selected_idx < len(self._energies) else "")
+
+        # Left panel: always the best candidate (deep blue)
+        left_model_js = (
+            f'  var mL=vL.addModel(`{pdb_best}`,"pdb");\n'
+            f'  mL.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});'
+        )
+
+        # Right panel: split into two separate models — similar atoms (grey)
+        # and differing atoms (orange) — using model.setStyle, which is the
+        # correct 3Dmol API (vR.setStyle({resi:[...]}, ...) is unreliable).
+        if selected_idx != best_idx and len(sel_particles) == len(best_particles):
+            devs = [
+                ((p.x - r.x)**2 + (p.y - r.y)**2 + (p.z - r.z)**2) ** 0.5
+                for p, r in zip(sel_particles, best_particles)
+            ]
+            max_dev   = max(devs) if max(devs) > 0 else 1.0
+            threshold = max_dev * 0.3
+            sim_lines, diff_lines = [], []
+            for i, p in enumerate(sel_particles):
+                line = (f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
+                        f"{p.x:8.3f}{p.y:8.3f}{p.z:8.3f}  1.00  0.50           C")
+                (diff_lines if devs[i] > threshold else sim_lines).append(line)
+            pdb_sim  = "\n".join(sim_lines)
+            pdb_diff = "\n".join(diff_lines)
+            n_diff   = len(diff_lines)
+            right_parts = []
+            if sim_lines:
+                right_parts.append(
+                    f'  var mSim=vR.addModel(`{pdb_sim}`,"pdb");\n'
+                    f'  mSim.setStyle({{}},{{cartoon:{{color:"#374151",thickness:0.55,opacity:0.8}},sphere:{{color:"#374151",radius:0.45,opacity:0.75}}}});'
+                )
+            if diff_lines:
+                right_parts.append(
+                    f'  var mDiff=vR.addModel(`{pdb_diff}`,"pdb");\n'
+                    f'  mDiff.setStyle({{}},{{cartoon:{{color:"#f97316",thickness:0.75,opacity:1.0}},sphere:{{color:"#f97316",radius:0.62,opacity:1.0}}}});'
+                )
+            right_model_js = "\n".join(right_parts)
+            right_info   = f"C{selected_idx+1} &nbsp;&middot;&nbsp; {sel_e} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
+            right_legend = (
+                f'<span style="color:#374151">&#9632;</span> SIMILAR &nbsp;'
+                f'<span style="color:#f97316">&#9632;</span> DIFFERS FROM BEST ({n_diff} atoms)'
+            )
+        else:
+            right_model_js = (
+                f'  var mR=vR.addModel(`{pdb_best}`,"pdb");\n'
+                f'  mR.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});'
+            )
+            right_info   = f"&#9733; C{best_idx+1} (BEST) &nbsp;&middot;&nbsp; {best_e} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
+            right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
+  .vpane {{ flex:1;position:relative;height:100%; }}
+  .divider {{ width:2px;background:#e2e8f0;flex-shrink:0; }}
+  .info {{
+    position:absolute;top:12px;left:12px;
+    font-family:monospace;font-size:11px;letter-spacing:1px;
+    color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.9);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;z-index:10;
+  }}
+  .legend {{
+    position:absolute;bottom:12px;left:12px;
+    font-family:monospace;font-size:10px;letter-spacing:1px;
+    color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.9);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;z-index:10;
+  }}
+  .pane-lbl {{
+    position:absolute;top:12px;right:12px;
+    font-family:monospace;font-size:9px;letter-spacing:2px;
+    color:#94a3b8;pointer-events:none;z-index:10;
+  }}
+</style>
+</head><body>
+<div class="vpane">
+  <div id="vL" style="width:100%;height:100%;"></div>
+  <div class="info">&#9733; C{best_idx+1} (BEST) &nbsp;&middot;&nbsp; {best_e} &nbsp;&middot;&nbsp; {n_atoms} ATOMS</div>
+  <div class="pane-lbl">BEST CANDIDATE</div>
+  <div class="legend"><span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE</div>
+</div>
+<div class="divider"></div>
+<div class="vpane">
+  <div id="vR" style="width:100%;height:100%;"></div>
+  <div class="info">{right_info}</div>
+  <div class="pane-lbl">COMPARISON</div>
+  <div class="legend">{right_legend}</div>
+</div>
+<script>
+(function(){{
+  var vL=$3Dmol.createViewer("vL",{{backgroundColor:"#f8fafc"}});
+{left_model_js}
+  vL.zoomTo(); vL.zoom(0.85); vL.render();
+  setInterval(function(){{ vL.rotate(1,'y'); vL.render(); }},50);
+
+  var vR=$3Dmol.createViewer("vR",{{backgroundColor:"#f8fafc"}});
+{right_model_js}
+  vR.zoomTo(); vR.zoom(0.85); vR.render();
+  setInterval(function(){{ vR.rotate(1,'y'); vR.render(); }},50);
+}})();
+</script></body></html>"""
+        html_bytes = len(html.encode())
+        self._log(f"[SBS] html size={html_bytes} bytes "
+                  f"({'OVER' if html_bytes > 2_000_000 else 'under'} 2MB limit)")
+        self._set_html(html)
+        self._log("[SBS] setUrl called")
 
 
 # ═══════════════════════════════════════════════════════════════════
