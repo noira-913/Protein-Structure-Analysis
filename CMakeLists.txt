@@ -37,9 +37,6 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(pybind11)
 
-# 이후에는 평소처럼 사용
-# pybind11_add_module(protein_physics physics_engine.cpp)
-
 # ── OpenMP (있으면 자동 활성화) ──────────────
 find_package(OpenMP)
 
