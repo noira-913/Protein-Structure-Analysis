@@ -27,11 +27,14 @@ def has_openmp() -> bool:
         with tempfile.NamedTemporaryFile(suffix=".cpp", mode="w", delete=False) as f:
             f.write(test_src)
             fname = f.name
-        ret = subprocess.run(
-            ["cl", flag, fname, "/Fe" + os.devnull] if sys.platform == "win32"
-            else ["c++", flag, fname, "-o", os.devnull],
-            capture_output=True, timeout=10
-        )
+        if sys.platform == "win32":
+            cl = shutil.which("cl") or _find_cl_exe_path()
+            if not cl:
+                return False
+            cmd = [cl, flag, fname, "/Fe" + os.devnull]
+        else:
+            cmd = ["c++", flag, fname, "-o", os.devnull]
+        ret = subprocess.run(cmd, capture_output=True, timeout=10)
         return ret.returncode == 0
     except Exception:
         return False
@@ -40,6 +43,26 @@ def has_openmp() -> bool:
             os.unlink(fname)
         except Exception:
             pass
+
+
+def _find_cl_exe_path():
+    """Return the full path to cl.exe, or None."""
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        r"Microsoft Visual Studio\Installer\vswhere.exe",
+    )
+    if not os.path.exists(vswhere):
+        return None
+    try:
+        result = subprocess.run(
+            [vswhere, "-latest", "-products", "*",
+             "-find", r"VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        return lines[-1] if lines else None
+    except Exception:
+        return None
 
 
 # ── CUDA detection ───────────────────────────────────────────────
@@ -74,26 +97,8 @@ def find_cl_exe():
     """Return the directory containing cl.exe, or None if not found."""
     if shutil.which("cl"):
         return None  # already on PATH, no action needed
-
-    vswhere = os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        r"Microsoft Visual Studio\Installer\vswhere.exe",
-    )
-    if not os.path.exists(vswhere):
-        return None
-    try:
-        result = subprocess.run(
-            [vswhere, "-latest", "-products", "*",
-             "-requires", "Microsoft.VisualCpp.Build.Tools",
-             "-find", r"VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"],
-            capture_output=True, text=True, timeout=10,
-        )
-        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-        if lines:
-            return os.path.dirname(lines[-1])  # directory of cl.exe
-    except Exception:
-        pass
-    return None
+    path = _find_cl_exe_path()
+    return os.path.dirname(path) if path else None
 
 
 # ── Build CUDA extension via nvcc subprocess ─────────────────────
@@ -128,7 +133,7 @@ def build_cuda_extension(cuda_home, nvcc):
     ]
     if is_win:
         py_ver = f"python{sys.version_info.major}{sys.version_info.minor}"
-        cmd.append(os.path.join(sys.prefix, "libs", f"{py_ver}.lib"))
+        cmd.append(os.path.join(sys.base_prefix, "libs", f"{py_ver}.lib"))
 
     # Ensure cl.exe is on PATH for nvcc's host compiler
     env = os.environ.copy()
