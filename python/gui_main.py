@@ -3,25 +3,59 @@ gui_main.py — ALMA: Atomistic Local Motion Analyzer
 =====================================================
 PyQt6 desktop application for protein structure retrieval, implicit-solvent
 Monte Carlo simulation, and conformational analysis.
+단백질 구조 검색, 암묵적 용매 몬테 카를로 시뮬레이션, 구조 분석을 위한
+PyQt6 데스크톱 애플리케이션.
 
-High-level workflow:
-  1. User enters a 4-char PDB ID or a UniProt accession in the sidebar.
-  2. PipelineWorker (QThread) fetches the PDB file (RCSB or AlphaFold),
-     maps atoms to AMBER ff parameters, then runs generate_ensemble() via
-     the C++ protein_physics extension.
-  3. ComparisonWorker (QThread) concurrently fetches AlphaFold / SWISS-MODEL
-     structures and computes Kabsch-superimposed Cα RMSD vs the reference.
-  4. LandscapeWorker (QThread) runs a longer MC Markov chain, projects
-     conformations to 2D via PCA, builds a NetworkX conformational graph,
-     detects metastable basins via greedy modularity, and classifies the
-     protein as ordered / possibly-disordered / IDP.
-  5. Residue flexibility is shown as per-Cα RMSF from the landscape trajectory.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 전체 흐름 (High-level Workflow)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+  1. [입력] 사용자가 4글자 PDB ID(결정학 구조) 또는 UniProt 접근자를 입력.
+     User enters a 4-char PDB ID (crystallographic) or UniProt accession.
+
+  2. [PipelineWorker] 백그라운드 QThread가 PDB 파일을 가져오고
+     AMBER ff99SB 파라미터를 원자에 매핑한 뒤, C++ physics 엔진으로
+     Metropolis MC 앙상블을 생성하고 최종 에너지를 계산한다.
+     Background QThread fetches PDB (RCSB or AlphaFold), maps atoms to
+     AMBER ff parameters, then calls generate_ensemble() via the C++
+     protein_physics extension and evaluates final energies.
+
+  3. [ComparisonWorker] 동시에 AlphaFold/SWISS-MODEL 구조를 가져와
+     Kabsch 중첩 Cα RMSD를 참조 구조와 비교한다.
+     Concurrently fetches AlphaFold / SWISS-MODEL structures and computes
+     Kabsch-superimposed Cα RMSD vs the reference.
+     • Kabsch 알고리즘: SVD로 최적 회전 행렬 R을 구해 두 구조를 정렬.
+       이론: H = P^T Q → SVD → R = V diag(1,1,det(VUᵀ)) Uᵀ
+
+  4. [LandscapeWorker] 더 긴 MC 마르코프 체인을 실행해 배열 공간을 탐색.
+     PCA로 고차원 Cα 좌표를 2D로 투영한 뒤, NetworkX 그래프를 만들고
+     탐욕적 모듈성(greedy modularity)으로 준안정 분지(metastable basin)를
+     탐지해 단백질을 ordered / possibly-disordered / IDP 로 분류한다.
+     Runs a longer MC Markov chain, projects conformations to 2D via PCA,
+     builds a NetworkX conformational graph, detects metastable basins via
+     greedy modularity, and classifies the protein as ordered / IDP.
+     • PCA: 고차원 구조 공간의 주요 집단 운동 방향(PC1, PC2)을 찾아
+       자유 에너지 지형을 2D로 시각화.
+     • IDP(Intrinsically Disordered Protein) 분류: 준안정 분지가 많고
+       에너지 차이가 작으면(에너지 지형이 평탄하면) 무질서 단백질로 분류.
+
+  5. [RMSF] 궤적의 각 Cα에 대해 RMSF(제곱평균제곱근 요동)를 계산해
+     잔기별 유연성(flexibility) 프로파일을 시각화한다.
+     Per-Cα RMSF from landscape trajectory shows residue flexibility.
+     RMSF ≥ 2 Å 인 잔기는 무질서(disordered)로 표시.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 렌더링 (3D Rendering)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 3D structures are rendered in a QWebEngineView using the 3Dmol.js library
 served from a local temp HTML file (avoids CORS issues with file:// URLs).
+3D 구조는 로컬 임시 HTML 파일을 통해 3Dmol.js 라이브러리를 사용해 렌더링.
+(file:// URL의 CORS 문제를 피하기 위해 임시 파일 경로를 사용)
 
 GPU acceleration: if protein_physics_cuda is importable at startup, the user
 is offered a choice; both modules expose the same Particle / PhysicsEngine API.
+GPU 가속: protein_physics_cuda 가 임포트 가능하면 시작 시 GPU 선택 옵션 제공.
+두 모듈(CPU/GPU)은 동일한 Particle / PhysicsEngine API를 노출한다.
 """
 
 import sys, os, requests, traceback, tempfile
@@ -150,9 +184,21 @@ QSplitter::handle { background: #e2e8f0; }
 
 # ═══════════════════════════════════════════════════════════════════
 #  AMBER parameters
+#  AMBER 힘장(force field) 매개변수
 # ═══════════════════════════════════════════════════════════════════
+#
+# 힘장(force field)이란: 원자 간 상호작용을 수식으로 표현한 매개변수 집합.
+# AMBER ff99SB는 단백질 시뮬레이션에 널리 쓰이는 힘장 중 하나.
+# Force field: parameterised equations describing interatomic interactions.
+# AMBER ff99SB is a widely-used force field for protein simulation.
+#
 # Simplified AMBER ff99SB-like radii (Å) and LJ well-depths (kcal/mol)
 # keyed by element symbol.  Fallback: (1.9 Å, 0.1 kcal/mol).
+# 원소 기호별 반 데르 발스 반경(Å)과 레너드-존스 우물 깊이(kcal/mol).
+# 사전에 없는 원소는 폴백값 (1.9 Å, 0.1 kcal/mol) 사용.
+#
+# 반경이 작을수록 원자가 밀도 높게 패킹되고, ε이 클수록 분산 인력이 강함.
+# Smaller radius → tighter packing; larger ε → stronger dispersion attraction.
 _AMBER = {
     "C": (1.908, 0.086), "N": (1.824, 0.170),
     "O": (1.661, 0.210), "S": (2.000, 0.250),
@@ -160,6 +206,11 @@ _AMBER = {
 }
 # Residue-level formal charges (in electron units) assigned to the Cα atom.
 # Only charged/titratable side-chains are listed; all others default to 0.
+#
+# 잔기 수준 형식 전하 (전자 단위) — Cα 원자에 할당.
+# 하전/적정 가능한 측쇄만 목록화; 나머지는 0.
+# pH 7에서 ARG/LYS = +1 (양전하 아민), ASP/GLU = -1 (음전하 카르복실),
+# HIS = +0.5 (부분 프로토네이션).  이 전하들이 GB/DH 정전기 에너지를 주도.
 _CHARGE = {"ARG": +1.0, "LYS": +1.0, "HIS": +0.5, "ASP": -1.0, "GLU": -1.0}
 
 def _atom_params(atom):
@@ -251,10 +302,24 @@ def _ca_map_from_pdb(path):
 
 def _compute_rmsd(ca_map1, ca_map2):
     """Kabsch-superimposed Cα RMSD (Å) between two residue-keyed coordinate maps.
+    두 잔기 키 좌표 맵 사이의 Kabsch 중첩 Cα RMSD (Å).
 
     Only residues present in both maps are compared.  Returns None when fewer
     than 3 common residues exist (Kabsch requires at least 3 points).
+    두 맵에 공통으로 있는 잔기만 비교. 공통 잔기 < 3개면 None 반환.
+
+    Kabsch 알고리즘 이론 (Kabsch Algorithm Theory):
+    ─────────────────────────────────────────────
+    두 구조를 최적으로 겹치는 회전 행렬 R을 SVD로 구한다:
+      1. 각 구조의 무게중심을 원점으로 이동 (centroid subtraction)
+      2. 공분산 행렬 H = P^T Q 계산
+      3. SVD: U, S, Vt = svd(H)
+      4. 반사(reflection) 보정: d = sign(det(Vᵀ Uᵀ)) → 행렬식이 -1이면 반사이므로 보정
+         d = sign(det(Vt.T @ U.T)); R = Vt.T @ diag(1, 1, d) @ U.T
+      5. RMSD = sqrt(mean(||R·q_i - p_i||²))
+
     The Kabsch rotation handles the reflection ambiguity via SVD sign correction.
+    Kabsch 회전은 SVD 부호 보정으로 반사 모호성을 처리한다.
     """
     common = sorted(set(ca_map1.keys()) & set(ca_map2.keys()))
     if len(common) < 3:
@@ -271,12 +336,25 @@ def _compute_rmsd(ca_map1, ca_map2):
 
 def _compute_rmsf(snapshots, ca_indices):
     """Per-Cα root-mean-square fluctuation (Å) across all trajectory snapshots.
+    궤적 스냅샷 전체에 걸친 잔기별 Cα RMSF (Å).
 
     snapshots   — list of particle-lists from LandscapeWorker
+                  LandscapeWorker의 MC 스냅샷 목록 (각 원소 = 입자 목록)
     ca_indices  — index of each Cα atom inside each particle list
+                  각 Cα 원자의 입자 목록 내 인덱스
 
     Returns a 1-D array of length len(ca_indices).  High RMSF values indicate
     flexible or disordered regions.
+    len(ca_indices) 길이의 1D 배열 반환. 높은 RMSF = 유연/무질서 영역.
+
+    RMSF 이론 (Theory):
+    ───────────────────
+    RMSF_i = sqrt( <(r_i - <r_i>)²> )
+    여기서 <> 는 궤적 시간 평균, r_i 는 잔기 i의 Cα 위치.
+    MD/MC 시뮬레이션에서 RMSF ≥ 2 Å 는 일반적으로 무질서/유연 영역 기준.
+    실험적으로는 X-선 결정학 B-인수(B-factor)에 해당:
+      B = 8π²/3 · RMSF²  (등방성 가정)
+    High RMSF ↔ high B-factor ↔ crystallographically disordered region.
     """
     n_snaps = len(snapshots)
     n_ca    = len(ca_indices)
@@ -315,19 +393,36 @@ def _extract_ca_residues(pdb_path):
 # ═══════════════════════════════════════════════════════════════════
 class PipelineWorker(QThread):
     """Background thread that runs the full analysis pipeline.
+    전체 분석 파이프라인을 실행하는 백그라운드 스레드 (QThread 상속).
 
-    Signals:
+    Qt 시그널-슬롯(signal-slot) 패턴을 사용해 GUI 스레드와 통신:
+    메인 스레드를 블로킹하지 않고 긴 계산을 비동기로 수행.
+    Uses Qt signal-slot pattern to communicate with the GUI thread
+    without blocking it during long calculations.
+
+    Signals / 시그널:
       progress(str)   — log message for the sidebar process log
+                        사이드바 로그에 표시할 진행 메시지
       metrics(dict)   — partial metrics to update sidebar counters
+                        사이드바 카운터 업데이트용 부분 메트릭
       finished(...)   — emitted on success with (ensemble, energies, pdb_path,
                         ca_indices, ca_map, init_atoms)
+                        성공 시 방출 — 앙상블, 에너지, PDB 경로, Cα 인덱스 등
       error(str)      — emitted on unrecoverable failure
+                        복구 불가 오류 시 방출
 
-    Steps (run() method):
-      1. _fetch()     — retrieve PDB from disk, RCSB, or AlphaFold API
-      2. _parse_pdb() — build Particle list + Cα index map
-      3. generate_ensemble() — run MC via C++ engine (GIL released)
-      4. calculate_potential() — compute final energies for each candidate
+    Steps (run() 메서드 실행 순서):
+    ────────────────────────────────
+      1. _fetch()     — PDB 파일을 디스크 → RCSB → AlphaFold API 순으로 검색
+                        Retrieve PDB from disk, RCSB, or AlphaFold API
+      2. _parse_pdb() — BioPython으로 PDB 파싱 후 AMBER 매개변수 매핑,
+                        C++ Particle 목록과 Cα 인덱스 맵 구성
+                        Build Particle list + Cα index map with AMBER params
+      3. generate_ensemble() — C++ 엔진으로 Metropolis MC 앙상블 생성
+                               (GIL 해제 → Qt GUI 스레드 응답 유지)
+                               Run MC via C++ engine (GIL released)
+      4. calculate_potential() — 각 후보 배열의 최종 에너지 계산
+                                  Compute final GB/DH/LJ/SASA energies
     """
     progress = pyqtSignal(str)
     metrics  = pyqtSignal(dict)
@@ -630,7 +725,16 @@ class LandscapeWorker(QThread):
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")
 
-        # PCA layout — project the high-dim coordinate space to 2D
+        # ── PCA: 고차원 구조 공간을 2D로 투영 ────────────────────────────
+        # PCA layout — project the high-dim Cα coordinate space to 2D.
+        #
+        # 각 스냅샷의 Cα 좌표를 이어붙여 (N × 3·n_ca) 행렬을 만든다.
+        # PCA는 데이터의 분산이 가장 큰 방향(주성분, PC)을 찾는다.
+        #   PC1 = 단백질의 가장 큰 집단 운동 방향 (가장 많은 분산 설명)
+        #   PC2 = PC1에 직교하는 두 번째로 큰 운동 방향
+        # 이를 통해 에너지 지형(free energy landscape)을 2D로 시각화할 수 있다.
+        # Build (N × 3·n_ca) matrix; PCA finds directions of maximum variance.
+        # PC1/PC2 capture dominant collective motions of the protein backbone.
         coord_mat = np.array([self._ca_vec(s) for s in snapshots])
         n_feat = coord_mat.shape[1]
         n_pc   = min(2, N - 1, n_feat)
@@ -641,8 +745,14 @@ class LandscapeWorker(QThread):
                                       np.zeros((N, 1))])
         var_exp = pca.explained_variance_ratio_.tolist()
 
+        # ── 구조 그래프 구축 (Conformational Graph) ──────────────────────
         # Build the sequential conformational graph:
-        # each snapshot = node, consecutive snapshots = edge
+        # each snapshot = node, consecutive snapshots = edge.
+        #
+        # 마르코프 체인의 순서를 그래프로 표현:
+        #   노드(node) = 스냅샷 배열, 엣지(edge) = 연속 스냅샷 간 전이.
+        # 엣지 가중치 = |ΔE| — 에너지 변화가 작을수록 전이가 쉬움.
+        # Edge weight = |ΔE|; small weight → easy transition between conformations.
         G = nx.Graph()
         for i in range(N):
             G.add_node(i, energy=float(energies[i]))
@@ -650,14 +760,36 @@ class LandscapeWorker(QThread):
             G.add_edge(i, i + 1,
                        weight=float(abs(energies[i + 1] - energies[i])))
 
-        # Community detection — clusters are metastable basins
+        # ── 군집 탐지 → 준안정 분지 (Community Detection → Metastable Basins) ──
+        # Community detection — clusters are metastable basins.
+        #
+        # 탐욕적 모듈성(greedy modularity) 알고리즘은 모듈성 Q를 최대화하는
+        # 군집을 찾는다:  Q = Σ_c [ (내부 엣지 비율) - (기대 비율)² ]
+        # 각 군집 = 에너지 지형의 '분지(basin)' — 단백질이 오래 머무는 구조 영역.
+        # Greedy modularity maximises Q; each cluster = a metastable conformational basin.
+        # Proteins with multiple well-separated basins tend to be flexible or disordered.
         communities = list(
             nx.algorithms.community.greedy_modularity_communities(G))
         node_comm = {node: ci
                      for ci, comm in enumerate(communities)
                      for node in comm}
 
-        # IDP classification
+        # ── IDP 분류 (IDP Classification) ────────────────────────────────
+        # Intrinsically Disordered Protein (IDP) 분류 기준:
+        #
+        # kT = 0.592 kcal/mol @ 300K — 열 요동 에너지 스케일.
+        # 유의미한 분지: 전체 스냅샷의 5% 이상을 차지하는 군집.
+        # e_spread = 유의미한 분지들의 최소 에너지 차이 → 지형의 '거칠기'.
+        #
+        # 분류 기준:
+        #   IDP:               ≥3개 분지 AND e_spread < 5kT
+        #                      (여러 분지가 비슷한 에너지 → 지형이 평탄 → 무질서)
+        #   POSSIBLY DISORDERED: ≥2개 분지 OR 최저 분지가 전체의 50% 미만 차지
+        #                        (부분적 무질서 또는 다중 접힘 상태)
+        #   ORDERED:           단일 지배적 분지 (깔때기형 에너지 지형)
+        #                      (funnel landscape → 단일 안정 구조)
+        # IDP: ≥3 significant basins AND e_spread < 5kT (flat landscape → disordered)
+        # ORDERED: single dominant basin (funnel landscape → stable native fold)
         kT  = 0.592          # kcal/mol at 300 K
         sig = [c for c in communities if len(c) >= 0.05 * N]
         e_spread = 0.0
@@ -1318,7 +1450,22 @@ class ProteinApp(QMainWindow):
                   f"funnel={data['funnel']:.2f}")
 
     def _draw_landscape(self, data):
-        """Render the conformational graph on the matplotlib canvas."""
+        """Render the conformational graph on the matplotlib canvas.
+        matplotlib 캔버스에 구조 그래프(에너지 지형)를 렌더링.
+
+        시각화 구성 요소:
+        ─────────────────
+        • 얇은 회색 엣지: MC 궤적의 시간 순서 연결 (thin grey edges = time sequence)
+        • 볼록 껍질(convex hull) 음영: 각 군집(분지)의 영역 표시
+          (Community convex hulls = metastable basin boundaries)
+        • 산점도 노드: 색상 = 에너지 (RdYlGn_r: 낮음=초록, 높음=빨강)
+          (Scatter nodes coloured by energy)
+        • 녹색 사각형 = 시작점, 주황 다이아몬드 = 끝점,
+          파란 별 = 최소 에너지 구조 (에너지 최솟값)
+        • 컬러바: 에너지 스케일 (kcal/mol)
+        • 레이블 B1, B2, ...: 군집(분지) 번호
+        • X축/Y축: PC1/PC2 — 설명 분산(explained variance) % 표시
+        """
         self._landscape_fig.clear()
         ax = self._landscape_fig.add_subplot(111)
         ax.set_facecolor("#f8fafc")
@@ -1760,8 +1907,17 @@ class ProteinApp(QMainWindow):
     # ── Disorder / RMSF profile ───────────────────────────────────
 
     def _draw_disorder_profile(self, rmsf, residues):
-        """Plot per-residue RMSF; green = ordered, red = disordered (≥2 Å)."""
-        THRESHOLD = 2.0   # Å — standard disorder cutoff
+        """Plot per-residue RMSF; green = ordered, red = disordered (≥2 Å).
+        잔기별 RMSF 프로파일 플롯: 초록 = 규칙(ordered), 빨강 = 무질서(≥2 Å).
+
+        RMSF 2 Å 기준(threshold)은 문헌에서 광범위하게 사용되는 무질서 기준:
+        • RMSF < 2 Å: 잔기가 고정된 위치 근처에서 소진동 → 규칙 구조
+        • RMSF ≥ 2 Å: 잔기가 넓은 범위에서 운동 → 유연/무질서 영역
+        X-선 B-인수와 직접 비교 가능: RMSF = sqrt(3B / 8π²)
+        The 2 Å threshold is literature-standard for disordered regions.
+        Directly comparable to X-ray B-factors: RMSF = sqrt(3B / 8π²).
+        """
+        THRESHOLD = 2.0   # Å — standard disorder cutoff (무질서 판별 기준값)
         n_res = min(len(rmsf), len(residues))
         if n_res == 0:
             return
@@ -1814,7 +1970,18 @@ class ProteinApp(QMainWindow):
         self._disorder_canvas.draw()
 
     def _render_colored_by_rmsf(self):
-        """Load the MC best structure into 3Dmol colored by per-residue RMSF (B-factor)."""
+        """Load the MC best structure into 3Dmol colored by per-residue RMSF (B-factor).
+        MC 최저 에너지 구조를 잔기별 RMSF(B-인수)로 색칠해 3Dmol로 렌더링.
+
+        RMSF 값을 PDB B-인수(온도 인수) 필드에 저장해 3Dmol의 bwr 그래디언트로 표시:
+          파란색(blue) = RMSF 낮음 = 딱딱한(rigid) 구조 영역
+          흰색(white)  = 중간 유연성
+          빨간색(red)  = RMSF 높음 = 유연/무질서 영역
+
+        RMSF stored in PDB B-factor field; 3Dmol's bwr gradient maps:
+          blue → rigid (low RMSF), white → intermediate, red → flexible/disordered.
+        Colour scale: 0 → 4.0 Å (clamped).
+        """
         if self._rmsf is None or not self._ensemble:
             return
         best_idx  = int(np.argmin(self._energies))
@@ -1904,6 +2071,15 @@ class ProteinApp(QMainWindow):
             self.landscape_toggle_btn.setText("◈  LANDSCAPE")
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  진입점 (Entry Point)
+#  실행 흐름:
+#    1. QApplication 생성 (Qt 이벤트 루프 초기화)
+#    2. ProteinApp 윈도우 생성 — GPU 탐지, PhysicsEngine 초기화 포함
+#    3. 윈도우 표시 후 Qt 이벤트 루프 시작 (sys.exit으로 정상 종료 코드 반환)
+#    4. 예외 발생 시 error_log.txt에 스택 트레이스 저장
+#  Entry flow: create QApplication → build window (GPU detect, engine init)
+#              → show → Qt event loop → on exception write error_log.txt
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = QApplication(sys.argv)
