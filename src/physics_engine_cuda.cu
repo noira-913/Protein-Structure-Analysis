@@ -768,18 +768,36 @@ PYBIND11_MODULE(protein_physics_cuda, m)
 
     py::class_<PhysicsEngine>(m, "PhysicsEngine")
         .def(py::init<>())
+        // topology arg accepted for API parity with CPU module but not used (GPU Cartesian MC).
         .def("calculate_potential",
-             &PhysicsEngine::calculate_potential,
+             [](PhysicsEngine& self, const std::vector<Particle>& particles,
+                py::object /* topo */) -> double {
+                 py::gil_scoped_release release;
+                 return self.calculate_potential(particles);
+             },
              py::arg("particles"),
-             py::call_guard<py::gil_scoped_release>())
+             py::arg("topology") = py::none())
+        // Wrapper that matches the CPU module's torsion-MC signature.
+        // The GPU backend accepts 'topology' but ignores it — Cartesian moves
+        // remain in use until P4.2 (GPU-resident torsion trajectory).
+        // max_angle (rad) is converted to a comparable Cartesian maxd (Å).
         .def("generate_ensemble",
-             &PhysicsEngine::generate_ensemble,
+             [](PhysicsEngine& self,
+                const std::vector<Particle>& init,
+                py::object /* topo: accepted, ignored until P4.2 */,
+                int ncand, int steps,
+                double T, double max_angle) -> std::vector<std::vector<Particle>> {
+                 // ~0.12 rad × 3 Å typical bond arm ≈ 0.36 Å; clamp to [0.05, 1.0]
+                 double maxd = std::min(1.0, std::max(0.05, max_angle * 3.0));
+                 py::gil_scoped_release release;
+                 return self.generate_ensemble(init, ncand, steps, T, maxd);
+             },
              py::arg("initial_state"),
+             py::arg("topology"),
              py::arg("n_candidates"),
              py::arg("steps_per_cand"),
              py::arg("temperature") = 0.6,
-             py::arg("max_disp")    = 0.3,
-             py::call_guard<py::gil_scoped_release>())
+             py::arg("max_angle")   = 0.12)
         .def("lowest_energy_structure",
              &PhysicsEngine::lowest_energy_structure,
              py::arg("ensemble"),
