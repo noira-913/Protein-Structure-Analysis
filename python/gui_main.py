@@ -76,6 +76,7 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import protein_physics
+from amber_params import get_atom_params as _amber_get_params
 
 
 def _try_gpu_backend():
@@ -183,84 +184,177 @@ QSplitter::handle { background: #e2e8f0; }
 """
 
 # ═══════════════════════════════════════════════════════════════════
-#  AMBER parameters
-#  AMBER 힘장(force field) 매개변수
+#  AMBER ff14SB parameters  (see python/amber_params.py for full tables)
+#  AMBER ff14SB 힘장 매개변수 — 전체 표는 amber_params.py 참고
 # ═══════════════════════════════════════════════════════════════════
 #
-# 힘장(force field)이란: 원자 간 상호작용을 수식으로 표현한 매개변수 집합.
-# AMBER ff99SB는 단백질 시뮬레이션에 널리 쓰이는 힘장 중 하나.
-# Force field: parameterised equations describing interatomic interactions.
-# AMBER ff99SB is a widely-used force field for protein simulation.
+# 이전 방식: 6개 원소 기호 → (반경, ε);  전하는 Cα에만 형식 전하 할당.
+# 새 방식:  (잔기명, 원자명) → AMBER 원자 유형 → 정확한 VDW 매개변수 +
+#           RESP 부분 전하 (20개 표준 아미노산 모든 중원자).
 #
-# Simplified AMBER ff99SB-like radii (Å) and LJ well-depths (kcal/mol)
-# keyed by element symbol.  Fallback: (1.9 Å, 0.1 kcal/mol).
-# 원소 기호별 반 데르 발스 반경(Å)과 레너드-존스 우물 깊이(kcal/mol).
-# 사전에 없는 원소는 폴백값 (1.9 Å, 0.1 kcal/mol) 사용.
-#
-# 반경이 작을수록 원자가 밀도 높게 패킹되고, ε이 클수록 분산 인력이 강함.
-# Smaller radius → tighter packing; larger ε → stronger dispersion attraction.
-_AMBER = {
-    "C": (1.908, 0.086), "N": (1.824, 0.170),
-    "O": (1.661, 0.210), "S": (2.000, 0.250),
-    "H": (0.600, 0.015), "P": (2.100, 0.200),
-}
-# Residue-level formal charges (in electron units) assigned to the Cα atom.
-# Only charged/titratable side-chains are listed; all others default to 0.
-#
-# 잔기 수준 형식 전하 (전자 단위) — Cα 원자에 할당.
-# 하전/적정 가능한 측쇄만 목록화; 나머지는 0.
-# pH 7에서 ARG/LYS = +1 (양전하 아민), ASP/GLU = -1 (음전하 카르복실),
-# HIS = +0.5 (부분 프로토네이션).  이 전하들이 GB/DH 정전기 에너지를 주도.
-_CHARGE = {"ARG": +1.0, "LYS": +1.0, "HIS": +0.5, "ASP": -1.0, "GLU": -1.0}
+# Previous: 6 element symbols → (radius, ε); charge only on Cα of 5 residues.
+# New:      (resname, atomname) → AMBER ff14SB atom type → correct VDW params
+#           + RESP partial charges for all heavy atoms of all 20 amino acids.
 
 def _atom_params(atom):
     """Return (charge, radius, epsilon) for a BioPython Atom object.
 
-    Charge is assigned to Cα atoms only; all other atoms get 0.
-    Element is inferred from atom.element or the first character of atom name.
+    Delegates to amber_params.get_atom_params() which uses the full
+    AMBER ff14SB (resname, atomname) → type → (radius, ε) + RESP charges.
+    Falls back to element-based estimates for unknown residues/atoms.
+
+    AMBER ff14SB amber_params.get_atom_params()에 위임.
+    알 수 없는 잔기/원자의 경우 원소 기반 추정값으로 폴백.
     """
     res  = atom.get_parent().get_resname().strip()
     name = atom.get_name().strip()
-    elem = (atom.element or "").strip().upper()
-    elem = elem if len(elem) == 1 else name[0].upper()
-    charge = _CHARGE.get(res, 0.0) if name == "CA" else 0.0
-    r, e = _AMBER.get(elem, (1.9, 0.1))
-    return charge, r, e
+    return _amber_get_params(res, name)
 
 def _parse_pdb(path, log, physics_mod):
-    """Parse a PDB file and build a particle list for the physics engine.
+    """PDB 파일을 파싱해 물리 엔진용 파티클 목록과 결합 위상 그래프를 구성한다.
+    Parse a PDB file and build a particle list + bond topology for the physics engine.
 
-    Returns (particles, ca_indices, ca_map):
-      particles   — list of physics_mod.Particle for all valid heavy atoms
-      ca_indices  — index into particles for each Cα atom (in residue order)
-      ca_map      — dict {(chain_id, res_seq): coord_array} for RMSD reference
+    ── 반환값 (Returns) ──────────────────────────────────────────────────────────
+      particles  — 모든 유효한 중원자(heavy atom)에 대한 physics_mod.Particle 목록.
+                   list of physics_mod.Particle for all valid heavy atoms.
+      ca_indices — particles 목록 내 각 Cα 원자의 인덱스 (잔기 순서).
+                   index into particles for each Cα atom (in residue order).
+      ca_map     — {(chain_id, res_seq): 좌표 배열} RMSD 계산용 참조 딕셔너리.
+                   dict {(chain_id, res_seq): coord_array} for RMSD reference.
+      topology   — physics_mod.BondTopology 인스턴스.
+                   adj(인접 목록), bonds(결합 쌍), rot_bonds(회전 가능 결합) 포함.
+                   physics_mod.BondTopology instance with adj list, bond pairs,
+                   and rotatable bonds.
 
-    HETATM records (ligands, waters) are skipped (get_id()[0] != ' ').
-    Atoms with NaN/Inf coordinates are skipped and a warning is logged.
+    ── 건너뜀 규칙 (Skip rules) ────────────────────────────────────────────────
+      • HETATM 레코드 (리간드, 물 분자):
+        BioPython에서 res.get_id()[0] != ' '이면 HETATM.
+        현재 GAFF 파라미터 미지원으로 건너뜀 (IMPROVEMENTS.md P2.1 참고).
+        HETATM records (ligands, waters): res.get_id()[0] != ' ' in BioPython.
+        Skipped because GAFF parameters are not yet included (see P2.1).
+      • NaN / Inf 좌표: 결정학 미해상 루프(loop)에서 발생.
+        Invalid (NaN/Inf) coordinates: occur in unresolved crystallographic loops.
     """
     parser = PDBParser(QUIET=True)
     st = parser.get_structure("prot", path)
     atoms, skipped = [], 0
     ca_indices, ca_map = [], {}
+
+    # ── 위상 구성용 원자별 메타데이터 배열 ──────────────────────────────────────
+    # BondTopology.build()에 전달할 세 개의 평행 배열.
+    # 모두 atoms 목록과 동일한 순서·길이를 유지해야 함.
+    #
+    # Three parallel arrays passed to BondTopology.build().
+    # Must stay in the same order and length as the atoms list.
+    #
+    #   meta_resnames  — 잔기명 (예: "ALA", "GLY")
+    #                    residue name (e.g. "ALA")
+    #   meta_atomnames — PDB 원자명 (예: "CA", "OG1")
+    #                    PDB atom name (e.g. "CA")
+    #   meta_residx    — 고유 잔기 정수 인덱스 (아래 residue_id_map에서 할당)
+    #                    unique sequential residue integer (assigned below)
+    meta_resnames:  list[str] = []
+    meta_atomnames: list[str] = []
+    meta_residx:    list[int] = []
+
+    # ── 잔기별 고유 정수 인덱스 할당 ────────────────────────────────────────────
+    # 키: (chain_id, res_seq, icode) 세 값을 함께 쓰는 이유:
+    #   • chain_id: 다중 체인 단백질에서 서로 다른 체인의 잔기를 구분.
+    #     예: 체인 A의 잔기 5와 체인 B의 잔기 5는 별개.
+    #   • res_seq:  PDB 잔기 일련번호 (정수). 체인 내 순서.
+    #   • icode:    삽입 코드 (insertion code).  PDB에서 동일 번호 잔기가 여러 개인 경우
+    #               (예: '100A', '100B') 를 구분하는 한 글자 코드.
+    #
+    # 값: 등장 순서대로 부여한 0-기반 정수.  이 정수의 연속성(r, r+1)이
+    # C++ build()에서 펩타이드 결합 탐지에 사용된다.
+    #
+    # Key: (chain_id, res_seq, icode) — three values combined because:
+    #   • chain_id: distinguishes residues across chains in multi-chain proteins.
+    #     e.g. chain-A residue 5 ≠ chain-B residue 5.
+    #   • res_seq:  PDB residue sequence number (integer).
+    #   • icode:    PDB insertion code (single char) — distinguishes residues
+    #     with the same sequence number (e.g. "100A", "100B" in antibody numbering).
+    #
+    # Value: 0-based integer assigned in first-encounter order.
+    # Consecutive values (r, r+1) are used in C++ build() to detect peptide bonds.
+    residue_id_map: dict[tuple, int] = {}
+
     for atom in st.get_atoms():
-        if atom.get_parent().get_id()[0] != " ":
+        res = atom.get_parent()   # BioPython Residue 객체 / BioPython Residue object
+
+        # HETATM 건너뜀: res.get_id()[0]은 ' '(표준 아미노산), 'H_xxx'(HETATM), 'W'(물).
+        # Skip HETATM: get_id()[0] is ' ' for standard AA, 'H_xxx' for ligands, 'W' for water.
+        if res.get_id()[0] != " ":
             continue
-        coord = atom.get_coord()
+
+        coord = atom.get_coord()   # numpy array [x, y, z] in Å
+
+        # NaN/Inf 좌표 건너뜀 (미해상 루프 등에서 발생할 수 있음).
+        # Skip atoms with invalid coordinates (unresolved loops, etc.).
         if not np.all(np.isfinite(coord)):
             skipped += 1
             continue
+
+        # Cα 원자: ca_indices와 ca_map 갱신.
+        # ca_indices: RMSD·RMSF 계산 시 atoms 배열에서 Cα 위치를 빠르게 참조.
+        # ca_map:     (chain_id, res_seq) → 좌표, Kabsch RMSD 계산에 사용.
+        # Cα atom: update ca_indices and ca_map.
+        # ca_indices: fast Cα lookup into atoms array for RMSD / RMSF.
+        # ca_map:     (chain_id, res_seq) → coords for Kabsch RMSD.
         if atom.get_name().strip() == "CA":
             ca_indices.append(len(atoms))
-            key = (atom.get_parent().get_parent().get_id(),
-                   atom.get_parent().get_id()[1])
-            ca_map[key] = coord.copy()
+            ca_key = (res.get_parent().get_id(), res.get_id()[1])
+            ca_map[ca_key] = coord.copy()
+
+        # 잔기 고유 인덱스 할당.  처음 등장하는 잔기에만 새 정수를 부여.
+        # Assign unique residue index.  New integer only on first encounter.
+        res_key = (res.get_parent().get_id(),   # chain_id, e.g. 'A'
+                   res.get_id()[1],              # res_seq, e.g. 42
+                   res.get_id()[2])              # icode,   e.g. ' ' or 'A'
+        if res_key not in residue_id_map:
+            residue_id_map[res_key] = len(residue_id_map)
+
+        # 메타데이터 수집 (atoms와 동일한 순서로 추가).
+        # Collect metadata (appended in the same order as atoms).
+        meta_resnames.append(res.get_resname().strip())
+        meta_atomnames.append(atom.get_name().strip())
+        meta_residx.append(residue_id_map[res_key])
+
+        # AMBER ff14SB 파라미터로 파티클 생성.
+        # _atom_params()는 amber_params.get_atom_params()에 위임해
+        # (잔기명, 원자명) → (전하 e, 반경 Å, ε kcal/mol)을 반환.
+        # Create Particle with AMBER ff14SB parameters.
+        # _atom_params() delegates to amber_params.get_atom_params()
+        # returning (charge e, radius Å, epsilon kcal/mol).
         charge, r, e = _atom_params(atom)
         atoms.append(physics_mod.Particle(
             float(coord[0]), float(coord[1]), float(coord[2]),
             charge, r, e, False))
+
     if skipped:
         log(f"  ⚠  {skipped} atoms skipped (invalid coords)")
-    return atoms, ca_indices, ca_map
+
+    # ── 결합 위상 그래프 구성 ─────────────────────────────────────────────────
+    # BondTopology.build()에 세 메타데이터 배열을 전달한다.
+    # 내부적으로:
+    #   1. (res_idx, atomname) → 파티클 인덱스 역방향 맵 구성
+    #   2. AMBER 잔기 템플릿으로 잔기 내 결합 추가
+    #   3. 연속 잔기 간 펩타이드 결합 C(i)→N(i+1) 추가
+    #   4. rot_specs 표로 회전 가능 결합 인덱스 추출
+    #
+    # Build the covalent bond topology.
+    # BondTopology.build() receives the three parallel metadata arrays and:
+    #   1. Builds a (res_idx, atomname) → particle index reverse lookup
+    #   2. Adds intra-residue bonds from AMBER templates
+    #   3. Adds peptide bonds C(i)→N(i+1) between consecutive residues
+    #   4. Extracts rotatable bond indices from rot_specs tables
+    # BondTopology is defined in the CPU module only; always use protein_physics
+    # even when the GPU backend is selected for simulation.
+    topo = protein_physics.BondTopology()
+    topo.build(meta_resnames, meta_atomnames, meta_residx)
+    log(f"  topology: {topo.num_bonds} bonds · {topo.num_rot_bonds} rotatable")
+
+    return atoms, ca_indices, ca_map, topo
 
 def _parse_pdb_atoms_only(path, physics_mod):
     """Lightweight PDB parser — returns only the particle list, no index maps.
@@ -426,8 +520,8 @@ class PipelineWorker(QThread):
     """
     progress = pyqtSignal(str)
     metrics  = pyqtSignal(dict)
-    # ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms
-    finished = pyqtSignal(object, object, str, object, object, object)
+    # ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo
+    finished = pyqtSignal(object, object, str, object, object, object, object)
     error    = pyqtSignal(str)
 
     def __init__(self, engine, target, physics_mod, n_cand=5, steps=300):
@@ -512,7 +606,7 @@ class PipelineWorker(QThread):
                 self.error.emit("Structure retrieval failed.")
                 return
             self.progress.emit("  Parsing PDB + AMBER forcefield mapping…")
-            atoms, ca_indices, ca_map = _parse_pdb(path, self.progress.emit, self.physics_mod)
+            atoms, ca_indices, ca_map, topo = _parse_pdb(path, self.progress.emit, self.physics_mod)
             if not atoms:
                 self.error.emit("No valid protein atoms found.")
                 return
@@ -521,11 +615,11 @@ class PipelineWorker(QThread):
             self.progress.emit(
                 f"  Running MC: {self.n_cand} candidates × {self.steps} steps…")
             ensemble = self.engine.generate_ensemble(
-                atoms, self.n_cand, self.steps, 0.6, 0.3)
+                atoms, topo, self.n_cand, self.steps, 0.6, 0.12)
             self.progress.emit("  Computing ensemble free energies…")
-            energies = [self.engine.calculate_potential(s) for s in ensemble]
+            energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
             self.metrics.emit({"best_e": min(energies), "n_cand": self.n_cand})
-            self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms)
+            self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms, topo)
         except Exception as ex:
             self.error.emit(str(ex))
 
@@ -685,13 +779,14 @@ class LandscapeWorker(QThread):
     N_SNAPSHOTS    = 120   # total trajectory length
     STEPS_PER_SNAP = 80    # MC steps between each snapshot
 
-    def __init__(self, engine, init_atoms, ca_indices, T=0.6, maxd=0.3):
+    def __init__(self, engine, init_atoms, ca_indices, topo, T=0.6, max_angle=0.12):
         super().__init__()
         self.engine     = engine
         self.init_atoms = init_atoms
         self.ca_indices = ca_indices
+        self.topo       = topo
         self.T          = T
-        self.maxd       = maxd
+        self.max_angle  = max_angle
 
     def _ca_vec(self, particles):
         """Flatten Cα coordinates of one snapshot into a 1-D vector."""
@@ -717,9 +812,9 @@ class LandscapeWorker(QThread):
                 self.progress.emit(f"  [LANDSCAPE] Snapshot {i}/{N}…")
             # Each call advances the chain by S MC steps
             current = self.engine.generate_ensemble(
-                current, 1, S, self.T, self.maxd)[0]
+                current, self.topo, 1, S, self.T, self.max_angle)[0]
             snapshots.append(current)
-            energies.append(self.engine.calculate_potential(current))
+            energies.append(self.engine.calculate_potential(current, self.topo))
 
         energies = np.array(energies, dtype=float)
 
@@ -884,6 +979,7 @@ class ProteinApp(QMainWindow):
         self._comp_worker        = None
         self._landscape_worker   = None
         self._init_atoms         = None
+        self._topo               = None
         self._pdb_path           = None
         self._ca_indices         = []
         self._landscape_snaps    = []
@@ -1216,10 +1312,11 @@ class ProteinApp(QMainWindow):
         if "best_e"   in d: self._mv_energy.setText(f"{d['best_e']:.0f}")
         if "n_cand"   in d: self._mv_cand.setText(str(d["n_cand"]))
 
-    def _on_done(self, ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms):
+    def _on_done(self, ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo):
         self._ensemble    = ensemble
         self._energies    = energies
         self._init_atoms  = init_atoms
+        self._topo        = topo
         self._ca_indices  = ca_indices
         self._pdb_path    = pdb_path
         self.run_btn.setEnabled(True)
@@ -1416,7 +1513,7 @@ class ProteinApp(QMainWindow):
             return
 
         self._landscape_worker = LandscapeWorker(
-            ls_engine, self._init_atoms, self._ca_indices)
+            ls_engine, self._init_atoms, self._ca_indices, self._topo)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
         self._landscape_worker.start()
