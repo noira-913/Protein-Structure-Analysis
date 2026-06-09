@@ -828,6 +828,36 @@ public:
     // d = first adj[rb.j] ≠ rb.i.  Energy terms from get_dih_terms().
     std::vector<DihRecord>           dihedrals;
 
+    // ── 레버암 스케일 (Lever-arm scale per rotatable bond) ───────────────────
+    //
+    // 같은 δφ라도 j-side 원자 수(N_down)가 클수록 평균 선형 변위(lever-arm effect)가
+    // 커져 거의 모든 이동이 거부된다 (큰 단백질의 N-말단 결합에서 특히 심각).
+    //
+    // 완화 방법: max_angle에 scale_k = sqrt(N_ref / N_down_k) 를 곱해
+    // 원자당 RMS 변위를 결합 종류에 관계없이 일정하게 유지한다.
+    // N_ref = 10 (전형적인 곁사슬 j-side 크기). 범위 클램프: [0.05, 1.0].
+    //
+    // Each bond's scale_k = sqrt(N_ref / N_downstream), clamped to [0.05, 1.0].
+    // Multiplied into max_angle before sampling δφ so that per-atom RMS
+    // displacement is approximately constant regardless of bond position.
+    std::vector<double>              rot_bond_scale;
+
+    // ── 크랭크샤프트 협동 이동 쌍 (Crankshaft concerted-move pairs) ──────────
+    //
+    // 같은 Cα 원자를 공유하는 (φ 결합, ψ 결합) 쌍:  φ.j == ψ.i == CA 인덱스.
+    //
+    // MC 루프에서 +δ(φ) → −δ(ψ) 순으로 적용하면:
+    //   φ: CA + 곁사슬 + 이후 백본 전체가 +δ 만큼 회전 (Rodrigues)
+    //   ψ: C 이후 원자들이 −δ 만큼 복원 회전 (근사 상쇄, O(δ²) 잔여 변위)
+    // 순 효과: 잔기 i의 곁사슬만 크게 이동, 이후 백본은 거의 제자리.
+    // 거부율이 일반 단일 비틀림 이동보다 크게 낮아 대형 단백질 탐색에 효과적.
+    //
+    // Pairs (phi_rot_bond_idx, psi_rot_bond_idx) sharing the same Cα (φ.j == ψ.i).
+    // Applied as +δ around φ then −δ around ψ: sidechain moves, downstream
+    // backbone approximately restores (O(δ²) residual).  Yields higher acceptance
+    // than single torsion moves for large proteins.
+    std::vector<std::pair<int,int>>  concerted_pairs;
+
     // ── build() ──────────────────────────────────────────────────────────────
     //
     // 파라미터 (Parameters) — 모두 길이 N, 파티클 배열과 동일 순서:
@@ -1040,6 +1070,39 @@ public:
         rot_bond_sides.resize(rot_bonds.size());
         for (size_t k = 0; k < rot_bonds.size(); ++k)
             rot_bond_sides[k] = j_side(rot_bonds[k].i, rot_bonds[k].j);
+
+        // ── 레버암 스케일 사전 계산 ──────────────────────────────────────────
+        // N_down이 크면 같은 δφ에서 원자당 선형 변위가 √(N_down)에 비례해 커짐.
+        // scale_k = sqrt(N_REF / N_down_k) 로 보정해 원자당 RMS 변위를 일정하게 유지.
+        //
+        // scale_k = sqrt(N_ref / N_downstream_k), clamped to [0.05, 1.0].
+        // Reference size N_ref = 10 ≈ typical sidechain j-side.
+        constexpr double LEVER_NREF = 10.0;
+        rot_bond_scale.resize(rot_bonds.size());
+        for (size_t k = 0; k < rot_bonds.size(); ++k) {
+            double ns = std::max(1.0, (double)rot_bond_sides[k].size());
+            rot_bond_scale[k] = std::min(1.0, std::max(0.05, std::sqrt(LEVER_NREF / ns)));
+        }
+
+        // ── 크랭크샤프트 협동 이동 쌍 구성 ──────────────────────────────────
+        // φ 결합(i=N, j=CA)과 ψ 결합(i=CA, j=C)이 동일한 CA 원자를 공유하는 쌍.
+        // φ.j == ψ.i == CA 조건으로 빠르게 매칭.
+        //
+        // Match φ and ψ bonds sharing the same Cα: φ.j == ψ.i == CA_atom_idx.
+        {
+            std::unordered_map<int,int> phi_at_ca, psi_at_ca;
+            for (size_t k = 0; k < rot_bonds.size(); ++k) {
+                if (rot_bonds[k].kind == BondKind::BACKBONE_PHI)
+                    phi_at_ca[rot_bonds[k].j] = (int)k;
+                else if (rot_bonds[k].kind == BondKind::BACKBONE_PSI)
+                    psi_at_ca[rot_bonds[k].i] = (int)k;
+            }
+            for (auto& [ca_idx, pk] : phi_at_ca) {
+                auto it = psi_at_ca.find(ca_idx);
+                if (it != psi_at_ca.end())
+                    concerted_pairs.push_back({pk, it->second});
+            }
+        }
     }
 
     // ── bonded() ─────────────────────────────────────────────────────────────
@@ -1452,43 +1515,25 @@ public:
     // Returns a vector of ncand final conformations (the MC "ensemble").
     //
     // P1.5 비틀림 각도 이동 MC — ncand개의 독립 궤적을 각각 steps 스텝 실행.
+    // 추가 기능 (additions vs. original P1.5):
+    //   • 레버암 적응형 스케일: rot_bond_scale[k] = sqrt(N_ref/N_down_k)
+    //     (큰 단백질 N-말단 결합의 치솟는 거부율 완화)
+    //   • 크랭크샤프트 협동 이동 (25%): 같은 Cα의 φ+ψ 쌍에 +δ/−δ 적용
+    //     → 곁사슬 이동, 이후 백본 근사 복원 → 수용율 향상
+    //   • 온라인 수용율 추적 + 자동 조정: TUNE_FREQ 스텝마다 cur_max 조절
+    //     목표 수용율 [TARGET_LO, TARGET_HI] 유지
     //
-    // Parameters / 매개변수:
-    //   init      — starting conformation (same for all chains)
-    //               모든 체인의 공통 초기 배열
-    //   topo      — BondTopology built from _parse_pdb; provides rot_bonds + rot_bond_sides
-    //               PDB 파싱 후 구성된 결합 위상 그래프 — rot_bonds + rot_bond_sides 제공
-    //   ncand     — number of independent trajectories / 독립 궤적 수
-    //   steps     — MC steps per trajectory / 궤적당 MC 스텝 수
-    //   T         — effective temperature in kcal/mol (0.6 ≈ 300 K)
-    //   max_angle — max backbone rotation per step in radians (~0.12 ≈ 7°)
-    //               sidechain moves use 2.5× this value (~17°)
-    //               백본 최대 회전각 (라디안); 곁사슬은 2.5× 적용
+    // Additions over original P1.5:
+    //   • Lever-arm scale: rot_bond_scale[k] = sqrt(N_ref/N_downstream_k) prevents
+    //     lever-arm rejection catastrophe for bonds near the N-terminus.
+    //   • Crankshaft moves (25% of steps): concerted +δ/−δ on φ/ψ sharing one Cα.
+    //     Sidechain displaces; downstream backbone approximately restores → higher acceptance.
+    //   • Online acceptance tracking: adjust cur_max every TUNE_FREQ steps toward
+    //     target acceptance window [TARGET_LO, TARGET_HI].
     //
-    // Algorithm (Metropolis Monte Carlo with torsion moves) / 알고리즘:
-    //   ① topo.rot_bonds에서 무작위로 결합 (rb) 하나를 선택
-    //      Pick random rotatable bond rb from topo.rot_bonds
-    //   ② rb.i→rb.j 단위 벡터를 회전축 u로 설정
-    //      Axis u = normalise(p[rb.j] − p[rb.i])
-    //   ③ δφ ~ Uniform[-max_angle, +max_angle] 샘플링
-    //      Sample δφ ~ U[-max_angle, +max_angle]
-    //   ④ j-side 원자들을 Rodrigues 공식으로 u 축 주위 δφ 회전
-    //      Rotate all j-side atoms around u by δφ (Rodrigues formula)
-    //      → 결합 길이·결합각 정확히 보존 (bond lengths/angles identically preserved)
-    //   ⑤ 교차 쌍(cross-pair) 에너지 변화 ΔE = Σ_{cross}[new−old] + ΔSASA
-    //      cross pairs: 정확히 하나만 j-side에 속하는 원자 쌍
-    //      Compute ΔE from cross-pair energies (exactly one atom in j-side) + ΔSASA
-    //   ⑥ Metropolis 수용/거부; 거부 시 j-side 위치·Born 반경 복원
-    //      Metropolis accept/reject; revert j-side on rejection
-    //
-    // 교차 쌍만 ΔE에 기여하는 이유 (Why only cross pairs contribute to ΔE):
-    //   강체 회전은 j-side 내 쌍 거리를 보존한다.
-    //   따라서 j-side 내 쌍 에너지는 변하지 않고 소거된다.
-    //   A rigid rotation preserves all pairwise distances within the j-side.
-    //   Those pairs cancel in ΔE = E_new − E_old.
-    //
-    // Convergence: Metropolis satisfies detailed balance → Boltzmann distribution.
-    // 수렴: Metropolis 기준은 세밀 균형을 만족 → 볼츠만 분포 p ∝ exp(-E/T)로 수렴.
+    // Metropolis detailed balance is preserved:
+    //   torsion move  — symmetric U[-δ,+δ] proposal.
+    //   crankshaft    — symmetric U[-δ,+δ] for +δ/−δ pair; reverse proposal identical probability.
     std::vector<std::vector<Particle>> generate_ensemble(
         const std::vector<Particle>& init,
         const BondTopology& topo,
@@ -1499,134 +1544,227 @@ public:
         if (init.empty()) throw std::invalid_argument("initial_state empty");
         if (ncand <= 0 || steps <= 0) throw std::invalid_argument("ncand/steps must be positive");
         if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
-        size_t N = init.size();
+        size_t N   = init.size();
         int    nrb = (int)topo.rot_bonds.size();
+        int    ncp = (int)topo.concerted_pairs.size();
         std::vector<std::vector<Particle>> ens(ncand);
 
         auto chain = [&](int c, std::mt19937& rng) {
             std::vector<Particle> st = init;
             NeighborList nl; nl.build(st);
             auto a = born_radii(st, nl);
-            double curE = total_e(st, nl, a);
+            double curE = total_e(st, nl, a, &topo);
 
             std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+            std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
             std::uniform_real_distribution<double> uni(0.0, 1.0);
-            // in_side: reused each step — set bits before, clear after
-            // 매 스텝 재사용: 사용 전 비트 설정, 사용 후 초기화
-            std::vector<bool> in_side(N, false);
+            std::vector<bool> in_side(N, false);  // reused every step; cleared after each move
 
+            // ── 적응형 제안 폭 상태 (Adaptive proposal width state) ──────────
+            // TUNE_FREQ 스텝마다 수용율을 측정해 cur_max를 조절한다.
+            // 목표 수용율: [TARGET_LO, TARGET_HI]. 이 창을 벗어나면 SCALE_UP/DOWN 적용.
+            double cur_max = max_angle;
+            int    acc_win = 0, tot_win = 0;
+            constexpr int    TUNE_FREQ  = 200;
+            constexpr double TARGET_LO  = 0.28, TARGET_HI = 0.52;
+            constexpr double SCALE_UP   = 1.06,  SCALE_DOWN = 0.94;
+            constexpr double ANGLE_MAX  = 0.50,  ANGLE_MIN  = 0.004; // radians
+
+            // ── 크로스-쌍 에너지 계산 헬퍼 ──────────────────────────────────
+            // in_side가 설정된 상태에서 호출; i-side vs j-side 교차 쌍만 합산.
+            // Helper: sum cross-pair energies for the current in_side mask.
+            auto cross_e = [&]() -> double {
+                double E = 0.0;
+                for (size_t i = 0; i < N; ++i)
+                    for (size_t j : nl.nb[i]) {
+                        if (in_side[i] == in_side[j]) continue;
+                        if (topo.is_excluded((int)i, (int)j)) continue;
+                        double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                        if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                        E += pair_e(st[i], st[j], a[i], a[j]);
+                    }
+                return E;
+            };
+
+            // ── 표준 비틀림 이동 람다 ─────────────────────────────────────
+            // Standard torsion-angle MC move with lever-arm scaling.
+            // Returns {accepted, did_move}.
+            auto try_torsion = [&]() -> std::pair<bool,bool> {
+                int            rb_idx = pick_rb(rng);
+                const RotBond& rb     = topo.rot_bonds[rb_idx];
+                const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+                if (side.empty()) return {false, false};
+
+                // 회전축 계산 / Compute normalised rotation axis.
+                double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
+                double al = std::sqrt(ax*ax+ay*ay+az*az);
+                if (al < 1e-10) return {false, false};
+                ax/=al; ay/=al; az/=al;
+
+                // 레버암 스케일 + 결합 종류 가중치 적용
+                // Apply lever-arm scale and bond-kind weighting.
+                double base_d = (rb.kind == BondKind::BACKBONE_PHI ||
+                                 rb.kind == BondKind::BACKBONE_PSI)
+                                ? cur_max : cur_max * 2.5;
+                base_d *= topo.rot_bond_scale[rb_idx];
+                double delta = std::uniform_real_distribution<double>(-base_d, base_d)(rng);
+                double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+                for (int k : side) in_side[k] = true;
+
+                std::vector<std::array<double,3>> old_pos(side.size());
+                std::vector<double>               old_born(side.size());
+                for (size_t k = 0; k < side.size(); ++k) {
+                    int idx = side[k];
+                    old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                    old_born[k] = a[idx];
+                }
+
+                double old_cross = cross_e();
+                double old_sasa  = sasa_nonpolar(st, nl);
+                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+
+                double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+                for (int k : side)
+                    rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ax, ay, az, cosD, sinD);
+                for (int k : side) update_born((size_t)k, st, nl, a);
+
+                double new_cross = cross_e();
+                double new_sasa  = sasa_nonpolar(st, nl);
+                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+
+                bool accepted = false;
+                double dE = (new_cross-old_cross) + (new_sasa-old_sasa) + (new_dih-old_dih);
+                if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
+                    curE += dE;
+                    accepted = true;
+                } else {
+                    for (size_t k = 0; k < side.size(); ++k) {
+                        int idx = side[k];
+                        st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                        a[idx]    = old_born[k];
+                    }
+                }
+                for (int k : side) in_side[k] = false;
+                return {accepted, true};
+            };
+
+            // ── 크랭크샤프트 협동 이동 람다 ──────────────────────────────
+            // Crankshaft move: +δ on φ then −δ on ψ for the same Cα.
+            //   Phase 1 (φ, +δ): CA + sidechain + all downstream rotate.
+            //   Phase 2 (ψ, −δ): C + O + all downstream rotate back (≈ cancels).
+            //   Net displacement: sidechain of residue i; downstream backbone O(δ²).
+            // Returns {accepted, did_move}.
+            auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+                if (ncp == 0) return {false, false};
+                int cp_idx = (ncp > 1) ? pick_cp(rng) : 0;
+                int phi_k  = topo.concerted_pairs[cp_idx].first;
+                int psi_k  = topo.concerted_pairs[cp_idx].second;
+                const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+                const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+                if (phi_side.empty() || psi_side.empty()) return {false, false};
+
+                // in_side: φ side (includes sidechain + downstream backbone)
+                for (int k : phi_side) in_side[k] = true;
+
+                // φ 축 계산 / φ rotation axis.
+                const RotBond& phi_rb = topo.rot_bonds[phi_k];
+                double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
+                double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
+                double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+                if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
+                p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
+
+                // 이전 에너지 + 상태 저장 / Save old energy and positions.
+                std::vector<std::array<double,3>> old_pos(phi_side.size());
+                std::vector<double>               old_born(phi_side.size());
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                    old_born[k] = a[idx];
+                }
+                double old_cross = cross_e();
+                double old_sasa  = sasa_nonpolar(st, nl);
+                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+
+                // δ 샘플링: 크랭크샤프트는 실효 이동이 국소적이므로 스케일 없이 cur_max 사용.
+                // No lever-arm scale for crankshaft: the effective displacement is local
+                // regardless of chain position (downstream atoms approximately cancel).
+                double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(rng);
+                double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+                // Phase 1: φ 회전 (+δ), φ-side 전체
+                for (int k : phi_side)
+                    rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
+
+                // Phase 2: ψ 회전 (−δ), ψ-side (post-φ 축 좌표 사용)
+                // ψ axis recomputed from current (post-φ) atom positions.
+                const RotBond& psi_rb = topo.rot_bonds[psi_k];
+                double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
+                double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
+                double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+                if (p2l < 1e-10) {
+                    // φ 회전 복원 후 스킵 / Revert φ and skip.
+                    for (size_t k = 0; k < phi_side.size(); ++k) {
+                        int idx = phi_side[k];
+                        st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    }
+                    for (int k : phi_side) in_side[k] = false;
+                    return {false, false};
+                }
+                p2ax/=p2l; p2ay/=p2l; p2az/=p2l;
+                // Apply −δ: cosD same (cos symmetric), −sinD flips rotation direction.
+                for (int k : psi_side)
+                    rodrigues(st[k].x, st[k].y, st[k].z, p2ox, p2oy, p2oz, p2ax, p2ay, p2az, cosD, -sinD);
+
+                // φ-side 전체 Born 반경 업데이트 (일부 원자는 제자리 복귀, 모두 갱신)
+                for (int k : phi_side) update_born((size_t)k, st, nl, a);
+
+                double new_cross = cross_e();
+                double new_sasa  = sasa_nonpolar(st, nl);
+                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+
+                bool accepted = false;
+                double dE = (new_cross-old_cross) + (new_sasa-old_sasa) + (new_dih-old_dih);
+                if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
+                    curE += dE;
+                    accepted = true;
+                } else {
+                    for (size_t k = 0; k < phi_side.size(); ++k) {
+                        int idx = phi_side[k];
+                        st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                        a[idx]    = old_born[k];
+                    }
+                }
+                for (int k : phi_side) in_side[k] = false;
+                return {accepted, true};
+            };
+
+            // ── 메인 MC 루프 ──────────────────────────────────────────────
             for (int s = 0; s < steps; ++s) {
-                // Rebuild NL and recompute Born radii when drift exceeds NL_SKIN/2
-                // drift > NL_SKIN/2 이면 이웃 목록 전체 재구축
+                // drift > NL_SKIN/2 이면 이웃 목록·Born 반경 전체 재구축
                 if (nl.needs_rebuild(st)) {
                     nl.build(st);
                     a    = born_radii(st, nl);
                     curE = total_e(st, nl, a, &topo);
                 }
 
-                // ── 결합 선택 (Pick a rotatable bond) ──────────────────────
-                int               rb_idx = pick_rb(rng);
-                const RotBond&    rb     = topo.rot_bonds[rb_idx];
-                const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
-                if (side.empty()) continue;
+                // 이동 종류 선택: 25% 크랭크샤프트, 75% 표준 비틀림
+                // Move type: 25% crankshaft (when pairs exist), 75% standard torsion.
+                bool do_crank = ncp > 0 && uni(rng) < 0.25;
+                auto [accepted, did_move] = do_crank ? try_crankshaft() : try_torsion();
 
-                // ── in_side 플래그 설정 ─────────────────────────────────────
-                for (int k : side) in_side[k] = true;
-
-                // ── 회전축 계산 (Compute normalised rotation axis u) ────────
-                double ax = st[rb.j].x - st[rb.i].x;
-                double ay = st[rb.j].y - st[rb.i].y;
-                double az = st[rb.j].z - st[rb.i].z;
-                double al = std::sqrt(ax*ax + ay*ay + az*az);
-                if (al < 1e-10) { for (int k : side) in_side[k] = false; continue; }
-                ax /= al; ay /= al; az /= al;
-
-                // ── 회전각 샘플링 (Sample rotation angle) ──────────────────
-                // Backbone φ/ψ: 작은 이동 (~7°) — 나선/가닥 전환 탐색
-                // Sidechain χ: 큰 이동 (~17°) — 회전이성체 전환 탐색
-                // Small backbone moves explore helix↔strand transitions.
-                // Larger sidechain moves allow rotamer flips.
-                double max_d = (rb.kind == BondKind::BACKBONE_PHI ||
-                                rb.kind == BondKind::BACKBONE_PSI)
-                               ? max_angle : max_angle * 2.5;
-                double delta = std::uniform_real_distribution<double>(-max_d, max_d)(rng);
-                double cosD  = std::cos(delta);
-                double sinD  = std::sin(delta);
-
-                // ── 이전 상태 저장 (Save old state for revert on rejection) ─
-                std::vector<std::array<double,3>> old_pos(side.size());
-                std::vector<double>               old_born(side.size());
-                for (size_t k = 0; k < side.size(); ++k) {
-                    int idx     = side[k];
-                    old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
-                    old_born[k] = a[idx];
-                }
-
-                // ── 이전 에너지 계산 (Compute old cross-pair + SASA + dihedral energy) ─
-                // 교차 쌍: 정확히 하나만 j-side에 속하는 (i, j) 쌍 (i < j)
-                // Cross pair: exactly one of (i, j) is in side; only these change.
-                double old_cross = 0.0;
-                for (size_t i = 0; i < N; ++i)
-                    for (size_t j : nl.nb[i]) {        // j > i
-                        if (in_side[i] == in_side[j]) continue;
-                        if (topo.is_excluded((int)i, (int)j)) continue;
-                        double dx = st[i].x - st[j].x;
-                        double dy = st[i].y - st[j].y;
-                        double dz = st[i].z - st[j].z;
-                        if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
-                        old_cross += pair_e(st[i], st[j], a[i], a[j]);
-                    }
-                double old_sasa = sasa_nonpolar(st, nl);
-                // 이중면체각 에너지: 경계를 가로지르는 레코드만 변함
-                // Dihedral delta: only records spanning the rotation boundary change.
-                double old_dih = dihedral_e_boundary(st, topo.dihedrals, in_side);
-
-                // ── Rodrigues 회전 적용 (Apply rotation to j-side atoms) ────
-                // 앵커: rb.i 좌표.  회전 후 분자 내 모든 결합 길이·결합각 보존.
-                // Anchor: position of rb.i.  All bond lengths/angles preserved.
-                double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
-                for (int k : side)
-                    rodrigues(st[k].x, st[k].y, st[k].z,
-                              ox, oy, oz, ax, ay, az, cosD, sinD);
-
-                // ── j-side Born 반경 업데이트 ──────────────────────────────
-                // j-side 원자들의 고정측 원자와의 거리가 바뀌었으므로 Born 반경 재계산.
-                // j-side atoms moved relative to fixed side → update their Born radii.
-                for (int k : side) update_born((size_t)k, st, nl, a);
-
-                // ── 새 에너지 계산 (Compute new cross-pair + SASA + dihedral energy) ───
-                double new_cross = 0.0;
-                for (size_t i = 0; i < N; ++i)
-                    for (size_t j : nl.nb[i]) {
-                        if (in_side[i] == in_side[j]) continue;
-                        if (topo.is_excluded((int)i, (int)j)) continue;
-                        double dx = st[i].x - st[j].x;
-                        double dy = st[i].y - st[j].y;
-                        double dz = st[i].z - st[j].z;
-                        if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
-                        new_cross += pair_e(st[i], st[j], a[i], a[j]);
-                    }
-                double new_sasa = sasa_nonpolar(st, nl);
-                double new_dih  = dihedral_e_boundary(st, topo.dihedrals, in_side);
-
-                // ── Metropolis 수용/거부 (Metropolis accept/reject) ─────────
-                double dE = (new_cross - old_cross) + (new_sasa - old_sasa)
-                          + (new_dih - old_dih);
-                if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
-                    curE += dE;
-                } else {
-                    // Revert: j-side 위치와 Born 반경 복원
-                    for (size_t k = 0; k < side.size(); ++k) {
-                        int idx      = side[k];
-                        st[idx].x    = old_pos[k][0];
-                        st[idx].y    = old_pos[k][1];
-                        st[idx].z    = old_pos[k][2];
-                        a[idx]       = old_born[k];
+                // ── 수용율 추적 및 cur_max 자동 조정 ──────────────────────
+                // Track acceptance; tune cur_max every TUNE_FREQ moves.
+                if (did_move) {
+                    acc_win += accepted ? 1 : 0;
+                    if (++tot_win == TUNE_FREQ) {
+                        double rate = (double)acc_win / TUNE_FREQ;
+                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        acc_win = tot_win = 0;
                     }
                 }
-
-                // ── in_side 플래그 초기화 (Reset in_side flags) ────────────
-                for (int k : side) in_side[k] = false;
             }
             ens[c] = std::move(st);
         };
@@ -1697,7 +1835,8 @@ PYBIND11_MODULE(protein_physics,m){
         .def_readonly("bonds",          &BondTopology::bonds)
         .def_readonly("rot_bonds",      &BondTopology::rot_bonds)
         .def_readonly("rot_bond_sides", &BondTopology::rot_bond_sides)
-        .def_readonly("excl",           &BondTopology::excl)
+        .def_readonly("excl",             &BondTopology::excl)
+        .def_readonly("rot_bond_scale",   &BondTopology::rot_bond_scale)
         .def_property_readonly("num_dihedrals",
             [](const BondTopology& t){ return (int)t.dihedrals.size(); })
         .def_property_readonly("num_atoms",
@@ -1705,7 +1844,9 @@ PYBIND11_MODULE(protein_physics,m){
         .def_property_readonly("num_bonds",
             [](const BondTopology& t){ return (int)t.bonds.size(); })
         .def_property_readonly("num_rot_bonds",
-            [](const BondTopology& t){ return (int)t.rot_bonds.size(); });
+            [](const BondTopology& t){ return (int)t.rot_bonds.size(); })
+        .def_property_readonly("num_concerted_pairs",
+            [](const BondTopology& t){ return (int)t.concerted_pairs.size(); });
     py::class_<PhysicsEngine>(m,"PhysicsEngine")
         .def(py::init<>())
         .def("calculate_potential",
