@@ -76,7 +76,8 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import protein_physics
-from amber_params import get_atom_params as _amber_get_params
+from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES
+import iupred as _iupred
 
 
 def _try_gpu_backend():
@@ -212,120 +213,160 @@ def _atom_params(atom):
 
 def _parse_pdb(path, log, physics_mod):
     """PDB 파일을 파싱해 물리 엔진용 파티클 목록과 결합 위상 그래프를 구성한다.
-    Parse a PDB file and build a particle list + bond topology for the physics engine.
+    Parse a PDB file into a Particle list + BondTopology for the physics engine.
 
     ── 반환값 (Returns) ──────────────────────────────────────────────────────────
-      particles  — 모든 유효한 중원자(heavy atom)에 대한 physics_mod.Particle 목록.
-                   list of physics_mod.Particle for all valid heavy atoms.
-      ca_indices — particles 목록 내 각 Cα 원자의 인덱스 (잔기 순서).
-                   index into particles for each Cα atom (in residue order).
-      ca_map     — {(chain_id, res_seq): 좌표 배열} RMSD 계산용 참조 딕셔너리.
-                   dict {(chain_id, res_seq): coord_array} for RMSD reference.
-      topology   — physics_mod.BondTopology 인스턴스.
-                   adj(인접 목록), bonds(결합 쌍), rot_bonds(회전 가능 결합) 포함.
-                   physics_mod.BondTopology instance with adj list, bond pairs,
-                   and rotatable bonds.
+      atoms         — 모든 유효 중원자(금속 이온 포함)에 대한 Particle 목록.
+                      Particle list for all valid heavy atoms including metal ions.
+      ca_indices    — atoms 목록 내 각 Cα 원자의 인덱스 (잔기 등장 순서).
+                      Index into atoms for each Cα atom, in residue encounter order.
+      ca_map        — {(chain_id, res_seq): 좌표 배열} — Kabsch RMSD 계산에 사용.
+                      dict {(chain_id, res_seq): coord} for Kabsch RMSD computation.
+      topo          — 이황화 구속이 등록된 BondTopology 인스턴스.
+                      BondTopology with disulfide restraints registered.
+      iupred_scores — IUPred 유사 예측기에서 계산한 잔기별 무질서 확률 [0, 1].
+                      Per-Cα disorder probability from the sequence-based predictor.
+      ca_residues   — [(chain_id, res_seq, res_name3)] — 무질서 프로파일 x축 레이블용.
+                      Residue info per Cα for disorder profile x-axis labels.
 
-    ── 건너뜀 규칙 (Skip rules) ────────────────────────────────────────────────
-      • HETATM 레코드 (리간드, 물 분자):
-        BioPython에서 res.get_id()[0] != ' '이면 HETATM.
-        현재 GAFF 파라미터 미지원으로 건너뜀 (IMPROVEMENTS.md P2.1 참고).
-        HETATM records (ligands, waters): res.get_id()[0] != ' ' in BioPython.
-        Skipped because GAFF parameters are not yet included (see P2.1).
-      • NaN / Inf 좌표: 결정학 미해상 루프(loop)에서 발생.
-        Invalid (NaN/Inf) coordinates: occur in unresolved crystallographic loops.
+    ── HETATM 처리 방침 (P2.2) ───────────────────────────────────────────────────
+      BioPython에서 res.get_id()[0]의 값:
+        ' '     → 표준 ATOM 레코드 (표준 아미노산)
+        'H_xxx' → HETATM 레코드 (리간드, 이온 등)
+        'W'     → 물 분자 (WAT, HOH)
+
+      이전 방침: 모든 HETATM 건너뜀 → 금속 활성 부위 단백질에서 이온이 소실됨.
+
+      현재 방침 (P2.2):
+        • 물 분자 (HOH, WAT, …): 항상 건너뜀.
+          이유: implicit-solvent(GB/SASA) 모델을 사용하므로 명시적 물이 불필요.
+               포함 시 O(N²) 비결합 합산이 크게 느려지고 Born 반경이 왜곡됨.
+        • 금속 이온 (MG, ZN, FE 등): 포함. ION_PARAMS 표에서 직접 파라미터 조회.
+        • 기타 HETATM (유기 리간드): 포함. 원소 기호 기반 폴백 파라미터 사용.
+          결합 위상(topo)은 알 수 없는 잔기를 조용히 건너뛰므로 안전.
+
+      BioPython residue id interpretation:
+        ' '     → standard ATOM record (standard amino acid)
+        'H_xxx' → HETATM record (ligand, ion, etc.)
+        'W'     → water
+
+      New policy (P2.2):
+        • Water: always dropped (implicit-solvent model; explicit water would inflate
+          the O(N²) pair sum and distort Born radii).
+        • Metal ions: included using pre-tabulated ION_PARAMS.
+        • Other HETATM: included using element-symbol fallback params.
+
+    ── 건너뜀 규칙 요약 (Skip rules) ────────────────────────────────────────────
+      • 물 분자 (HOH, WAT, TIP3, SOL 등)
+      • NaN/Inf 좌표 (결정학 미해상 루프)
+      • Water residues (any name in _WATER_RESNAMES)
+      • Invalid (NaN/Inf) coordinates (unresolved crystallographic loops)
     """
     parser = PDBParser(QUIET=True)
     st = parser.get_structure("prot", path)
     atoms, skipped = [], 0
     ca_indices, ca_map = [], {}
 
-    # ── 위상 구성용 원자별 메타데이터 배열 ──────────────────────────────────────
-    # BondTopology.build()에 전달할 세 개의 평행 배열.
-    # 모두 atoms 목록과 동일한 순서·길이를 유지해야 함.
-    #
+    # ── Cα 잔기 정보 수집 (Cα residue info collection) ──────────────────────────
+    # ca_residues: 무질서 프로파일 x축 레이블용 (chain_id, res_seq, res_name3) 3-튜플.
+    # ca_resnames: IUPred 서열 입력용 3글자 잔기명 목록 (Cα 순서).
+    # ca_residues: (chain_id, res_seq, res_name3) for each Cα — disorder plot x-axis.
+    # ca_resnames: 3-letter resnames in Cα order — sequence input for IUPred.
+    ca_residues: list[tuple] = []
+    ca_resnames: list[str]   = []
+
+    # ── SG 원자 추적 (CYS SG atom tracking for disulfide detection, P2.3) ───────
+    # 각 시스테인 SG 원자에 대해 (파티클 인덱스, x, y, z)를 저장한다.
+    # 파싱 완료 후 SG–SG 거리를 전체 검사해 이황화 결합을 탐지한다.
+    # Store (particle_idx, x, y, z) for each CYS SG atom.
+    # After parsing, check all SG–SG pairs for distances < 2.5 Å.
+    sg_atoms: list[tuple] = []
+    n_ions = 0   # 포함된 금속 이온 수 (로그용) / included metal ion count for logging
+
+    # ── 위상 구성용 메타데이터 배열 (BondTopology metadata arrays) ──────────────
+    # BondTopology.build()에 전달하는 세 개의 평행 배열.
+    # 모두 atoms 목록과 동일한 순서·길이를 유지해야 한다.
     # Three parallel arrays passed to BondTopology.build().
     # Must stay in the same order and length as the atoms list.
-    #
-    #   meta_resnames  — 잔기명 (예: "ALA", "GLY")
-    #                    residue name (e.g. "ALA")
-    #   meta_atomnames — PDB 원자명 (예: "CA", "OG1")
-    #                    PDB atom name (e.g. "CA")
-    #   meta_residx    — 고유 잔기 정수 인덱스 (아래 residue_id_map에서 할당)
-    #                    unique sequential residue integer (assigned below)
-    meta_resnames:  list[str] = []
-    meta_atomnames: list[str] = []
-    meta_residx:    list[int] = []
+    meta_resnames:  list[str] = []   # 잔기명 (예: "ALA") / residue name
+    meta_atomnames: list[str] = []   # 원자명 (예: "CA") / atom name
+    meta_residx:    list[int] = []   # 잔기별 고유 정수 인덱스 / unique residue integer index
 
-    # ── 잔기별 고유 정수 인덱스 할당 ────────────────────────────────────────────
-    # 키: (chain_id, res_seq, icode) 세 값을 함께 쓰는 이유:
-    #   • chain_id: 다중 체인 단백질에서 서로 다른 체인의 잔기를 구분.
-    #     예: 체인 A의 잔기 5와 체인 B의 잔기 5는 별개.
-    #   • res_seq:  PDB 잔기 일련번호 (정수). 체인 내 순서.
-    #   • icode:    삽입 코드 (insertion code).  PDB에서 동일 번호 잔기가 여러 개인 경우
-    #               (예: '100A', '100B') 를 구분하는 한 글자 코드.
-    #
-    # 값: 등장 순서대로 부여한 0-기반 정수.  이 정수의 연속성(r, r+1)이
-    # C++ build()에서 펩타이드 결합 탐지에 사용된다.
-    #
-    # Key: (chain_id, res_seq, icode) — three values combined because:
-    #   • chain_id: distinguishes residues across chains in multi-chain proteins.
-    #     e.g. chain-A residue 5 ≠ chain-B residue 5.
-    #   • res_seq:  PDB residue sequence number (integer).
-    #   • icode:    PDB insertion code (single char) — distinguishes residues
-    #     with the same sequence number (e.g. "100A", "100B" in antibody numbering).
-    #
-    # Value: 0-based integer assigned in first-encounter order.
-    # Consecutive values (r, r+1) are used in C++ build() to detect peptide bonds.
+    # ── 잔기별 고유 정수 인덱스 할당 맵 (Residue → sequential integer index) ────
+    # 키: (chain_id, res_seq, icode) — 삽입코드까지 포함해 항체 번호매김(100A, 100B)처리.
+    # 값: 0-기반 정수. C++ build()에서 연속값(r, r+1)이 펩타이드 결합 탐지에 사용됨.
+    # HETATM 잔기는 10만 이상의 고립 인덱스를 부여해 인접성 오해를 방지.
+    # Key: (chain_id, res_seq, icode) — insertion code handles antibody numbering (100A,100B).
+    # Value: 0-based integer; consecutive (r, r+1) triggers peptide bond in C++ build().
+    # HETATM residues get isolated large indices (≥100 000) — no adjacency to ATOM residues.
     residue_id_map: dict[tuple, int] = {}
 
     for atom in st.get_atoms():
-        res = atom.get_parent()   # BioPython Residue 객체 / BioPython Residue object
+        res      = atom.get_parent()
+        # BioPython 잔기 플래그: ' '=표준AA, 'H_xxx'=HETATM, 'W'=물
+        # BioPython residue flag: ' '=standard AA, 'H_xxx'=HETATM, 'W'=water
+        het_flag = res.get_id()[0]
+        resname  = res.get_resname().strip()
+        atomname = atom.get_name().strip()
 
-        # HETATM 건너뜀: res.get_id()[0]은 ' '(표준 아미노산), 'H_xxx'(HETATM), 'W'(물).
-        # Skip HETATM: get_id()[0] is ' ' for standard AA, 'H_xxx' for ligands, 'W' for water.
-        if res.get_id()[0] != " ":
+        # ── 물 분자 제거 ──────────────────────────────────────────────────────
+        # implicit-solvent 모델에서 명시적 물은 불필요하고 계산 비용만 증가시킴.
+        # Drop water molecules — counterproductive with our implicit-solvent model.
+        if het_flag != " " and resname in _WATER_RESNAMES:
             continue
 
-        coord = atom.get_coord()   # numpy array [x, y, z] in Å
-
-        # NaN/Inf 좌표 건너뜀 (미해상 루프 등에서 발생할 수 있음).
-        # Skip atoms with invalid coordinates (unresolved loops, etc.).
+        # ── 좌표 유효성 검사 ──────────────────────────────────────────────────
+        # NaN/Inf 좌표는 결정학적으로 해상도가 부족한 루프 영역에서 발생함.
+        # Invalid coords occur in crystallographically unresolved loop regions.
+        coord = atom.get_coord()
         if not np.all(np.isfinite(coord)):
             skipped += 1
             continue
 
-        # Cα 원자: ca_indices와 ca_map 갱신.
-        # ca_indices: RMSD·RMSF 계산 시 atoms 배열에서 Cα 위치를 빠르게 참조.
-        # ca_map:     (chain_id, res_seq) → 좌표, Kabsch RMSD 계산에 사용.
-        # Cα atom: update ca_indices and ca_map.
-        # ca_indices: fast Cα lookup into atoms array for RMSD / RMSF.
-        # ca_map:     (chain_id, res_seq) → coords for Kabsch RMSD.
-        if atom.get_name().strip() == "CA":
+        # ── Cα 원자 추적 (표준 ATOM 레코드만) ──────────────────────────────────
+        # HETATM의 경우 atomname이 "CA"여도 Cα 탄소가 아니므로 표준 ATOM만 처리.
+        # For standard ATOM records only: Cα atoms define backbone for RMSD/RMSF/IUPred.
+        if het_flag == " " and atomname == "CA":
             ca_indices.append(len(atoms))
             ca_key = (res.get_parent().get_id(), res.get_id()[1])
             ca_map[ca_key] = coord.copy()
+            ca_residues.append((res.get_parent().get_id(), res.get_id()[1], resname))
+            ca_resnames.append(resname)
 
-        # 잔기 고유 인덱스 할당.  처음 등장하는 잔기에만 새 정수를 부여.
-        # Assign unique residue index.  New integer only on first encounter.
-        res_key = (res.get_parent().get_id(),   # chain_id, e.g. 'A'
-                   res.get_id()[1],              # res_seq, e.g. 42
-                   res.get_id()[2])              # icode,   e.g. ' ' or 'A'
+        # ── CYS SG 원자 추적 (이황화 탐지용, P2.3) ───────────────────────────
+        # 파티클 목록에 추가되기 직전의 인덱스 len(atoms)를 함께 저장한다.
+        # Store particle index BEFORE appending (= current len(atoms)) + coordinates.
+        if het_flag == " " and resname == "CYS" and atomname == "SG":
+            sg_atoms.append((len(atoms), float(coord[0]), float(coord[1]), float(coord[2])))
+
+        # 금속 이온 카운트 (로그 표시용)
+        # Count ion atoms for the log message.
+        if het_flag != " " and resname in ION_PARAMS:
+            n_ions += 1
+
+        # ── 잔기 고유 인덱스 할당 ────────────────────────────────────────────
+        # 표준 AA: 등장 순서대로 연속 정수 부여 → C++에서 펩타이드 결합 자동 탐지.
+        # HETATM: 10만 + 카운터로 고립 인덱스 부여 → 표준 AA와 인접하지 않도록.
+        # Standard AA: sequential integer in encounter order → C++ detects peptide bonds.
+        # HETATM:  isolated large index (≥100 000) → no adjacency to standard AA.
+        res_key = (res.get_parent().get_id(), res.get_id()[1], res.get_id()[2])
         if res_key not in residue_id_map:
-            residue_id_map[res_key] = len(residue_id_map)
+            if het_flag == " ":
+                residue_id_map[res_key] = len(residue_id_map)
+            else:
+                residue_id_map[res_key] = 100000 + len(residue_id_map)
 
-        # 메타데이터 수집 (atoms와 동일한 순서로 추가).
-        # Collect metadata (appended in the same order as atoms).
-        meta_resnames.append(res.get_resname().strip())
-        meta_atomnames.append(atom.get_name().strip())
+        meta_resnames.append(resname)
+        meta_atomnames.append(atomname)
         meta_residx.append(residue_id_map[res_key])
 
-        # AMBER ff14SB 파라미터로 파티클 생성.
-        # _atom_params()는 amber_params.get_atom_params()에 위임해
-        # (잔기명, 원자명) → (전하 e, 반경 Å, ε kcal/mol)을 반환.
-        # Create Particle with AMBER ff14SB parameters.
-        # _atom_params() delegates to amber_params.get_atom_params()
-        # returning (charge e, radius Å, epsilon kcal/mol).
+        # AMBER ff14SB 파라미터 조회 → Particle 생성.
+        # _atom_params() → amber_params.get_atom_params() 위임:
+        #   이온 잔기 → ION_PARAMS 직접 반환
+        #   표준 AA  → (잔기명, 원자명) → AMBER 원자 유형 → VDW + RESP 전하
+        #   알 수 없는 잔기 → 원소 기호 기반 폴백
+        # Create Particle: _atom_params() → get_atom_params() which handles ions,
+        # standard AA (full AMBER params), and unknown residues (element fallback).
         charge, r, e = _atom_params(atom)
         atoms.append(physics_mod.Particle(
             float(coord[0]), float(coord[1]), float(coord[2]),
@@ -333,38 +374,69 @@ def _parse_pdb(path, log, physics_mod):
 
     if skipped:
         log(f"  ⚠  {skipped} atoms skipped (invalid coords)")
+    if n_ions:
+        log(f"  ions: {n_ions} metal/ion atoms included")
 
-    # ── 결합 위상 그래프 구성 ─────────────────────────────────────────────────
-    # BondTopology.build()에 세 메타데이터 배열을 전달한다.
-    # 내부적으로:
-    #   1. (res_idx, atomname) → 파티클 인덱스 역방향 맵 구성
-    #   2. AMBER 잔기 템플릿으로 잔기 내 결합 추가
-    #   3. 연속 잔기 간 펩타이드 결합 C(i)→N(i+1) 추가
-    #   4. rot_specs 표로 회전 가능 결합 인덱스 추출
-    #
-    # Build the covalent bond topology.
-    # BondTopology.build() receives the three parallel metadata arrays and:
-    #   1. Builds a (res_idx, atomname) → particle index reverse lookup
-    #   2. Adds intra-residue bonds from AMBER templates
-    #   3. Adds peptide bonds C(i)→N(i+1) between consecutive residues
-    #   4. Extracts rotatable bond indices from rot_specs tables
-    # BondTopology is defined in the CPU module only; always use protein_physics
-    # even when the GPU backend is selected for simulation.
+    # ── 결합 위상 그래프 구성 (Build covalent bond topology) ─────────────────
+    # BondTopology는 HETATM 잔기(bond_templates에 없음)를 조용히 건너뛴다.
+    # BondTopology.build() silently skips HETATM residues (not in bond_templates).
     topo = protein_physics.BondTopology()
     topo.build(meta_resnames, meta_atomnames, meta_residx)
-    log(f"  topology: {topo.num_bonds} bonds · {topo.num_rot_bonds} rotatable")
+    log(f"  topology: {topo.num_bonds} bonds · {topo.num_rot_bonds} rotatable"
+        f" · {topo.num_concerted_pairs} crankshaft pairs")
 
-    return atoms, ca_indices, ca_map, topo
+    # ── 이황화 결합 탐지 (Disulfide bond detection, P2.3) ─────────────────────
+    # 모든 CYS SG 원자 쌍 중 SG–SG < 2.5 Å인 쌍을 이황화 결합으로 간주한다.
+    # 탐지 기준 2.5 Å = 이황화 결합 공유 결합 거리(2.0–2.1 Å) + 0.5 Å 여유.
+    # 탐지된 쌍마다 topo.add_disulfide(i, j) 호출:
+    #   1) disulfide_pairs에 등록 → 하모닉 구속 에너지에 기여
+    #   2) excl에 추가 → 비결합 합산에서 제외 (1-2 쌍 배제)
+    #
+    # Scan all CYS SG–SG pairs for distances < 2.5 Å (= SG-SG bond length 2.0-2.1 Å
+    # plus 0.5 Å tolerance).  For each detected pair, add_disulfide():
+    #   1) Registers in disulfide_pairs → contributes harmonic restraint energy
+    #   2) Adds to excl[] → excluded from the non-bonded pair sum (1-2 exclusion)
+    n_ss = 0
+    for ai, (ia, ax, ay, az) in enumerate(sg_atoms):
+        for ib, bx, by, bz in (sg_atoms[k] for k in range(ai + 1, len(sg_atoms))):
+            dx, dy, dz = ax - bx, ay - by, az - bz
+            if dx*dx + dy*dy + dz*dz < 6.25:   # 2.5² = 6.25 Å²
+                topo.add_disulfide(ia, ib)
+                n_ss += 1
+    if n_ss:
+        log(f"  disulfide bonds: {n_ss} detected")
+
+    # ── IUPred 무질서 예측 (Sequence-based disorder prediction, P3.1) ────────
+    # 서열만으로 잔기별 무질서 확률을 계산한다. O(N × WINDOW) 시간, 즉각 처리.
+    # 이 값은 무질서 패널에 즉시 표시되어 landscape MC 결과를 기다릴 필요 없음.
+    # Pure sequence-based prediction — O(N × WINDOW), computed immediately on parse.
+    # Enables the disorder panel before the landscape MC run completes.
+    iupred_scores: list[float] = []
+    if ca_resnames:
+        iupred_scores = _iupred.score_from_resnames(ca_resnames)
+
+    return atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues
 
 def _parse_pdb_atoms_only(path, physics_mod):
-    """Lightweight PDB parser — returns only the particle list, no index maps.
+    """경량 PDB 파서 — Particle 목록만 반환, 인덱스 맵 없음.
+    Lightweight PDB parser — returns only the Particle list, no index maps.
+
+    ComparisonWorker에서 AlphaFold / SWISS-MODEL 구조의 에너지를 빠르게 평가할 때 사용.
+    결합 위상이나 이황화 탐지가 필요없이 단순 에너지 계산만 하면 되므로 간소화.
     Used by ComparisonWorker to quickly evaluate AlphaFold / SWISS-MODEL energies.
+    No topology or disulfide detection needed — energy evaluation only.
+
+    _parse_pdb와 동일한 물 제거 규칙을 적용: 물 HETATM만 건너뜀, 금속 이온은 포함.
+    Same water-skip rule as _parse_pdb: drop water HETATM, keep metal ions.
     """
     parser = PDBParser(QUIET=True)
     st = parser.get_structure("prot", path)
     atoms = []
     for atom in st.get_atoms():
-        if atom.get_parent().get_id()[0] != " ":
+        res = atom.get_parent()
+        # 물 분자만 제거, 금속 이온/리간드는 포함 (에너지 기여 포함).
+        # Drop only water; keep metal ions and ligands (they contribute to energy).
+        if res.get_id()[0] != " " and res.get_resname().strip() in _WATER_RESNAMES:
             continue
         coord = atom.get_coord()
         if not np.all(np.isfinite(coord)):
@@ -520,8 +592,9 @@ class PipelineWorker(QThread):
     """
     progress = pyqtSignal(str)
     metrics  = pyqtSignal(dict)
-    # ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo
-    finished = pyqtSignal(object, object, str, object, object, object, object)
+    # ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo, extra
+    # extra dict: {"iupred_scores": [...], "ca_residues": [...]}
+    finished = pyqtSignal(object, object, str, object, object, object, object, object)
     error    = pyqtSignal(str)
 
     def __init__(self, engine, target, physics_mod, n_cand=5, steps=300):
@@ -606,7 +679,8 @@ class PipelineWorker(QThread):
                 self.error.emit("Structure retrieval failed.")
                 return
             self.progress.emit("  Parsing PDB + AMBER forcefield mapping…")
-            atoms, ca_indices, ca_map, topo = _parse_pdb(path, self.progress.emit, self.physics_mod)
+            atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues = \
+                _parse_pdb(path, self.progress.emit, self.physics_mod)
             if not atoms:
                 self.error.emit("No valid protein atoms found.")
                 return
@@ -619,7 +693,8 @@ class PipelineWorker(QThread):
             self.progress.emit("  Computing ensemble free energies…")
             energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
             self.metrics.emit({"best_e": min(energies), "n_cand": self.n_cand})
-            self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms, topo)
+            extra = {"iupred_scores": iupred_scores, "ca_residues": ca_residues}
+            self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms, topo, extra)
         except Exception as ex:
             self.error.emit(str(ex))
 
@@ -988,6 +1063,8 @@ class ProteinApp(QMainWindow):
         self._rmsf_residues      = []
         self._rmsf_n_disordered  = 0
         self._rmsf_pct           = 0.0
+        self._iupred_scores      = []
+        self._ca_residues        = []
         self._build_ui()
         self.setStyleSheet(STYLE)
 
@@ -1312,13 +1389,27 @@ class ProteinApp(QMainWindow):
         if "best_e"   in d: self._mv_energy.setText(f"{d['best_e']:.0f}")
         if "n_cand"   in d: self._mv_cand.setText(str(d["n_cand"]))
 
-    def _on_done(self, ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo):
+    def _on_done(self, ensemble, energies, pdb_path, ca_indices, ca_map,
+                 init_atoms, topo, extra):
         self._ensemble    = ensemble
         self._energies    = energies
         self._init_atoms  = init_atoms
         self._topo        = topo
         self._ca_indices  = ca_indices
         self._pdb_path    = pdb_path
+        # ── IUPred 점수 저장 및 무질서 패널 즉시 활성화 ──────────────────────
+        # IUPred 예측은 순수 서열 기반이므로 MC landscape 실행 전에도 바로 표시 가능.
+        # 사용자가 무질서 버튼을 누르면 IUPred 단독 패널(단일 플롯)을 먼저 보게 되고,
+        # 이후 landscape 완료 시 RMSF와 나란히 보여지는 이중 패널로 업데이트된다.
+        # IUPred is sequence-only so the disorder panel can be enabled immediately.
+        # Before landscape: single IUPred panel.
+        # After landscape: dual-panel (IUPred top + RMSF bottom).
+        self._iupred_scores  = extra.get("iupred_scores", [])
+        self._ca_residues    = extra.get("ca_residues", [])
+        if self._iupred_scores:
+            self._draw_disorder_profile(residues=self._ca_residues,
+                                        iupred_scores=self._iupred_scores)
+            self.disorder_toggle_btn.setEnabled(True)
         self.run_btn.setEnabled(True)
         self.best_btn.setEnabled(True)
         self.landscape_start_btn.setEnabled(True)
@@ -1539,7 +1630,8 @@ class ProteinApp(QMainWindow):
             residues = _extract_ca_residues(self._pdb_path)
             self._rmsf          = rmsf
             self._rmsf_residues = residues
-            self._draw_disorder_profile(rmsf, residues)
+            self._draw_disorder_profile(rmsf=rmsf, residues=residues,
+                                        iupred_scores=self._iupred_scores)
             self.disorder_toggle_btn.setEnabled(True)
 
         self._log(f"[LANDSCAPE] Classification: {lbl}  ·  "
@@ -2003,67 +2095,138 @@ class ProteinApp(QMainWindow):
 
     # ── Disorder / RMSF profile ───────────────────────────────────
 
-    def _draw_disorder_profile(self, rmsf, residues):
-        """Plot per-residue RMSF; green = ordered, red = disordered (≥2 Å).
-        잔기별 RMSF 프로파일 플롯: 초록 = 규칙(ordered), 빨강 = 무질서(≥2 Å).
+    def _draw_disorder_profile(self, rmsf=None, residues=None, iupred_scores=None):
+        """잔기별 유연성 프로파일을 matplotlib으로 그린다.
+        Plot the per-residue flexibility / disorder profile.
 
-        RMSF 2 Å 기준(threshold)은 문헌에서 광범위하게 사용되는 무질서 기준:
-        • RMSF < 2 Å: 잔기가 고정된 위치 근처에서 소진동 → 규칙 구조
-        • RMSF ≥ 2 Å: 잔기가 넓은 범위에서 운동 → 유연/무질서 영역
-        X-선 B-인수와 직접 비교 가능: RMSF = sqrt(3B / 8π²)
-        The 2 Å threshold is literature-standard for disordered regions.
-        Directly comparable to X-ray B-factors: RMSF = sqrt(3B / 8π²).
+        ── 이중 패널 설계 (Dual-panel design) ────────────────────────────────────
+        사용 가능한 데이터에 따라 1~2개의 서브플롯을 동적으로 생성한다:
+
+          1. IUPred 패널 (PDB 파싱 직후 즉시 사용 가능):
+             서열 기반 잔기별 무질서 확률 [0, 1].
+             기준값(threshold) 0.5 초과 → 무질서로 예측.
+             서열 특성만으로 판단하므로 MC 실행 전에 먼저 볼 수 있음.
+
+          2. RMSF 패널 (landscape MC 궤적 완료 후):
+             MC 시뮬레이션에서 각 Cα의 평균 제곱근 요동 (Å).
+             RMSF ≥ 2 Å → 유연/무질서 영역 (문헌 표준 기준값).
+             X-선 결정학 B-인수와 직접 비교 가능: RMSF = sqrt(3B/8π²).
+
+        두 패널은 동일한 x축(잔기 번호)와 레이블을 공유해 비교를 용이하게 한다.
+
+        Dynamic subplot count based on available data:
+          Panel 1 — IUPred: sequence-based disorder probability [0,1] per residue.
+                    Available immediately after _parse_pdb().  Threshold = 0.5.
+          Panel 2 — RMSF:   per-Cα root-mean-square fluctuation (Å) from MC.
+                    Available after landscape MC trajectory.  Threshold = 2 Å.
+                    Directly comparable to X-ray B-factors: RMSF = sqrt(3B/8π²).
+
+        ── 동적 업데이트 흐름 (Update sequence) ────────────────────────────────
+          1. _on_done()에서 호출: iupred_scores만 있음 → IUPred 단일 패널.
+          2. _on_landscape_done()에서 호출: rmsf도 있음 → 이중 패널.
+
+        Called first from _on_done() with IUPred only → single panel.
+        Called again from _on_landscape_done() with both → dual panel.
+
+        파라미터 / Parameters
+        ─────────────────────
+        rmsf          — 잔기별 RMSF 배열 (Å). None이면 RMSF 패널 생략.
+                        Per-residue RMSF array (Å). None → skip RMSF panel.
+        residues      — [(chain_id, res_seq, res_name3)] — x축 눈금 레이블.
+                        List of (chain_id, res_seq, res_name3) for x-axis tick labels.
+        iupred_scores — 잔기별 무질서 확률 [0,1]. None이면 IUPred 패널 생략.
+                        Per-residue disorder probability [0,1]. None → skip IUPred panel.
         """
-        THRESHOLD = 2.0   # Å — standard disorder cutoff (무질서 판별 기준값)
-        n_res = min(len(rmsf), len(residues))
+        have_rmsf   = rmsf is not None and len(rmsf) > 0
+        have_iupred = iupred_scores is not None and len(iupred_scores) > 0
+
+        if not have_rmsf and not have_iupred:
+            return
+
+        n_res = 0
+        if have_rmsf and residues:
+            n_res = min(len(rmsf), len(residues))
+        if have_iupred and residues:
+            n_res = max(n_res, min(len(iupred_scores), len(residues) if residues else len(iupred_scores)))
+        if n_res == 0:
+            if have_rmsf:    n_res = len(rmsf)
+            if have_iupred:  n_res = max(n_res, len(iupred_scores))
         if n_res == 0:
             return
 
-        x = np.arange(1, n_res + 1)
-        y = rmsf[:n_res]
-
-        n_dis = int((y > THRESHOLD).sum())
-        pct   = 100.0 * n_dis / n_res
-        self._rmsf_n_disordered = n_dis
-        self._rmsf_pct          = pct
-        self.disorder_stats_lbl.setText(
-            f"DISORDERED: {n_dis} / {n_res} residues  ({pct:.1f}%)")
-
+        n_panels = int(have_rmsf) + int(have_iupred)
         self._disorder_fig.clear()
-        ax = self._disorder_fig.add_subplot(111)
-        ax.set_facecolor("#f8fafc")
         self._disorder_fig.patch.set_facecolor("#f8fafc")
+        axes = self._disorder_fig.subplots(n_panels, 1, squeeze=False,
+                                           gridspec_kw={"hspace": 0.45})
+        panel = 0
 
-        ax.fill_between(x, 0, y, where=(y <= THRESHOLD),
-                        color="#16a34a", alpha=0.22, label="Ordered (<2 Å)")
-        ax.fill_between(x, 0, y, where=(y > THRESHOLD),
-                        color="#dc2626", alpha=0.22, label="Disordered (≥2 Å)")
-        ax.plot(x, y, color="#1e293b", lw=1.2, zorder=3)
-        ax.axhline(THRESHOLD, color="#dc2626", lw=0.9, linestyle="--",
-                   alpha=0.65, label="2 Å cutoff")
+        def _tick_labels(ax_obj, n):
+            if residues and len(residues) >= n:
+                step = max(1, n // 20)
+                tp   = list(range(1, n + 1, step))
+                tl   = [str(residues[t-1][1]) if t-1 < len(residues) else str(t) for t in tp]
+                ax_obj.set_xticks(tp); ax_obj.set_xticklabels(tl, fontsize=6, rotation=45, ha="right")
 
-        if residues:
-            step = max(1, n_res // 20)
-            tick_pos = list(range(1, n_res + 1, step))
-            tick_lbl = [
-                str(residues[tp - 1][1]) if tp - 1 < len(residues) else str(tp)
-                for tp in tick_pos
-            ]
-            ax.set_xticks(tick_pos)
-            ax.set_xticklabels(tick_lbl, fontsize=6, rotation=45, ha="right")
+        # ── IUPred panel (sequence-based, always shown when available) ──────
+        if have_iupred:
+            ax = axes[panel][0]
+            ax.set_facecolor("#f8fafc")
+            n = min(len(iupred_scores), n_res)
+            x = np.arange(1, n + 1)
+            y = np.array(iupred_scores[:n])
+            THOLD = 0.5
+            n_dis = int((y > THOLD).sum())
+            pct   = 100.0 * n_dis / n if n else 0.0
+            ax.fill_between(x, 0, y, where=(y <= THOLD), color="#16a34a", alpha=0.20)
+            ax.fill_between(x, 0, y, where=(y > THOLD),  color="#dc2626", alpha=0.20)
+            ax.plot(x, y, color="#1e293b", lw=1.0, zorder=3)
+            ax.axhline(THOLD, color="#dc2626", lw=0.8, linestyle="--", alpha=0.6)
+            ax.set_xlim(1, n); ax.set_ylim(0, 1)
+            ax.set_ylabel("IUPred score", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"Sequence disorder (IUPred)  ·  {n_dis}/{n} predicted disordered ({pct:.1f}%)",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+            ax.tick_params(colors="#94a3b8", labelsize=6)
+            for sp in ax.spines.values(): sp.set_edgecolor("#e2e8f0"); sp.set_linewidth(0.7)
+            _tick_labels(ax, n)
+            panel += 1
 
-        ax.set_xlim(1, n_res)
-        ax.set_ylim(bottom=0)
-        ax.set_xlabel("Residue", fontsize=8, color="#64748b", labelpad=4)
-        ax.set_ylabel("RMSF (Å)", fontsize=8, color="#64748b", labelpad=4)
-        ax.set_title(
-            f"Residue Flexibility  ·  {n_dis}/{n_res} disordered ({pct:.1f}%)",
-            fontsize=9, color="#1e293b", fontweight="bold", pad=8)
-        ax.tick_params(colors="#94a3b8", labelsize=7)
-        for sp in ax.spines.values():
-            sp.set_edgecolor("#e2e8f0"); sp.set_linewidth(0.8)
-        ax.legend(fontsize=7, framealpha=0.88, edgecolor="#e2e8f0",
-                  facecolor="#ffffff", labelcolor="#1e293b", loc="upper right")
+        # ── RMSF panel (simulation-based, shown when landscape is done) ─────
+        if have_rmsf:
+            ax = axes[panel][0]
+            ax.set_facecolor("#f8fafc")
+            n = min(len(rmsf), n_res)
+            x = np.arange(1, n + 1)
+            y = np.array(rmsf[:n])
+            THOLD = 2.0
+            n_dis = int((y > THOLD).sum())
+            pct   = 100.0 * n_dis / n if n else 0.0
+            self._rmsf_n_disordered = n_dis
+            self._rmsf_pct          = pct
+            self.disorder_stats_lbl.setText(
+                f"RMSF: {n_dis}/{n_res} residues disordered (≥2 Å)  ({pct:.1f}%)")
+            ax.fill_between(x, 0, y, where=(y <= THOLD), color="#16a34a", alpha=0.22)
+            ax.fill_between(x, 0, y, where=(y > THOLD),  color="#dc2626", alpha=0.22)
+            ax.plot(x, y, color="#1e293b", lw=1.0, zorder=3)
+            ax.axhline(THOLD, color="#dc2626", lw=0.8, linestyle="--", alpha=0.6)
+            ax.set_xlim(1, n); ax.set_ylim(bottom=0)
+            ax.set_xlabel("Residue", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("RMSF (Å)", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"MC flexibility (RMSF)  ·  {n_dis}/{n} disordered ({pct:.1f}%)",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+            ax.tick_params(colors="#94a3b8", labelsize=6)
+            for sp in ax.spines.values(): sp.set_edgecolor("#e2e8f0"); sp.set_linewidth(0.7)
+            _tick_labels(ax, n)
+
+        if not have_rmsf:
+            # Update stats label for IUPred-only mode
+            n = min(len(iupred_scores), n_res) if have_iupred else 0
+            y = np.array(iupred_scores[:n]) if have_iupred else np.array([])
+            n_dis = int((y > 0.5).sum())
+            pct   = 100.0 * n_dis / n if n else 0.0
+            self.disorder_stats_lbl.setText(
+                f"IUPred: {n_dis}/{n} residues disordered (score>0.5)  ({pct:.1f}%)")
+
         self._disorder_canvas.draw()
 
     def _render_colored_by_rmsf(self):

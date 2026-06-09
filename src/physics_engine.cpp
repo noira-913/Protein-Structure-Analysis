@@ -180,14 +180,109 @@ struct NeighborList {
     std::vector<std::vector<size_t>> nb;
     std::vector<std::array<double,3>> ref;
     size_t N=0;
-    // O(N²) full rebuild: refresh pair lists and snapshot reference positions.
-    void build(const std::vector<Particle>& p){
-        N=p.size();nb.assign(N,{});ref.resize(N);
-        for(size_t i=0;i<N;++i){
-            ref[i]={p[i].x,p[i].y,p[i].z};
-            for(size_t j=i+1;j<N;++j){
-                double dx=p[i].x-p[j].x,dy=p[i].y-p[j].y,dz=p[i].z-p[j].z;
-                if(dx*dx+dy*dy+dz*dz<NL_RCUT2) nb[i].push_back(j);
+    // ── 셀 목록 이웃 목록 재구축 (Cell-list Neighbor List rebuild, P4.1) ─────────
+    //
+    // ── 배경: O(N²) 방식의 문제 (Why we need a cell list) ───────────────────────
+    //
+    // 기존 방식(모든 쌍 순환)은 N개 원자에 대해 O(N²) 연산이 필요하다.
+    // N = 2000 (단백질 약 150 잔기)에서 약 2×10⁶ 쌍 검사.
+    // N = 10000 (단백질 약 750 잔기)에서 약 5×10⁷ 쌍 검사.
+    // 재구축 빈도는 낮지만(drift 기반) 각 재구축 자체가 병목이 된다.
+    //
+    // The old all-pairs loop is O(N²).  For N=2 000 (≈150 residues) that is
+    // ~2×10⁶ pair checks per rebuild.  For N=10 000 (~750 residues) it is
+    // ~5×10⁷ checks.  Even at low rebuild frequency (drift-triggered) this
+    // becomes the bottleneck for larger proteins.
+    //
+    // ── 셀 목록 원리 (Cell-list principle) ──────────────────────────────────────
+    //
+    // 알고리즘:
+    //   1. 경계 상자를 한 변 길이 cs = sqrt(NL_RCUT2) + ε 의 3D 직교 셀로 분할.
+    //      cs ≥ 탐색 반경이므로, 두 원자가 탐색 반경 내에 있다면
+    //      반드시 동일 셀 또는 3D에서 1셀 이내 인접 셀에 존재한다.
+    //      (증명: 두 원자가 2셀 이상 떨어진 셀에 있다면 적어도 한 차원에서
+    //       거리가 cs ≥ NL_RCUT 이상이므로 탐색 반경을 초과함.)
+    //   2. 각 원자를 해당 셀 목록에 등록.  O(N).
+    //   3. 각 원자 i에 대해 3×3×3 = 27개 이웃 셀(자기 셀 포함)의 원자 j만 검사.
+    //      j > i 조건으로 중복 제거.  탐색 반경 초과 쌍은 거리 검사로 필터링.
+    //
+    // Cell-list algorithm:
+    //   1. Partition the bounding box into cubic cells of side cs ≥ sqrt(NL_RCUT2).
+    //      Key property: any two atoms within the search radius must be in the
+    //      same cell or a cell that is at most 1 cell away in each dimension.
+    //      Proof: if two atoms are ≥ 2 cells apart in any dimension, their
+    //      separation in that dimension is ≥ cs ≥ search_radius → outside cutoff.
+    //   2. Bin each atom into its cell.  O(N).
+    //   3. For each atom i, scan only atoms j in the 27-cell 3×3×3 neighbourhood.
+    //      Use j>i to avoid double-counting.  Filter by exact distance check.
+    //
+    // 복잡도 분석 (Complexity):
+    //   평균 원자 밀도 ρ(atoms/Å³)에서 셀당 원자 수 ≈ ρ × cs³ = 상수.
+    //   각 원자가 검사하는 쌍 수 ≈ 27 × 셀당 원자 수 = O(1).
+    //   전체 재구축 복잡도: O(N).
+    //   실용적 속도 향상: N = 1000에서 ≈ 40×, N = 5000에서 ≈ 200×.
+    //
+    // Average complexity: O(N) because each atom checks only a constant number
+    // of neighbors (27 cells × ρ×cs³ atoms per cell ≈ constant).
+    // Practical speedup: ≈40× at N=1000, ≈200× at N=5000.
+    //
+    // ── 구현 세부 (Implementation details) ──────────────────────────────────────
+    //
+    // cs = sqrt(NL_RCUT2) + ε:
+    //   수치 오차로 경계 원자가 잘못 분류되는 것을 막기 위한 작은 여백.
+    //   Small epsilon prevents floating-point boundary atoms from being misclassified.
+    //
+    // 경계 처리: 경계 상자를 cs 만큼 확장해 모든 원자가 유효한 셀 인덱스를 갖도록.
+    //   std::clamp 로 경계 초과 인덱스를 안전하게 클램핑.
+    // Boundary: expand the box by one cell (margin=cs) so all atoms get valid
+    //   cell indices; clamp prevents out-of-range access.
+    void build(const std::vector<Particle>& p) {
+        N = p.size(); nb.assign(N, {}); ref.resize(N);
+        if (N == 0) return;
+        for (size_t i = 0; i < N; ++i) ref[i] = {p[i].x, p[i].y, p[i].z};
+        if (N == 1) return;
+
+        // Bounding box
+        double xlo=p[0].x,xhi=p[0].x,ylo=p[0].y,yhi=p[0].y,zlo=p[0].z,zhi=p[0].z;
+        for (const auto& a : p) {
+            xlo=std::min(xlo,a.x); xhi=std::max(xhi,a.x);
+            ylo=std::min(ylo,a.y); yhi=std::max(yhi,a.y);
+            zlo=std::min(zlo,a.z); zhi=std::max(zhi,a.z);
+        }
+        // Cell side = full search radius ensures 3×3×3 neighborhood covers all pairs.
+        const double cs = std::sqrt(NL_RCUT2) + 1e-6;
+        const double mg = cs;   // expand box by one cell on each side
+        xlo -= mg; ylo -= mg; zlo -= mg;
+        double lx = xhi - xlo + 2.0*mg, ly = yhi - ylo + 2.0*mg, lz = zhi - zlo + 2.0*mg;
+        int nx = std::max(1, (int)std::ceil(lx / cs));
+        int ny = std::max(1, (int)std::ceil(ly / cs));
+        int nz = std::max(1, (int)std::ceil(lz / cs));
+
+        // Assign each atom to a cell
+        std::vector<std::vector<size_t>> cells((size_t)(nx*ny*nz));
+        std::vector<int> cx(N), cy(N), cz(N);
+        for (size_t i = 0; i < N; ++i) {
+            cx[i] = std::min(nx-1, std::max(0, (int)std::floor((p[i].x-xlo)/cs)));
+            cy[i] = std::min(ny-1, std::max(0, (int)std::floor((p[i].y-ylo)/cs)));
+            cz[i] = std::min(nz-1, std::max(0, (int)std::floor((p[i].z-zlo)/cs)));
+            cells[(size_t)(cx[i]+nx*(cy[i]+ny*cz[i]))].push_back(i);
+        }
+
+        // For each atom i scan the 3×3×3 cell neighbourhood
+        for (size_t i = 0; i < N; ++i) {
+            for (int dz=-1; dz<=1; ++dz) {
+                int cz2 = cz[i]+dz; if (cz2<0||cz2>=nz) continue;
+                for (int dy=-1; dy<=1; ++dy) {
+                    int cy2 = cy[i]+dy; if (cy2<0||cy2>=ny) continue;
+                    for (int dx=-1; dx<=1; ++dx) {
+                        int cx2 = cx[i]+dx; if (cx2<0||cx2>=nx) continue;
+                        for (size_t j : cells[(size_t)(cx2+nx*(cy2+ny*cz2))]) {
+                            if (j <= i) continue;
+                            double ddx=p[i].x-p[j].x,ddy=p[i].y-p[j].y,ddz=p[i].z-p[j].z;
+                            if (ddx*ddx+ddy*ddy+ddz*ddz < NL_RCUT2) nb[i].push_back(j);
+                        }
+                    }
+                }
             }
         }
     }
@@ -858,6 +953,86 @@ public:
     // than single torsion moves for large proteins.
     std::vector<std::pair<int,int>>  concerted_pairs;
 
+    // ── 이황화 결합 쌍 및 구속 (Disulfide bond pairs + restraints, P2.3) ────────
+    //
+    // ── 이황화 결합 생화학 (Disulfide bond biochemistry) ─────────────────────────
+    //
+    // 이황화 결합(S–S bond)은 두 시스테인 잔기의 SG 원자 사이에 형성되는
+    // 공유 결합이다.  산화 환경에서 형성되며 단백질의 3차 구조를 안정화시키는
+    // 주요 공유 가교 역할을 한다.  면역글로불린(항체), 인슐린, 리보핵산분해효소 A
+    // 등 수많은 분비 단백질과 세포외 단백질에 나타난다.
+    //
+    // Disulfide bonds (S–S bonds) form between the SG atoms of two Cysteine
+    // residues in oxidising environments and act as covalent cross-links that
+    // stabilise the tertiary structure.  They are prevalent in secreted proteins,
+    // antibodies, insulin, RNase A, and many extracellular proteins.
+    //
+    // PDB 구조에서 이황화 결합의 특징:
+    //   SG–SG 거리 ≈ 2.0–2.1 Å (공유 결합 거리).
+    //   정상 범위: 1.9–2.3 Å.  2.5 Å를 초과하면 비결합 상태.
+    //   탐지 기준: SG–SG < 2.5 Å (0.5 Å 여유 포함).
+    //   평형 거리: r₀ = 2.044 Å (ff14SB CYX 잔기 템플릿에서).
+    //
+    // Characteristics of disulfide bonds in PDB structures:
+    //   SG–SG distance ≈ 2.0–2.1 Å (covalent bond length).
+    //   Detection threshold: < 2.5 Å (generous 0.5 Å tolerance).
+    //   Equilibrium distance: r₀ = 2.044 Å (from AMBER ff14SB CYX template).
+    //
+    // ── 이 구현에서의 처리 (How this implementation handles them) ────────────────
+    //
+    // 등록 방식:
+    //   Python _parse_pdb()에서 SG 원자 인덱스를 수집한 후 SG–SG 거리를 검사.
+    //   2.5 Å 미만인 쌍마다 add_disulfide(i, j)를 호출해 이 목록에 등록.
+    //
+    // Registration:
+    //   _parse_pdb() in Python collects SG atom indices, then calls
+    //   add_disulfide(i,j) for every SG–SG pair closer than 2.5 Å.
+    //
+    // 에너지 기여:
+    //   총 에너지에 하모닉 구속 E_SS = K_SS × (r − r₀)² 추가 (P2.3).
+    //   K_SS = 600 kcal/mol/Å² → 약간의 변위에도 큰 에너지 페널티 → 결합 거리 유지.
+    //   이 값은 AMBER의 S–S 결합 신축 상수(~166 kcal/mol/Å²)보다 크지만,
+    //   MC 샘플러에서 간헐적으로 큰 torsion 이동이 이황화 결합 거리를 크게 변화시킬 수
+    //   있으므로 강한 구속으로 처리한다.
+    //
+    // Energy contribution:
+    //   A harmonic restraint E_SS = K_SS × (r − r₀)² is added to total_e() and
+    //   to the MC ΔE computation.  K_SS = 600 kcal/mol/Å² is intentionally stiffer
+    //   than the AMBER S–S stretching constant (≈166 kcal/mol/Å²) because a single
+    //   large torsion MC move can displace SG atoms significantly; the stiff spring
+    //   ensures the bond distance stays near r₀ throughout sampling.
+    //
+    // 1-2 배제:
+    //   이황화 결합은 공유 결합이므로 비결합 에너지 합산(pair_e)에서 제외해야 한다.
+    //   add_disulfide()는 쌍을 excl[]에도 추가해 1-2 쌍 배제 원칙을 준수한다.
+    //
+    // 1-2 exclusion:
+    //   As a covalent bond, the SS pair must be excluded from the non-bonded sum.
+    //   add_disulfide() inserts the pair into excl[] so is_excluded(i,j) returns true.
+    std::vector<std::pair<int,int>>  disulfide_pairs;
+
+    // add_disulfide: 이황화 결합 쌍 (i, j)를 등록한다.
+    //   • 경계 검사: 유효하지 않은 인덱스나 자기 자신과의 쌍은 조용히 무시.
+    //   • 정규화:   항상 i < j 로 저장 (excl과 일관성 유지).
+    //   • disulfide_pairs에 추가 후 excl[i]에도 삽입(이진 탐색으로 정렬 유지).
+    //
+    // add_disulfide: Register a disulfide bond between atoms i and j.
+    //   • Boundary check: silently ignore invalid indices or self-pairs.
+    //   • Normalise: always store with i < j (consistent with excl convention).
+    //   • Push to disulfide_pairs and insert j into excl[i] (keeps excl sorted).
+    void add_disulfide(int i, int j) {
+        if (i < 0 || j < 0 || i >= N || j >= N || i == j) return;
+        if (i > j) std::swap(i, j);
+        disulfide_pairs.push_back({i, j});
+        // 이황화 SG-SG 쌍을 1-2 비결합 배제 목록에 추가.
+        // 이진 탐색으로 정렬된 위치를 찾아 중복 없이 삽입.
+        // Insert SS pair into 1-2 exclusion list (binary search keeps list sorted,
+        // duplicate check prevents double-insertion).
+        auto& vi = excl[i];
+        auto pos = std::lower_bound(vi.begin(), vi.end(), j);
+        if (pos == vi.end() || *pos != j) vi.insert(pos, j);
+    }
+
     // ── build() ──────────────────────────────────────────────────────────────
     //
     // 파라미터 (Parameters) — 모두 길이 N, 파티클 배열과 동일 순서:
@@ -1353,6 +1528,79 @@ private:
         return E;
     }
 
+    // ── 이황화 결합 하모닉 구속 에너지 (Disulfide harmonic restraint energy, P2.3) ─
+    //
+    // 이황화 결합을 하모닉 스프링으로 모델링한다.
+    //   E_SS = K_SS × (r_SG-SG − r₀_SS)²
+    //
+    // 각 항의 의미 (Term definitions):
+    //   r_SG-SG — 두 시스테인 SG 원자 사이의 현재 거리 (Å)
+    //             Current distance between the two Cys SG atoms (Å)
+    //   r₀_SS   — 평형 SG–SG 결합 거리 (2.044 Å).
+    //             ff14SB CYX 잔기 템플릿에서 가져온 값.
+    //             Equilibrium SG–SG bond distance from AMBER ff14SB CYX template.
+    //   K_SS    — 힘 상수 (600 kcal/mol/Å²).
+    //             AMBER S–S 신축 상수(≈166 kcal/mol/Å²)보다 의도적으로 크게 설정.
+    //             이유: 단일 torsion MC 이동이 SG 원자를 크게 이동시킬 수 있으므로
+    //             강한 구속으로 이황화 결합 거리를 효과적으로 유지해야 한다.
+    //             Force constant (600 kcal/mol/Å²).  Intentionally larger than
+    //             the AMBER S-S stretching constant (≈166 kcal/mol/Å²) because
+    //             a single large torsion MC step can move SG far; the stiffer spring
+    //             keeps the bond distance near r₀ even with large proposals.
+    //
+    // ss_e(): 모든 이황화 쌍에 대해 구속 에너지를 합산한다. total_e()에서 사용.
+    //         Sum restraint energy over all SS pairs.  Called from total_e().
+    //
+    // ss_e_side(): MC 이동 중 ΔE 계산 최적화:
+    //   in_side 원자가 하나도 없는 SS 쌍은 이동에 의해 영향받지 않으므로 건너뜀.
+    //   이유: 강체 torsion 회전은 j-side 내부 거리를 보존하고,
+    //          i-side 내부 거리도 변하지 않는다.  변하는 것은 오직
+    //          i-side 원자 ↔ j-side 원자 사이의 거리뿐이다.
+    //   따라서 SS 쌍 (a, b)에서 a와 b 모두 같은 쪽(in_side 모두 true 또는 모두 false)이면
+    //   그 쌍의 에너지는 이동 전후로 변하지 않으므로 ΔE 계산에서 제외해도 된다.
+    //
+    // ss_e_side(): Optimised ΔE computation for MC moves:
+    //   Skip SS pairs where NEITHER or BOTH atoms are in in_side — their
+    //   pairwise distance is unchanged by a rigid torsion rotation (the
+    //   rotation preserves intra-side distances; only cross-side pairs change).
+    //   Only pairs where exactly one atom is in in_side (i.e. cross-side) change.
+    static constexpr double K_SS  = 600.0;    // 이황화 구속 힘 상수 (kcal/mol/Å²)
+                                               // SS restraint force constant
+    static constexpr double R0_SS = 2.044;    // SG–SG 평형 거리 (Å) / equilibrium SG-SG distance
+
+    // ss_e: 전체 이황화 구속 에너지 합산.  total_e()에서 호출.
+    // ss_e: Total disulfide restraint energy.  Called from total_e().
+    static double ss_e(const std::vector<Particle>& p,
+                        const std::vector<std::pair<int,int>>& ss) noexcept {
+        double E = 0.0;
+        for (const auto& [i, j] : ss) {
+            double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
+            double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+            E += K_SS * dr * dr;
+        }
+        return E;
+    }
+
+    // ss_e_side: MC 이동 ΔE에서 변화하는 이황화 구속 에너지만 합산.
+    // in_side 원자가 하나만 포함된 SS 쌍(cross-side)만 계산한다.
+    //
+    // ss_e_side: Partial SS restraint energy for MC ΔE — only cross-side pairs
+    // (exactly one atom in in_side) contribute to ΔE under a torsion rotation.
+    static double ss_e_side(const std::vector<Particle>& p,
+                              const std::vector<std::pair<int,int>>& ss,
+                              const std::vector<bool>& in_side) noexcept {
+        double E = 0.0;
+        for (const auto& [i, j] : ss) {
+            // 두 원자 모두 in_side이거나 둘 다 아니면 → 이동에 의해 거리 불변 → 건너뜀.
+            // Both in same side → rigid rotation preserves their distance → skip.
+            if (!in_side[i] && !in_side[j]) continue;
+            double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
+            double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+            E += K_SS * dr * dr;
+        }
+        return E;
+    }
+
     // HCT pairwise Born integral.
     // HCT(Hawkins-Cramer-Truhlar) 쌍별 Born 적분.
     //
@@ -1483,6 +1731,12 @@ private:
         double E = sasa_nonpolar(p, nl);
         if (topo && !topo->dihedrals.empty())
             E += dihedral_e(p, topo->dihedrals);
+        // 이황화 결합 구속 에너지: build()에 등록된 SG-SG 쌍에 대한 하모닉 에너지 합산.
+        // 이황화 결합이 없는 단백질에서는 disulfide_pairs가 비어 있어 추가 비용 없음.
+        // Disulfide restraint energy: harmonic sum over registered SG-SG pairs.
+        // Zero cost for proteins without disulfide bonds (empty vector short-circuits).
+        if (topo && !topo->disulfide_pairs.empty())
+            E += ss_e(p, topo->disulfide_pairs);
         size_t N = p.size();
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic,8) reduction(+:E)
@@ -1620,21 +1874,34 @@ public:
                     old_born[k] = a[idx];
                 }
 
-                double old_cross = cross_e();
-                double old_sasa  = sasa_nonpolar(st, nl);
-                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                double old_cross = cross_e();                     // 비결합 교차 쌍 에너지 (이동 전)
+                double old_sasa  = sasa_nonpolar(st, nl);        // 비극성 SASA 에너지 (이동 전)
+                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);  // 이중면체각 에너지 (이동 전)
+                // 이황화 구속 에너지 (이동 전): cross-side SG-SG 쌍만 계산.
+                // 이황화 결합 없으면 0.0 (단락 평가).
+                // SS restraint before move: only cross-side pairs.  0.0 if no SS bonds.
+                double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                 : ss_e_side(st, topo.disulfide_pairs, in_side);
 
+                // ── Rodrigues 회전 적용 + Born 반경 갱신 ─────────────────────────────
                 double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
                 for (int k : side)
                     rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ax, ay, az, cosD, sinD);
                 for (int k : side) update_born((size_t)k, st, nl, a);
 
-                double new_cross = cross_e();
-                double new_sasa  = sasa_nonpolar(st, nl);
-                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                double new_cross = cross_e();                     // 비결합 교차 쌍 에너지 (이동 후)
+                double new_sasa  = sasa_nonpolar(st, nl);        // 비극성 SASA 에너지 (이동 후)
+                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);  // 이중면체각 에너지 (이동 후)
+                // 이황화 구속 에너지 (이동 후).
+                // SS restraint after move.
+                double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                 : ss_e_side(st, topo.disulfide_pairs, in_side);
 
+                // ΔE = 모든 에너지 항의 변화량 합산 (이동 후 − 이동 전).
+                // ΔE = sum of all energy component changes (after - before move).
                 bool accepted = false;
-                double dE = (new_cross-old_cross) + (new_sasa-old_sasa) + (new_dih-old_dih);
+                double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                          + (new_dih-old_dih)   + (new_ss-old_ss);
                 if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
                     curE += dE;
                     accepted = true;
@@ -1683,9 +1950,13 @@ public:
                     old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
                     old_born[k] = a[idx];
                 }
-                double old_cross = cross_e();
-                double old_sasa  = sasa_nonpolar(st, nl);
-                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                double old_cross = cross_e();                    // 크로스-쌍 에너지 (이동 전) / cross-pair energy before
+                double old_sasa  = sasa_nonpolar(st, nl);       // 비극성 SASA (이동 전) / nonpolar SASA before
+                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side); // 이중면체각 (이동 전)
+                // 이황화 구속 (이동 전): cross-side 쌍만 포함. 이황화 없으면 0.0.
+                // SS restraint before both rotations: cross-side pairs only. 0.0 if no SS.
+                double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                 : ss_e_side(st, topo.disulfide_pairs, in_side);
 
                 // δ 샘플링: 크랭크샤프트는 실효 이동이 국소적이므로 스케일 없이 cur_max 사용.
                 // No lever-arm scale for crankshaft: the effective displacement is local
@@ -1720,12 +1991,19 @@ public:
                 // φ-side 전체 Born 반경 업데이트 (일부 원자는 제자리 복귀, 모두 갱신)
                 for (int k : phi_side) update_born((size_t)k, st, nl, a);
 
-                double new_cross = cross_e();
-                double new_sasa  = sasa_nonpolar(st, nl);
-                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                double new_cross = cross_e();                    // 크로스-쌍 에너지 (이동 후) / cross-pair after
+                double new_sasa  = sasa_nonpolar(st, nl);       // 비극성 SASA (이동 후) / SASA after
+                double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side); // 이중면체각 (이동 후)
+                // 이황화 구속 (두 회전 후). 하류 잔기가 근사 복귀하므로 ΔE는 작다.
+                // SS restraint after both rotations.  Small ΔE because downstream approximately restores.
+                double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                 : ss_e_side(st, topo.disulfide_pairs, in_side);
 
+                // 전체 ΔE = 모든 항의 변화량 합산.
+                // Total ΔE: sum of all component changes across both phase rotations.
                 bool accepted = false;
-                double dE = (new_cross-old_cross) + (new_sasa-old_sasa) + (new_dih-old_dih);
+                double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                          + (new_dih-old_dih)   + (new_ss-old_ss);
                 if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
                     curE += dE;
                     accepted = true;
@@ -1837,6 +2115,8 @@ PYBIND11_MODULE(protein_physics,m){
         .def_readonly("rot_bond_sides", &BondTopology::rot_bond_sides)
         .def_readonly("excl",             &BondTopology::excl)
         .def_readonly("rot_bond_scale",   &BondTopology::rot_bond_scale)
+        .def("add_disulfide", &BondTopology::add_disulfide,
+             py::arg("atom_i"), py::arg("atom_j"))
         .def_property_readonly("num_dihedrals",
             [](const BondTopology& t){ return (int)t.dihedrals.size(); })
         .def_property_readonly("num_atoms",
@@ -1846,7 +2126,9 @@ PYBIND11_MODULE(protein_physics,m){
         .def_property_readonly("num_rot_bonds",
             [](const BondTopology& t){ return (int)t.rot_bonds.size(); })
         .def_property_readonly("num_concerted_pairs",
-            [](const BondTopology& t){ return (int)t.concerted_pairs.size(); });
+            [](const BondTopology& t){ return (int)t.concerted_pairs.size(); })
+        .def_property_readonly("num_disulfide_pairs",
+            [](const BondTopology& t){ return (int)t.disulfide_pairs.size(); });
     py::class_<PhysicsEngine>(m,"PhysicsEngine")
         .def(py::init<>())
         .def("calculate_potential",

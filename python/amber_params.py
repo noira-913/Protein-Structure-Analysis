@@ -593,6 +593,91 @@ for _a, _q in [
 ]:
     PARTIAL_CHARGES[("TYR",_a)] = _q
 
+# ── 금속 이온 파라미터 (Common metal/ion params, P2.1) ───────────────────────
+#
+# PDB HETATM 레코드에 등장하는 일반적인 금속 이온과 단원자 이온에 대한
+# (전하, R* Å, ε kcal/mol) 파라미터 표.
+#
+# 출처 (Sources):
+#   • Joung & Cheatham (2008) J. Phys. Chem. B 112, 9020-9041
+#     (단원자 이온 Na⁺, K⁺, Rb⁺, Cs⁺, Li⁺, Cl⁻, Br⁻, I⁻의 TIP3P 최적화 파라미터)
+#   • Li, Merz et al. (2013, 2014, 2015) J. Chem. Theory Comput.
+#     (전이금속 Zn²⁺, Fe²⁺/³⁺, Mn²⁺, Co²⁺, Ni²⁺, Cu²⁺의 AMBER 이온-12-6 모델)
+#   • Ca²⁺, Mg²⁺: AMBER parm10.dat (기본 이온 파라미터 세트)
+#
+# Common metal/monoatomic ion parameters: (charge e, R* Å, ε kcal/mol).
+# Sources:
+#   Joung & Cheatham (2008) J. Phys. Chem. B 112, 9020-9041 — monovalent ions.
+#   Li, Merz et al. (2013-2015) J. Chem. Theory Comput. — divalent transition metals.
+#   Ca²⁺/Mg²⁺: AMBER parm10.dat default ion parameter set.
+#
+# 동작 원리:
+#   get_atom_params()는 (resname, atomname) 조회 전에 resname을 ION_PARAMS에서
+#   먼저 확인한다.  HETATM 레코드의 금속 이온은 표준 아미노산과 달리
+#   resname이 원소 기호와 동일하므로 ("MG", "ZN" 등) 이 테이블로 직접 처리된다.
+#
+# How it works:
+#   get_atom_params() checks resname against ION_PARAMS BEFORE the standard
+#   (resname, atomname) → ATOM_TYPE lookup.  Metal HETATM residue names match
+#   the element symbol exactly ("MG", "ZN", etc.), so this table catches them first.
+#
+# 중요: "CA"는 AMBER 원자 유형에서 방향족 탄소(aromatic carbon)를 가리키기도 하지만,
+# resname 조회는 (resname, atomname) 쌍 조회보다 먼저 실행되므로
+# HETATM의 Ca²⁺ 이온은 정확히 이 테이블에서 처리된다.
+# Note: "CA" is also the AMBER atom type for aromatic carbon; however, because
+# the resname lookup happens BEFORE the (resname, atomname) pair lookup, Ca²⁺
+# HETATM records are correctly caught by this table, not the ATOM_TYPE dict.
+ION_PARAMS: dict[str, tuple[float, float, float]] = {
+    # (전하 e, R* Å, ε kcal/mol) / (charge e, R* Å, ε kcal/mol)
+    "MG":  ( 2.0, 1.185, 0.8947),   # Mg²⁺ — 효소 활성 부위에 매우 흔함 (kinase, ATP 협조 등)
+                                     # Very common in enzyme active sites (kinases, ATP cofactor)
+    "CA":  ( 2.0, 1.713, 0.4598),   # Ca²⁺ — 신호 전달, 칼모듈린, EF-핸드 모티프
+                                     # Signalling, calmodulin, EF-hand motifs
+    "ZN":  ( 2.0, 1.213, 0.0125),   # Zn²⁺ — 아연 핑거, 카르복시펩티다제, 탄산무수화효소
+                                     # Zinc fingers, carboxypeptidase, carbonic anhydrase
+    "FE":  ( 2.0, 1.275, 0.0130),   # Fe²⁺ — 헴 철, 철-황 클러스터 (일반 철 항목)
+                                     # Heme iron, Fe-S clusters (generic iron entry)
+    "FE2": ( 2.0, 1.275, 0.0130),   # Fe²⁺ — 명시적 2가 철 잔기명 (FE2)
+                                     # Explicit Fe²⁺ residue name as used in some PDB entries
+    "FE3": ( 3.0, 1.206, 0.0130),   # Fe³⁺ — 3가 철, 리소자임 등 산화형 (R* 약간 작음)
+                                     # Fe³⁺ — smaller ionic radius than Fe²⁺
+    "MN":  ( 2.0, 1.258, 0.0150),   # Mn²⁺ — 망간 슈퍼옥사이드 디스뮤타제, 광합성계 II
+                                     # Manganese SOD, photosystem II oxygen-evolving complex
+    "NI":  ( 2.0, 1.163, 0.0150),   # Ni²⁺ — 니켈라제, 탄산탈수효소 변종
+                                     # Nickel in urease, hydrogenase
+    "CU":  ( 2.0, 1.178, 0.0150),   # Cu²⁺ — 사이토크롬 c 산화효소, 아주린, 플라스토시아닌
+                                     # Cytochrome c oxidase, azurin, plastocyanin
+    "CO":  ( 2.0, 1.227, 0.0150),   # Co²⁺ — 코발트 함유 효소, 비타민 B12 관련 단백질
+                                     # Cobalt enzymes, vitamin B12-related proteins
+    "NA":  ( 1.0, 1.364, 0.0874),   # Na⁺ — 이온 채널, 생리적 나트륨 이온
+                                     # Ion channels, physiological sodium
+    "CL":  (-1.0, 2.513, 0.0356),   # Cl⁻ — 염화이온, 종종 결정화 용액에서 기원
+                                     # Chloride ion, often from crystallisation solution
+    "K":   ( 1.0, 1.764, 0.0004),   # K⁺ — 칼륨 이온 채널, 단백질-DNA 상호작용
+                                     # Potassium channels, protein-DNA interfaces
+    "MO":  ( 0.0, 1.500, 0.0200),   # Mo  — 몰리브덴 보조인자 (잔기 oxidation state 다양, 근사값)
+                                     # Molybdenum cofactor; oxidation state varies, approx params
+}
+
+# ── 물 분자 잔기명 집합 (Water residue names to exclude) ─────────────────────
+#
+# implicit-solvent 모델(GB/SASA)을 사용하므로 명시적 물 분자는 불필요하다.
+# 오히려 포함하면 O(N²) 비결합 합산이 크게 느려지고 Born 반경 계산이 왜곡된다.
+# _parse_pdb()에서 이 집합에 속하는 HETATM 잔기를 조용히 제외한다.
+#
+# We use an implicit-solvent model (GB/SASA), so explicit water molecules are
+# unnecessary and counterproductive: they blow up the O(N²) pair sum and
+# distort Born radii.  _parse_pdb() silently skips any HETATM residue whose
+# name appears in this set.  The set covers all common water residue names
+# found in PDB files from different simulation packages:
+#   HOH  — standard PDB water (X-ray and NMR structures)
+#   WAT  — AMBER explicit water
+#   H2O  — alternative water label (rare)
+#   TIP  — TIP3P water (some PDB depositions)
+#   TIP3 — TIP3P full name
+#   SOL  — GROMACS water
+_WATER_RESNAMES: frozenset[str] = frozenset({"HOH", "WAT", "H2O", "TIP", "TIP3", "SOL"})
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_atom_params(resname: str, atomname: str) -> tuple[float, float, float]:
@@ -614,6 +699,14 @@ def get_atom_params(resname: str, atomname: str) -> tuple[float, float, float]:
     -------
     (charge e, radius Å, epsilon kcal/mol)
     """
+    # 금속/이온 잔기: ION_PARAMS에서 미리 정의된 파라미터를 직접 반환한다.
+    # (resname, atomname) 쌍 조회보다 먼저 실행해 Ca²⁺("CA") 등 이름 충돌을 방지.
+    # Metal/ion residues: return pre-tabulated params directly from ION_PARAMS.
+    # Checked BEFORE the (resname, atomname) pair lookup to prevent name collisions
+    # (e.g. "CA" is both the Ca²⁺ ion residue name and an AMBER aromatic-C atom type).
+    if resname in ION_PARAMS:
+        return ION_PARAMS[resname]
+
     charge  = PARTIAL_CHARGES.get((resname, atomname), 0.0)
     atype   = ATOM_TYPE.get((resname, atomname), None)
 
