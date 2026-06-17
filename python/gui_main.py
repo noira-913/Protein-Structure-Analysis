@@ -1641,9 +1641,19 @@ class ProteinApp(QMainWindow):
 
         lbl   = data["idp_label"]
         color = data["idp_color"]
-        self.idp_status_lbl.setText(lbl)
+
+        # Prefer the v2 classification if the disorder_report is available
+        dr = data.get("disorder_report")
+        if dr is not None:
+            display_lbl   = dr.idp_label_v2
+            display_color = dr.idp_color_v2
+        else:
+            display_lbl   = lbl
+            display_color = color
+
+        self.idp_status_lbl.setText(display_lbl)
         self.idp_status_lbl.setStyleSheet(
-            f"font-size:10px;font-weight:bold;color:{color};margin-left:6px;")
+            f"font-size:10px;font-weight:bold;color:{display_color};margin-left:6px;")
 
         self._draw_landscape(data)
 
@@ -1657,9 +1667,17 @@ class ProteinApp(QMainWindow):
                                         iupred_scores=self._iupred_scores)
             self.disorder_toggle_btn.setEnabled(True)
 
-        self._log(f"[LANDSCAPE] Classification: {lbl}  ·  "
+        self._log(f"[LANDSCAPE] v1: {lbl}  ·  "
                   f"{data['n_sig']} metastable basins  ·  "
                   f"funnel={data['funnel']:.2f}")
+        if dr is not None:
+            self._log(
+                f"[LANDSCAPE] v2: {dr.idp_label_v2}  ·  "
+                f"gap={dr.spectral_gap:.3f}  ·  "
+                f"S_norm={dr.basin_entropy_norm:.3f}  ·  "
+                f"tau={dr.tau_corr:.1f}  ·  "
+                f"DET={dr.rqa_det:.3f}  ·  "
+                f"rate={dr.mean_escape_rate:.4f}")
 
     def _draw_landscape(self, data):
         """Render the conformational graph on the matplotlib canvas.
