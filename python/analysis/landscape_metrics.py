@@ -24,6 +24,15 @@ from __future__ import annotations
 import numpy as np
 from typing import NamedTuple
 
+# Optional C++ backend — provides OpenMP-accelerated RQA and ACF.
+# Built separately from protein_physics; graceful fallback to pure Python.
+try:
+    import protein_analysis as _cext
+    _HAS_CEXT = True
+except ImportError:
+    _cext = None  # type: ignore[assignment]
+    _HAS_CEXT = False
+
 
 # ─── public data structure ────────────────────────────────────────────────────
 
@@ -146,8 +155,11 @@ def autocorr_decay(pca_traj: np.ndarray) -> tuple[float, np.ndarray]:
     if q2 < 1e-12:
         return float(n), np.ones(max_lag)
 
-    acf = np.array([float(np.dot(q[:n-lag], q[lag:])) / q2
-                    for lag in range(max_lag)])
+    if _HAS_CEXT:
+        acf = _cext.compute_acf(q.astype(np.float64))
+    else:
+        acf = np.array([float(np.dot(q[:n-lag], q[lag:])) / q2
+                        for lag in range(max_lag)])
 
     # Fit exponential on positive part to get τ_corr
     positive = acf > 0
@@ -187,6 +199,11 @@ def recurrence_determinism(pca_traj: np.ndarray,
     if n < 4:
         return 0.0, 0.0
 
+    if _HAS_CEXT:
+        det, lam = _cext.compute_rqa(pca_traj.astype(np.float64), eps_quantile, min_line)
+        return float(det), float(lam)
+
+    # Pure-Python fallback ─────────────────────────────────────────────────────
     # Pairwise Euclidean distances in PCA space
     diff = pca_traj[:, np.newaxis, :] - pca_traj[np.newaxis, :, :]
     dist = np.sqrt((diff ** 2).sum(axis=2))
@@ -203,7 +220,6 @@ def recurrence_determinism(pca_traj: np.ndarray,
     diag_points = 0
     for d in range(-(n - min_line), n - min_line + 1):
         diag = np.diag(R, d)
-        # Count points in runs of length >= min_line
         run = 0
         for v in diag:
             if v:
