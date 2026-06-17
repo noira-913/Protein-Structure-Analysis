@@ -78,6 +78,7 @@ import matplotlib.colors as mcolors
 import protein_physics
 from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES
 import iupred as _iupred
+from analysis import compute_disorder_metrics
 
 
 def _try_gpu_backend():
@@ -982,6 +983,27 @@ class LandscapeWorker(QThread):
             f"  [LANDSCAPE] Done · {len(sig)} significant basins · "
             f"funnel={funnel:.2f} · {idp_label}")
 
+        # ── Scientifically grounded landscape metrics (replaces KAM-based §3) ─
+        # These run on the already-computed result dict, adding spectral gap,
+        # basin entropy, ACF decay time, RQA determinism, and Kramers rates.
+        # The partial dict below is enough for compute_disorder_metrics.
+        _partial = {
+            "snapshots":   snapshots,
+            "energies":    energies,
+            "layout":      layout,
+            "communities": communities,
+            "node_comm":   node_comm,
+        }
+        try:
+            disorder_report = compute_disorder_metrics(_partial, T=self.T)
+            self.progress.emit(
+                f"  [LANDSCAPE] v2 · gap={disorder_report.spectral_gap:.2f} · "
+                f"S_norm={disorder_report.basin_entropy_norm:.2f} · "
+                f"{disorder_report.idp_label_v2}")
+        except Exception as _exc:
+            self.progress.emit(f"  [LANDSCAPE] v2 metrics error: {_exc}")
+            disorder_report = None
+
         self.result.emit({
             "snapshots":    snapshots,
             "energies":     energies,
@@ -994,6 +1016,7 @@ class LandscapeWorker(QThread):
             "e_spread":     float(e_spread),
             "idp_label":    idp_label,
             "idp_color":    idp_color,
+            "disorder_report": disorder_report,   # None if compute failed
         })
 
 # ═══════════════════════════════════════════════════════════════════
