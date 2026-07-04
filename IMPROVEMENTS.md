@@ -68,16 +68,23 @@
 - Immediate partial fix: stop skipping HETATM; use element-based fallback
   for unknown types; add tabulated params for common ions (Mg²⁺, Ca²⁺,
   Zn²⁺, Fe²⁺/³⁺, Na⁺, Cl⁻).
-- Full fix: ship a GAFF2 atom type table for organic ligands; call
-  antechamber programmatically or cache params for common cofactors
+- Full fix (deferred): ship a GAFF2 atom type table for organic ligands;
+  call antechamber programmatically or cache params for common cofactors
   (ATP, heme, NAD⁺, FAD, PLP…).
-- Status: TODO.
+- Status: **DONE** (immediate partial fix) — `_parse_pdb` in `gui_main.py`
+  no longer skips HETATM; metal ions get element-based fallback params;
+  isolated large residue indices (≥100 000) prevent spurious adjacency
+  to standard-AA residues. GAFF2 full fix still not implemented.
 
 **7. No disulfide bonds**
 - Cys SG–SG covalent bonds (~2.05 Å) are not detected or enforced.
 - Fix: scan parsed structure for Cys pairs with SG–SG < 2.5 Å;
   add a stiff harmonic restraint or bond term.
-- Status: TODO.
+- Status: **DONE** — `BondTopology::add_disulfide()` in `physics_engine.cpp`
+  registers SG–SG pairs (<2.5 Å) detected during PDB parsing, excludes them
+  from nonbonded pair energy, and applies a harmonic restraint
+  (`ss_e`/`ss_e_side`, K_SS=600 kcal/mol/Å², r0=2.044 Å) in `total_e()` and
+  the MC ΔE path.
 
 **8. No membrane / lipid environment**
 - Implicit solvent assumes uniform water (ε = 78.5) everywhere.
@@ -95,7 +102,12 @@
   20×20 amino acid statistical potential.
   Output: per-residue disorder probability in [0,1]; replace current
   RMSF-based classification.
-- Status: TODO.
+- Status: **DONE** — `python/iupred.py` implements the sequence-based
+  disorder predictor; `_parse_pdb` calls `score_from_resnames()` and the
+  GUI shows an IUPred panel immediately after parsing (before any MC run),
+  plus a dual IUPred+RMSF panel once the landscape run completes.
+  RMSF-based classification kept as a complementary trajectory-based view,
+  not replaced.
 
 **10. RMSD comparison ignores sidechain conformation**
 - Only Cα atoms are compared; two structures can have identical backbone
@@ -137,15 +149,16 @@ P1.4a physics_engine.cpp — dihedral energy (Ramachandran penalties)     ✓ DO
 ─────────────────────────────────────────────────────────────────
 P1.4c physics_engine.cpp — bond + angle energy terms (safe to defer)
 ─────────────────────────────────────────────────────────────────
-P2.1  amber_params.py — common metal ion params
-P2.2  gui_main.py/_parse_pdb — stop dropping HETATM
-P2.3  physics_engine.cpp — disulfide detection + restraints
+P2.1  amber_params.py — common metal ion params                          ✓ DONE
+P2.2  gui_main.py/_parse_pdb — stop dropping HETATM                      ✓ DONE
+P2.3  physics_engine.cpp — disulfide detection + restraints              ✓ DONE
 ─────────────────────────────────────────────────────────────────
-P3.1  python/iupred.py  — sequence-based disorder predictor
-P3.2  gui_main.py       — integrate IUPred into PDB parsing
+P3.1  python/iupred.py  — sequence-based disorder predictor              ✓ DONE
+P3.2  gui_main.py       — integrate IUPred into PDB parsing              ✓ DONE
+P3.3  gui_main.py/_compute_rmsd — all-heavy-atom RMSD option             ✓ DONE
 ─────────────────────────────────────────────────────────────────
-P4.1  physics_engine.cpp — cell-list NL build
-P4.2  physics_engine_cuda.cu — GPU-resident trajectory
+P4.1  physics_engine.cpp — cell-list NL build                            ✓ DONE
+P4.2  physics_engine_cuda.cu — GPU-resident trajectory                   TODO
 ```
 
 ---
