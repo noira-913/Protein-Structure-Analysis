@@ -228,6 +228,21 @@ def _parse_pdb(path, log, physics_mod):
                       Per-Cα disorder probability from the sequence-based predictor.
       ca_residues   — [(chain_id, res_seq, res_name3)] — 무질서 프로파일 x축 레이블용.
                       Residue info per Cα for disorder profile x-axis labels.
+      heavy_map     — {(chain_id, res_seq, atom_name): 좌표 배열} — 전체 중원자 RMSD용.
+                      dict {(chain_id, res_seq, atom_name): coord} for all-heavy-atom RMSD
+                      (P10 개선: 사이드체인 형태를 반영하는 RMSD, ca_map과 동일 원리이나
+                      원자명까지 키에 포함해 모든 중원자를 구분한다).
+                      Same idea as ca_map but keyed down to atom_name so every heavy atom
+                      (not just Cα) participates in the Kabsch superposition — see the
+                      "전체 중원자 RMSD" comment block below for the full rationale.
+      heavy_indices — atoms 목록 내 각 중원자의 인덱스, heavy_map과 동일한 순서.
+                      Index into atoms for each heavy atom, in the same order as heavy_map.
+      heavy_keys    — heavy_indices와 짝이 되는 (chain_id, res_seq, atom_name) 키 목록.
+                      Parallel (chain_id, res_seq, atom_name) key list matching heavy_indices
+                      (MC 앙상블 후보는 좌표 배열뿐이므로, 이 인덱스로 다시 키를 붙여준다).
+                      MC ensemble candidates are bare coordinate arrays with no atom
+                      metadata, so this lets us re-attach (chain, res_seq, atom_name)
+                      keys the same way ca_indices does for Cα-only RMSD.
 
     ── HETATM 처리 방침 (P2.2) ───────────────────────────────────────────────────
       BioPython에서 res.get_id()[0]의 값:
@@ -266,6 +281,15 @@ def _parse_pdb(path, log, physics_mod):
     st = parser.get_structure("prot", path)
     atoms, skipped = [], 0
     ca_indices, ca_map = [], {}
+
+    # ── 전체 중원자 맵 준비 (all-heavy-atom map, P10) ───────────────────────────
+    # heavy_map: (chain_id, res_seq, atom_name) → 좌표. heavy_indices/heavy_keys:
+    # atoms 목록 내 인덱스와 그에 대응하는 키를 병렬 배열로 저장 (ca_indices와 동일 패턴).
+    # heavy_map: (chain_id, res_seq, atom_name) → coord. heavy_indices/heavy_keys are
+    # parallel arrays (index into atoms + matching key), mirroring the ca_indices pattern.
+    heavy_indices: list[int] = []
+    heavy_keys:    list[tuple] = []
+    heavy_map:     dict = {}
 
     # ── Cα 잔기 정보 수집 (Cα residue info collection) ──────────────────────────
     # ca_residues: 무질서 프로파일 x축 레이블용 (chain_id, res_seq, res_name3) 3-튜플.
@@ -332,6 +356,41 @@ def _parse_pdb(path, log, physics_mod):
             ca_map[ca_key] = coord.copy()
             ca_residues.append((res.get_parent().get_id(), res.get_id()[1], resname))
             ca_resnames.append(resname)
+
+        # ── 전체 중원자 RMSD (all-heavy-atom RMSD, IMPROVEMENTS #10) ─────────────
+        # Cα RMSD만 비교하면 백본이 겹쳐도 사이드체인 회전이체(rotamer)가 완전히
+        # 달라진 구조를 "동일하다"고 오판할 수 있다. 예를 들어 활성 부위 잔기의
+        # 사이드체인이 반대 방향을 향해도 Cα 위치는 거의 변하지 않는다. 모든
+        # 중원자(백본 + 사이드체인)를 Kabsch 중첩에 포함시키면 이런 로컬 패킹
+        # 차이가 RMSD 값에 직접 반영되어, 참조 구조와의 비교가 더 엄격해진다.
+        #
+        # Cα-only RMSD can call two structures "identical" even when a sidechain
+        # rotamer flips entirely — e.g. an active-site sidechain pointing the
+        # opposite way barely moves the Cα.  Including every heavy atom (backbone
+        # + sidechain) in the Kabsch superposition makes local packing differences
+        # show up directly in the RMSD, giving a stricter structural comparison.
+        #
+        # 수소 제외 이유: AlphaFold/SWISS-MODEL 등 비교 대상 참조 구조들은 대개
+        # 수소를 명시적으로 포함하지 않으므로, 우리 쪽에서도 수소를 빼야 두 맵의
+        # 키가 실제로 겹친다 (수소를 넣으면 공통 키가 거의 0개가 되어 RMSD가
+        # 계산 불가능해진다).
+        # Hydrogens excluded: reference structures (AlphaFold, SWISS-MODEL) rarely
+        # include explicit hydrogens, so we drop them here too — otherwise the two
+        # key sets would barely overlap and _compute_rmsd would have no common atoms.
+        #
+        # HETATM 제외 이유: 리간드/이온은 서로 다른 구조 소스 사이에서 1:1로
+        # 대응한다는 보장이 없다 (아예 없을 수도, 다른 리간드가 결합했을 수도
+        # 있음). 표준 ATOM 레코드(폴리펩티드 골격+사이드체인)만 포함해야 비교가
+        # 의미를 가진다.
+        # HETATM excluded: ligands/ions aren't guaranteed to correspond 1:1 across
+        # different structure sources (may be absent, or a different ligand may be
+        # bound) — only standard ATOM records (backbone + sidechain) make a
+        # meaningful heavy-atom comparison.
+        if het_flag == " " and not atomname.startswith("H"):
+            heavy_key = (res.get_parent().get_id(), res.get_id()[1], atomname)
+            heavy_indices.append(len(atoms))
+            heavy_keys.append(heavy_key)
+            heavy_map[heavy_key] = coord.copy()
 
         # ── CYS SG 원자 추적 (이황화 탐지용, P2.3) ───────────────────────────
         # 파티클 목록에 추가되기 직전의 인덱스 len(atoms)를 함께 저장한다.
@@ -415,7 +474,8 @@ def _parse_pdb(path, log, physics_mod):
     if ca_resnames:
         iupred_scores = _iupred.score_from_resnames(ca_resnames)
 
-    return atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues
+    return (atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues,
+            heavy_map, heavy_indices, heavy_keys)
 
 def _parse_pdb_atoms_only(path, physics_mod):
     """경량 PDB 파서 — Particle 목록만 반환, 인덱스 맵 없음.
@@ -465,6 +525,37 @@ def _ca_map_from_pdb(path):
         break
     avg_b = float(np.mean(bfactors)) if bfactors else None
     return ca_map, avg_b
+
+def _heavy_atom_map_from_pdb(path):
+    """Return {(chain_id, res_seq, atom_name): coord} for a reference PDB file
+    (AlphaFold / SWISS-MODEL). Mirrors _ca_map_from_pdb but keeps every
+    standard-ATOM-record non-hydrogen heavy atom instead of Cα only.
+
+    _ca_map_from_pdb과 동일한 구조이나 Cα뿐 아니라 모든 표준 ATOM 중원자를 수집한다.
+    전체 중원자 RMSD(P10)에서 참조 구조 쪽 맵을 만들 때 사용한다.
+
+    수소·HETATM을 제외하는 이유는 _parse_pdb의 "전체 중원자 RMSD" 주석 참고:
+    참조 구조는 수소가 없고, 리간드/이온은 소스 간 1:1 대응이 보장되지 않는다.
+    See the "all-heavy-atom RMSD" comment block in _parse_pdb for why hydrogens
+    and HETATM records are excluded (reference files lack explicit hydrogens;
+    ligands/ions aren't guaranteed to correspond 1:1 across sources).
+    """
+    parser = PDBParser(QUIET=True)
+    st = parser.get_structure("x", path)
+    heavy_map = {}
+    for model in st:
+        for chain in model:
+            for res in chain:
+                if res.get_id()[0] != " ":
+                    continue
+                for atom in res:
+                    name = atom.get_name().strip()
+                    if name.startswith("H"):
+                        continue
+                    key = (chain.get_id(), res.get_id()[1], name)
+                    heavy_map[key] = atom.get_coord().copy()
+        break
+    return heavy_map
 
 def _compute_rmsd(ca_map1, ca_map2):
     """Kabsch-superimposed Cα RMSD (Å) between two residue-keyed coordinate maps.
@@ -593,7 +684,10 @@ class PipelineWorker(QThread):
     progress = pyqtSignal(str)
     metrics  = pyqtSignal(dict)
     # ensemble, energies, pdb_path, ca_indices, ca_map, init_atoms, topo, extra
-    # extra dict: {"iupred_scores": [...], "ca_residues": [...]}
+    # extra dict: {"iupred_scores": [...], "ca_residues": [...],
+    #              "heavy_map": {...}, "heavy_indices": [...], "heavy_keys": [...]}
+    # (heavy_* added for IMPROVEMENTS #10 all-heavy-atom RMSD; kept in extra so the
+    #  finished() signal arity doesn't need to change — same precedent as iupred_scores.)
     finished = pyqtSignal(object, object, str, object, object, object, object, object)
     error    = pyqtSignal(str)
 
@@ -679,7 +773,8 @@ class PipelineWorker(QThread):
                 self.error.emit("Structure retrieval failed.")
                 return
             self.progress.emit("  Parsing PDB + AMBER forcefield mapping…")
-            atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues = \
+            (atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues,
+             heavy_map, heavy_indices, heavy_keys) = \
                 _parse_pdb(path, self.progress.emit, self.physics_mod)
             if not atoms:
                 self.error.emit("No valid protein atoms found.")
@@ -693,7 +788,9 @@ class PipelineWorker(QThread):
             self.progress.emit("  Computing ensemble free energies…")
             energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
             self.metrics.emit({"best_e": min(energies), "n_cand": self.n_cand})
-            extra = {"iupred_scores": iupred_scores, "ca_residues": ca_residues}
+            extra = {"iupred_scores": iupred_scores, "ca_residues": ca_residues,
+                      "heavy_map": heavy_map, "heavy_indices": heavy_indices,
+                      "heavy_keys": heavy_keys}
             self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms, topo, extra)
         except Exception as ex:
             self.error.emit(str(ex))
@@ -706,7 +803,8 @@ class ComparisonWorker(QThread):
     result   = pyqtSignal(list)
 
     def __init__(self, target, pdb_path, ca_indices, ref_ca_map,
-                 ensemble, energies, engine, physics_mod):
+                 ensemble, energies, engine, physics_mod,
+                 heavy_indices=None, ref_heavy_map=None):
         super().__init__()
         self.target      = target
         self.pdb_path    = pdb_path
@@ -716,6 +814,14 @@ class ComparisonWorker(QThread):
         self.energies    = energies
         self.engine      = engine
         self.physics_mod = physics_mod
+        # ── 전체 중원자 RMSD용 참조 데이터 (P10) ────────────────────────────
+        # heavy_indices/ref_heavy_map이 없으면(구버전 호출 등) 빈 값으로 폴백해
+        # Heavy RMSD 열이 "—"로만 표시되고 나머지 기능은 그대로 동작한다.
+        # Reference data for all-heavy-atom RMSD. Falls back to empty containers
+        # if not supplied, so the Heavy RMSD column just shows "—" without
+        # breaking anything else.
+        self.heavy_indices = heavy_indices if heavy_indices is not None else []
+        self.ref_heavy_map = ref_heavy_map if ref_heavy_map is not None else {}
 
     def _pdb_to_uniprot(self, pdb_id):
         try:
@@ -785,6 +891,28 @@ class ComparisonWorker(QThread):
                     ca_map[key] = np.array([p.x, p.y, p.z])
         return ca_map
 
+    def _mc_heavy_map(self, cand_idx):
+        """MC 후보의 전체 중원자 좌표 맵을 (chain, res_seq, atom_name) 키로 재구성.
+        Rebuild an MC candidate's all-heavy-atom coordinate map keyed by
+        (chain, res_seq, atom_name).
+
+        _mc_ca_map과 동일한 원리: MC 앙상블 후보는 좌표 배열뿐이므로 파싱 시점에
+        저장해 둔 heavy_indices로 원래 (잔기, 원자명) 키를 다시 붙여준다.
+        Same idea as _mc_ca_map: MC ensemble candidates are bare coordinate
+        arrays, so heavy_indices (captured at parse time) lets us re-attach the
+        original (chain, res_seq, atom_name) key.
+        """
+        keys      = list(self.ref_heavy_map.keys())
+        particles = self.ensemble[cand_idx]
+        heavy_map = {}
+        for j, key in enumerate(keys):
+            if j < len(self.heavy_indices):
+                pidx = self.heavy_indices[j]
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    heavy_map[key] = np.array([p.x, p.y, p.z])
+        return heavy_map
+
     def _energy_for(self, path):
         try:
             atoms = _parse_pdb_atoms_only(path, self.physics_mod)
@@ -799,12 +927,15 @@ class ComparisonWorker(QThread):
         best_idx = int(np.argmin(self.energies))
 
         for i, energy in enumerate(self.energies):
-            mc_ca = self._mc_ca_map(i)
-            rmsd  = _compute_rmsd(self.ref_ca_map, mc_ca) if mc_ca else None
+            mc_ca    = self._mc_ca_map(i)
+            rmsd     = _compute_rmsd(self.ref_ca_map, mc_ca) if mc_ca else None
+            mc_heavy = self._mc_heavy_map(i)
+            rmsd_heavy = _compute_rmsd(self.ref_heavy_map, mc_heavy) if mc_heavy else None
             results.append({
                 "source": f"MC  C{i+1}", "is_mc": True, "mc_idx": i,
                 "is_best": i == best_idx, "energy": energy,
-                "rmsd": rmsd, "plddt": None, "path": self.pdb_path,
+                "rmsd": rmsd, "rmsd_heavy": rmsd_heavy,
+                "plddt": None, "path": self.pdb_path,
             })
 
         is_pdb_id  = len(self.target) == 4
@@ -822,10 +953,12 @@ class ComparisonWorker(QThread):
             af_path = self._fetch_alphafold(uniprot_id)
             if af_path:
                 af_ca, avg_plddt = _ca_map_from_pdb(af_path)
+                af_heavy = _heavy_atom_map_from_pdb(af_path)
                 results.append({
                     "source": "AlphaFold", "is_mc": False, "is_best": False,
                     "energy": self._energy_for(af_path),
                     "rmsd": _compute_rmsd(self.ref_ca_map, af_ca),
+                    "rmsd_heavy": _compute_rmsd(self.ref_heavy_map, af_heavy),
                     "plddt": avg_plddt, "path": af_path,
                 })
 
@@ -834,10 +967,12 @@ class ComparisonWorker(QThread):
             sm_path = self._fetch_swissmodel(uniprot_id)
             if sm_path:
                 sm_ca, _ = _ca_map_from_pdb(sm_path)
+                sm_heavy = _heavy_atom_map_from_pdb(sm_path)
                 results.append({
                     "source": "Homology  (SWISS-MODEL)", "is_mc": False, "is_best": False,
                     "energy": self._energy_for(sm_path),
                     "rmsd": _compute_rmsd(self.ref_ca_map, sm_ca),
+                    "rmsd_heavy": _compute_rmsd(self.ref_heavy_map, sm_heavy),
                     "plddt": None, "path": sm_path,
                 })
 
@@ -1314,12 +1449,18 @@ class ProteinApp(QMainWindow):
         self.comp_table_layout = QGridLayout(self.comp_table_w)
         self.comp_table_layout.setContentsMargins(12, 2, 12, 2)
         self.comp_table_layout.setSpacing(2)
+        # ── 열 구성 (P10: Heavy RMSD 열 추가) ───────────────────────────────
+        # 0=SOURCE 1=ENERGY 2=Cα RMSD 3=Heavy RMSD(사이드체인 반영) 4=pLDDT 5=VIEW버튼
+        # Column layout (P10 adds Heavy RMSD): 0=SOURCE 1=ENERGY 2=Cα RMSD
+        # 3=Heavy RMSD (sidechain-aware) 4=pLDDT 5=VIEW button.
         self.comp_table_layout.setColumnStretch(0, 3)
         self.comp_table_layout.setColumnStretch(1, 2)
         self.comp_table_layout.setColumnStretch(2, 2)
-        self.comp_table_layout.setColumnStretch(3, 1)
+        self.comp_table_layout.setColumnStretch(3, 2)
         self.comp_table_layout.setColumnStretch(4, 1)
-        for col, text in enumerate(["SOURCE", "ENERGY (kcal/mol)", "RMSD vs REF", "pLDDT", ""]):
+        self.comp_table_layout.setColumnStretch(5, 1)
+        for col, text in enumerate(
+                ["SOURCE", "ENERGY (kcal/mol)", "RMSD vs REF", "HEAVY RMSD", "pLDDT", ""]):
             lbl = QLabel(text)
             lbl.setStyleSheet(
                 "color:#94a3b8;font-size:9px;letter-spacing:1px;font-weight:bold;"
@@ -1406,6 +1547,10 @@ class ProteinApp(QMainWindow):
         # After landscape: dual-panel (IUPred top + RMSF bottom).
         self._iupred_scores  = extra.get("iupred_scores", [])
         self._ca_residues    = extra.get("ca_residues", [])
+        # 전체 중원자 RMSD용 데이터 (P10) — ComparisonWorker에 그대로 전달.
+        # All-heavy-atom RMSD data (P10) — forwarded as-is to ComparisonWorker.
+        self._heavy_map      = extra.get("heavy_map", {})
+        self._heavy_indices  = extra.get("heavy_indices", [])
         if self._iupred_scores:
             self._draw_disorder_profile(residues=self._ca_residues,
                                         iupred_scores=self._iupred_scores)
@@ -1437,7 +1582,8 @@ class ProteinApp(QMainWindow):
 
         self._comp_worker = ComparisonWorker(
             target, pdb_path, ca_indices, ca_map,
-            ensemble, energies, self.engine, self._physics_mod)
+            ensemble, energies, self.engine, self._physics_mod,
+            heavy_indices=self._heavy_indices, ref_heavy_map=self._heavy_map)
         self._comp_worker.progress.connect(self._log)
         self._comp_worker.result.connect(self._on_comparison_result)
         self._comp_worker.start()
@@ -1502,6 +1648,15 @@ class ProteinApp(QMainWindow):
             r_lbl.setStyleSheet("font-size:10px;color:#1e293b;")
             self.comp_table_layout.addWidget(r_lbl, row_i, 2)
 
+            # Heavy RMSD (P10) — 사이드체인까지 포함한 전체 중원자 Kabsch RMSD.
+            # 값이 없으면(구조 파싱 실패 등) 기존 RMSD 열과 동일하게 "—" 표시.
+            # Heavy RMSD (P10) — all-heavy-atom Kabsch RMSD including sidechains.
+            # Falls back to "—" like the Cα RMSD column when unavailable.
+            rmsd_heavy = entry.get("rmsd_heavy")
+            rh_lbl = QLabel(f"{rmsd_heavy:.2f} Å" if rmsd_heavy is not None else "—")
+            rh_lbl.setStyleSheet("font-size:10px;color:#1e293b;")
+            self.comp_table_layout.addWidget(rh_lbl, row_i, 3)
+
             plddt  = entry.get("plddt")
             p_lbl  = QLabel(f"{plddt:.1f}" if plddt is not None else "—")
             if plddt is not None:
@@ -1509,7 +1664,7 @@ class ProteinApp(QMainWindow):
                 p_lbl.setStyleSheet(f"font-size:10px;color:{pcol};font-weight:bold;")
             else:
                 p_lbl.setStyleSheet("font-size:10px;color:#94a3b8;")
-            self.comp_table_layout.addWidget(p_lbl, row_i, 3)
+            self.comp_table_layout.addWidget(p_lbl, row_i, 4)
 
             view_btn = QPushButton("VIEW")
             view_btn.setFixedSize(48, 20)
@@ -1518,7 +1673,7 @@ class ProteinApp(QMainWindow):
                 "border-radius:3px;font-size:9px;padding:0;letter-spacing:1px;")
             en = entry.copy()
             view_btn.clicked.connect(lambda _, e=en: self._render_source(e))
-            self.comp_table_layout.addWidget(view_btn, row_i, 4)
+            self.comp_table_layout.addWidget(view_btn, row_i, 5)
 
     def _render_source(self, entry):
         if self._view_stack.currentIndex() != 0:

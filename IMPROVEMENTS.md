@@ -101,7 +101,11 @@
 - Only Cα atoms are compared; two structures can have identical backbone
   but completely different sidechain packing.
 - Fix: add all-heavy-atom RMSD option (Kabsch on full heavy-atom set).
-- Status: TODO.
+- Status: **DONE** — `heavy_map`/`heavy_indices`/`heavy_keys` built in `_parse_pdb`
+  and `_heavy_atom_map_from_pdb()` for reference structures; `ComparisonWorker`
+  computes `rmsd_heavy` (Kabsch on all non-hydrogen ATOM-record heavy atoms) for
+  MC candidates, AlphaFold, and SWISS-MODEL, shown alongside Cα RMSD as a new
+  "HEAVY RMSD" column in `gui_main.py`.
 
 ### P4 — Performance
 
