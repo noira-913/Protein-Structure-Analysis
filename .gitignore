@@ -28,3 +28,6 @@ Thumbs.db
 
 # Logs
 error_log.txt
+
+# Claude Code local tooling state (worktrees, session config)
+.claude/
