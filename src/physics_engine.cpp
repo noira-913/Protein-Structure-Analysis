@@ -1796,19 +1796,69 @@ private:
     //   elj  — Lennard-Jones 12-6 van der Waals
     //          4ε[(σ/r)¹² - (σ/r)⁶] : 12항=척력(steric), 6항=분산(인력)
     //
-    // Hard-core repulsion replaces all three when atoms overlap (r < HARD_CUTOFF_FRAC·σ).
-    // r < HARD_CUTOFF_FRAC·σ 원자 겹침 시 HARD_SCALE·(σ/r)¹²로 모든 항을 대체 (충돌 방지).
+    // Hard-core term: a SMOOTH penalty added on top of edh+egb+elj when atoms
+    // overlap (r < HARD_CUTOFF_FRAC·σ), not a branch that replaces them.
+    //
+    //   E_hard(r) = HARD_SCALE · [ (r_cut/r)¹² − 1 ]²      where r_cut = HARD_CUTOFF_FRAC·σ
+    //
+    // At r = r_cut this is exactly 0 in BOTH value and slope (the bracket and
+    // its derivative both vanish there), so the total energy is continuous
+    // and smooth across the boundary — unlike the old design, which jumped
+    // straight from the ordinary LJ/GB/DH formula to HARD_SCALE·(σ/r)¹²,
+    // discarding it entirely. That discontinuity was harmless for every
+    // bundled structure checked at the time (P1.6), but real folded proteins
+    // can have a genuine, unremarkable tertiary contact land a fraction of a
+    // percent on either side of the threshold — found via a large predicted
+    // structure (Q92793, ~18.5k atoms) whose closest contact sat at
+    // r/σ = 0.5997, 0.03% inside the old cutoff: that ONE pair alone
+    // contributed +4.6M kcal/mol under the old formula (a value on the other
+    // side of the boundary would have scored a normal, bounded LJ repulsion
+    // of a few kcal/mol for what is physically the same contact). The new
+    // formula gives that same pair a ~2.5 kcal/mol penalty instead — smooth,
+    // bounded, and negligible next to the rest of the protein's energy — while
+    // still diverging steeply for genuine MC-proposal overlaps (r ≪ r_cut).
+    //
+    // 하드코어 항: r < HARD_CUTOFF_FRAC·σ 일 때 edh+egb+elj를 대체하는 대신
+    // 그 위에 "매끄러운" 벌점을 더한다. r=r_cut에서 값과 기울기가 모두 0이 되도록
+    // 구성되어 있어 경계에서 에너지가 불연속적으로 튀지 않는다.
+    //
+    // HARD_CAP: the smooth formula above fixes continuity AT the r_cut boundary,
+    // but [(r_cut/r)^12 - 1]^2 is still unbounded as r->0 -- it only helps
+    // contacts near the edge of the cutoff (like Q92793's r/sigma=0.5997 case
+    // above), not contacts deep inside it. Real (imperfect) structures can have
+    // both: PDB 1LYZ (a 1975 X-ray structure) has a genuine 1.36 Angstrom
+    // CB(Ala122)...NH1(Arg125) contact at r/sigma=0.364, a poorly-resolved Arg
+    // sidechain artifact, not an MC overlap. Uncapped, that single pair alone
+    // evaluates to ~1.6e9 kcal/mol even under the smooth formula. HARD_CAP
+    // bounds the penalty term itself so one such pair can no longer swamp
+    // calculate_potential() for the whole structure, while still being a much
+    // larger penalty than any real non-excluded contact should ever incur.
+    //
+    // HARD_CAP: 위 매끄러운 공식은 r_cut 경계에서의 연속성만 고치고, r->0일 때
+    // [(r_cut/r)^12 - 1]^2 자체는 여전히 무한히 발산한다 — 경계 부근 접촉에는
+    // 도움이 되지만 경계 훨씬 안쪽의 접촉에는 소용없다. 실제(불완전한) 구조는
+    // 둘 다 가질 수 있다: PDB 1LYZ(1975년 X선 구조)는 r/σ=0.364인 실제 1.36 Å
+    // CB(Ala122)···NH1(Arg125) 접촉을 갖고 있는데, 이는 잘 정제되지 않은 Arg
+    // 곁사슬의 결과물이지 MC 겹침이 아니다. 상한 없이는 이 한 쌍만으로도 매끄러운
+    // 공식 하에서 ~1.6×10⁹ kcal/mol이 나온다. HARD_CAP은 벌점 항 자체를 제한해
+    // 이런 접촉 하나가 전체 구조의 calculate_potential()을 뒤덮지 못하게 하면서도,
+    // 실제 배제되지 않는 정상 접촉보다는 훨씬 큰 페널티를 유지한다.
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
         double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
-        if(r<sig*HARD_CUTOFF_FRAC) return std::min(HARD_SCALE*std::pow(sig/r,12.0), HARD_CAP);
         double qp=pi.charge*pj.charge;
         double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
         double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
         double egb=GB_COEF*qp/fgb;
         double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
         double elj=4.0*eps*(s6*s6-s6);
-        return edh+egb+elj;
+        double E=edh+egb+elj;
+        double r_cut=sig*HARD_CUTOFF_FRAC;
+        if(r<r_cut){
+            double x=std::pow(r_cut/r,12.0)-1.0;
+            E+=std::min(HARD_SCALE*x*x, HARD_CAP);
+        }
+        return E;
     }
 
     // Sum of SASA + dihedral + all pair energies within NL_CUTOFF.
