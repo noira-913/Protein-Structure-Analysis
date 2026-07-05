@@ -26,8 +26,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-build.txt
 
-      - name: Build protein_physics extension (CPU-only runner)
+      # nvcc uses cl.exe as its host compiler and needs the full MSVC dev
+      # environment (PATH + INCLUDE + LIB), not just cl.exe's directory on
+      # PATH — a plain PowerShell shell on windows-latest doesn't set this
+      # up by itself (that's normally vcvarsall.bat's job).
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # windows-latest has no GPU, but nvcc doesn't need one to COMPILE —
+      # only to run the resulting kernels. Installing the toolkit here lets
+      # setup.py's find_cuda() detect it and build protein_physics_cuda
+      # alongside the CPU extension; alma.spec bundles whichever
+      # protein_physics*.pyd files exist at build time.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.1"
+          method: "network"
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: true
+
+      - name: Build protein_physics extensions (CPU + CUDA)
         run: python setup.py build_ext --inplace
+
+      - name: Verify CUDA extension was actually built
+        run: |
+          $cuda_pyd = Get-ChildItem -Path . -Filter "protein_physics_cuda*.pyd" -ErrorAction SilentlyContinue
+          if (-not $cuda_pyd) {
+            Write-Error "protein_physics_cuda*.pyd was not produced even though the CUDA toolkit was installed — setup.py's build_cuda_extension() failed silently (see the build log above for nvcc's actual error). Failing the job instead of shipping a silently CPU-only release."
+            exit 1
+          }
+          Write-Host "Found CUDA extension: $($cuda_pyd.Name)"
 
       - name: Build portable ALMA.exe
         run: pyinstaller alma.spec --noconfirm --clean
