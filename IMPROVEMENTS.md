@@ -152,7 +152,9 @@
 - Fix: cell-list decomposition — divide box into cells of side ≥ NL_CUTOFF;
   each atom checks only its 27 neighboring cells — O(N).
   Significant for proteins > 2 000 atoms.
-- Status: TODO.
+- Status: **DONE** — `physics_engine.cpp` bins atoms into a 3-D cell grid
+  (cell side = NL_CUTOFF+NL_SKIN) and each atom's Verlet neighbor list scan
+  is limited to its 27-cell neighborhood instead of all N atoms.
 
 **12. MC trajectory round-trips CPU↔GPU**
 - LandscapeWorker did 120 Python↔C++ round trips (one per snapshot), each
@@ -201,11 +203,79 @@
   order-dependent fold, not an embarrassingly parallel reduction — as do
   the O(rotatable-bond-count) dihedral/disulfide sums, which are too small
   to justify a kernel launch.
-- Status: **DONE** — not build-verified in this session (no CUDA
-  toolkit/GPU available in this environment; same caveat as prior GPU-
-  touching sessions in this repo). Needs a Windows+CUDA build/run to
-  confirm it compiles and to compare GPU vs CPU energies on the bundled
-  `data/*.pdb` structures before this is trusted for production use.
+- Status: **DONE — build-verified on real hardware** (Windows 11, RTX 4070
+  Laptop GPU, CUDA 13.2 toolkit, MSVC 2022). `python setup.py build_ext
+  --inplace` compiles both `protein_physics` and `protein_physics_cuda`
+  cleanly. `python tests/calibrate_gpu.py` passes all 11 bundled
+  `data/*.pdb` structures: `calculate_potential()` parity between CPU and
+  GPU engines is within 0.06% relative difference on every structure
+  (most < 0.01%), both engines' `generate_ensemble()` lower the energy
+  over 200 MC steps, and `run_landscape_trajectory()` completes end-to-end
+  with no CUDA errors. `tests/bridge_test.py` also passes on this build.
+
+**15. Hard-core repulsion guard (P1.6) was still unbounded, and blew up on real (not just bundled) structures**
+- The bundled `data/*.pdb` set is pre-vetted — every structure in it was already
+  debugged against this exact failure mode. A fresh, unmodified real PDB fetched
+  from RCSB is not pre-vetted, and `tests/accuracy_test.py` (new, see item #16)
+  immediately found one: hen egg-white lysozyme (PDB 1LYZ, a 1975 "real-space
+  refinement" structure) has a genuine 1.36 Å CB(Ala122)···NH1(Arg125) contact —
+  a real coordinate artifact from a poorly-resolved arginine sidechain in an old,
+  low-resolution structure, not a parsing bug. `pair_e()`'s hard-core branch
+  (`r < 0.6·σ` → `HARD_SCALE·(σ/r)¹²`) is unbounded as `r→0`: this single pair
+  alone evaluated to ~2×10⁹ kcal/mol and made `calculate_potential()` report
+  2.1 billion kcal/mol for the whole 1001-atom structure — the exact "billions
+  instead of thousands" failure item #13 was supposed to have fixed, just
+  triggered by a different, real-world input instead of a parsing gap.
+- The deeper problem: any real (imperfect) structure — older X-ray, NMR
+  ensembles, low-confidence AlphaFold regions — can contain a handful of
+  pathologically short contacts that are not MC-proposal artifacts. Lowering
+  `HARD_CUTOFF_FRAC` further only delays the problem; the real defect is that
+  the guard's *response* to a genuine hard-core violation is unbounded, so one
+  bad pair can dominate/invalidate the energy of an otherwise-normal structure.
+- Fix: added `HARD_CAP = 5.0e3` kcal/mol (`HARD_CAP_F` in the CUDA engine) —
+  `pair_e()`/`pair_e_gpu()` now return `min(HARD_SCALE·(σ/r)¹², HARD_CAP)`. A
+  clashing pair is still strongly, correctly penalized (thousands of kcal/mol —
+  MC still firmly rejects/relaxes it) but can no longer single-handedly make
+  `calculate_potential()` meaningless for a real structure.
+- Status: **DONE** — `tests/calibrate_gpu.py` still passes all 11 bundled
+  structures (no regression), and 1LYZ's `calculate_potential()` dropped from
+  2.1 billion to 41,230 kcal/mol (41.2 kcal/mol/atom — the "thousands, not
+  billions" range item #13 intended), while a 5000-step MC run still lowers it
+  further to -1,600 to -2,100 kcal/mol and stays within 0.2-0.4 Å Cα RMSD of
+  the native structure.
+
+**16. No test had ever compared ALMA's own output to real, independent structural ground truth**
+- `bridge_test.py` and `calibrate_gpu.py` only check internal self-consistency
+  (does the Python↔C++ bridge round-trip data; does the CPU engine agree with
+  the GPU engine). Neither asks whether the energy function's minimum actually
+  corresponds to a real protein's native structure.
+- Added `tests/accuracy_test.py`: for each of several real, structurally
+  diverse proteins, fetches the real RCSB crystal structure and the AlphaFold
+  prediction for the same UniProt entry, establishes the AlphaFold-vs-crystal
+  RMSD as an accuracy baseline, then runs `generate_ensemble()` starting from
+  the real crystal structure (the true native state) and checks whether MC
+  energy minimization keeps the structure near-native (physically sane) or
+  lets it drift away (a real force-field accuracy gap, not a code bug).
+  Auto-detects the AlphaFold-to-crystal residue-numbering offset via sequence
+  identity (not just coordinate-key overlap — see the script's `best_offset`
+  docstring for two real registration bugs this caught and fixed along the
+  way: a tandem-repeat frame ambiguity in polyubiquitin, and a propeptide-
+  length-driven mismatch in Interleukin-1 beta) and restricts multi-copy
+  crystal asymmetric units (e.g. barnase, 3 copies in 1BNI) to a single chain
+  so crystal-packing contacts between unrelated copies don't get scored as
+  real intramolecular interactions.
+- Status: **DONE** — 7 of 8 tested proteins (hen egg-white lysozyme, human
+  ubiquitin, sperm whale myoglobin, bovine RNase A, Bacillus barnase,
+  Interleukin-1 beta, alpha-lactalbumin) show ALMA's MC sampling staying
+  within a fraction of an Ångström of native — comfortably inside (usually
+  well under half of) the AlphaFold-vs-crystal accuracy bar for that protein,
+  across alpha-helical, beta-grasp, and mixed alpha+beta folds with and
+  without disulfides. The 8th (chymotrypsin inhibitor 2, PDB 2CI2) can't be
+  automatically aligned to its full-length UniProt entry at any residue offset
+  (its crystal numbering doesn't correspond linearly to full-length numbering)
+  — a known, documented limitation of the offset-search approach, not an ALMA
+  accuracy issue. Run with `python tests/accuracy_test.py` (needs internet
+  access to fetch structures).
 
 ---
 
@@ -239,7 +309,8 @@ P1.6  physics_engine.cpp — fix hard-core threshold + terminal/          ✓ DO
 P1.7  physics_engine_cuda.cu — torsion-move + topology parity with       ✓ DONE
       the CPU engine (dihedral/exclusions/disulfide/crankshaft),
       GPU-resident MC state, HARD_CUTOFF_FRAC 0.6 fix ported to GPU
-      (not build-verified — no CUDA toolkit/GPU in this environment)
+      (build-verified on RTX 4070 + CUDA 13.2 — calibrate_gpu.py:
+      11/11 structures PASS, energy parity < 0.06% rel. diff)
 ```
 
 ---

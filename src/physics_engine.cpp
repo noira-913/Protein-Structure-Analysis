@@ -147,6 +147,35 @@ namespace py = pybind11;
 //             단백질 에너지가 수천 대신 수십억 단위로 나온 원인이다. 0.6은 관측된
 //             모든 정상 접촉보다 충분히 낮으면서도, 공격적인 MC 제안으로 인한 실제
 //             수치적 겹침 병리 현상은 여전히 잡아낸다.
+// HARD_CAP  : ceiling (kcal/mol) on the hard-core term itself. Even below
+//             HARD_CUTOFF_FRAC·σ, HARD_SCALE·(σ/r)¹² is unbounded as r→0, and real
+//             deposited structures do contain occasional pathological contacts that
+//             are NOT MC-proposal artifacts — e.g. PDB 1LYZ (1975 "real-space
+//             refinement", pre-modern crystallography) has a genuine 1.36 Å CB···NH1
+//             contact between Ala122 and Arg125's flexible, poorly-resolved
+//             guanidinium group. Uncapped, that single pair alone evaluates to
+//             ~2×10⁹ kcal/mol and swamps calculate_potential() for the entire
+//             1001-atom structure (observed total: 2.1×10⁹, i.e. one pair IS the
+//             "billions" bug — see accuracy_test.py). A real force field would
+//             still treat this as strongly, finitely unfavorable, not treat the
+//             whole structure as if it doesn't exist. HARD_CAP bounds any single
+//             hard-core contact to a large-but-finite penalty so MC still firmly
+//             rejects/relaxes such contacts while calculate_potential() stays a
+//             meaningful, comparable number for real (imperfect) input structures,
+//             not just the hand-vetted bundled test set.
+//             HARD_CAP: 하드코어 항 자체의 상한(kcal/mol). HARD_CUTOFF_FRAC·σ 밑에서도
+//             HARD_SCALE·(σ/r)¹²은 r→0일 때 무한대로 발산한다. 실제 구조에는 MC 제안의
+//             인위적 결과가 아닌, 진짜 병리적 접촉이 이따금 존재한다 — 예: PDB 1LYZ
+//             (1975년 "real-space refinement", 현대 이전 결정학)는 Ala122와 유연하고
+//             전자밀도가 약해 잘 정제되지 않은 Arg125 구아니디늄기 사이에 실제 1.36 Å
+//             CB···NH1 접촉을 갖고 있다. 상한 없이는 이 한 쌍만으로 ~2×10⁹ kcal/mol이
+//             나와 1001개 원자 전체 구조의 calculate_potential()을 완전히 뒤덮는다
+//             (관측값: 2.1×10⁹ — 즉 이 쌍 하나가 "수십억" 버그의 전부다. accuracy_test.py
+//             참고). 실제 힘장이라면 이런 접촉도 강하지만 유한한 불리함으로 취급해야지,
+//             전체 구조가 존재하지 않는 것처럼 만들면 안 된다. HARD_CAP은 단일 하드코어
+//             접촉을 크지만 유한한 페널티로 제한해, MC는 여전히 이런 접촉을 확실히
+//             거부/완화하면서도 calculate_potential()은 미리 검증된 번들 테스트셋뿐
+//             아니라 실제(불완전한) 입력 구조에서도 의미 있고 비교 가능한 값으로 남는다.
 // GB_COEF   : prefactor for the GB Born term = -½(1/ε_prot - 1/ε_water)·C
 //             GB Born 항의 앞인수 — 진공→물 이동 시 에너지 이득(음수)
 static constexpr double COULOMB    = 332.0636;
@@ -162,6 +191,7 @@ static constexpr double NL_RCUT2   = (NL_CUTOFF+NL_SKIN)*(NL_CUTOFF+NL_SKIN);
 static constexpr double PAIR_CUT2  = NL_CUTOFF*NL_CUTOFF;
 static constexpr double HALF_SKIN2 = (NL_SKIN*0.5)*(NL_SKIN*0.5);
 static constexpr double HARD_SCALE = 1.0e4;
+static constexpr double HARD_CAP   = 5.0e3;
 static constexpr double HARD_CUTOFF_FRAC = 0.6;
 static constexpr double GB_COEF    = -0.5*(1.0/EPS_PROT-1.0/EPS_WATER)*COULOMB;
 
@@ -1771,7 +1801,7 @@ private:
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
         double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
-        if(r<sig*HARD_CUTOFF_FRAC) return HARD_SCALE*std::pow(sig/r,12.0);
+        if(r<sig*HARD_CUTOFF_FRAC) return std::min(HARD_SCALE*std::pow(sig/r,12.0), HARD_CAP);
         double qp=pi.charge*pj.charge;
         double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
         double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));

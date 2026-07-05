@@ -98,6 +98,14 @@ static constexpr double R0_SS      = 2.044;   /* equilibrium SG-SG distance (Ang
  * blowup on any real all-atom structure the moment this engine exercised
  * real (non-excluded) 1-4/H..H contacts down to r/sigma ~ 0.67. */
 #define HARD_CUTOFF_FRAC_F 0.6f
+/* HARD_CAP_F: ceiling (kcal/mol) on the hard-core term. Mirrors the CPU
+ * engine's fix in physics_engine.cpp (see the HARD_CAP comment there) --
+ * real deposited structures (e.g. PDB 1LYZ, a 1975 structure with a genuine
+ * 1.36 Ang CB...NH1 contact) can contain pathological-but-real short
+ * contacts that are not MC-proposal artifacts. Left uncapped, HARD_SCALE_F *
+ * (sigma/r)^12 is unbounded as r->0 and a single such pair can swamp the
+ * whole structure's energy by 5-6 orders of magnitude. */
+#define HARD_CAP_F 5.0e3f
 /* GB_COEF_F = -0.5 * (1/1 - 1/78.5) * 332.0636  */
 #define GB_COEF_F      (-0.5f * (1.0f - 1.0f / 78.5f) * 332.0636f)
 #define PAIR_CUT2_F    144.0f          /* 12^2 */
@@ -483,7 +491,7 @@ float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, f
     if (r < sig * HARD_CUTOFF_FRAC_F) {
         float ratio = sig / r;
         float r6    = ratio * ratio * ratio * ratio * ratio * ratio;
-        return HARD_SCALE_F * r6 * r6;
+        return fminf(HARD_SCALE_F * r6 * r6, HARD_CAP_F);
     }
 
     float qp  = qi * qj;
