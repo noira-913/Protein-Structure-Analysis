@@ -28,12 +28,12 @@ PyQt6 데스크톱 애플리케이션.
        이론: H = P^T Q → SVD → R = V diag(1,1,det(VUᵀ)) Uᵀ
 
   4. [LandscapeWorker] 더 긴 MC 마르코프 체인을 실행해 배열 공간을 탐색.
-     PCA로 고차원 Cα 좌표를 2D로 투영한 뒤, NetworkX 그래프를 만들고
-     탐욕적 모듈성(greedy modularity)으로 준안정 분지(metastable basin)를
-     탐지해 단백질을 ordered / possibly-disordered / IDP 로 분류한다.
+     PCA로 고차원 Cα 좌표를 2D로 투영한 뒤, 그 구조 공간에서 밀도 기반
+     군집화(DBSCAN)로 준안정 분지(metastable basin)를 탐지해 단백질을
+     ordered / possibly-disordered / IDP 로 분류한다.
      Runs a longer MC Markov chain, projects conformations to 2D via PCA,
-     builds a NetworkX conformational graph, detects metastable basins via
-     greedy modularity, and classifies the protein as ordered / IDP.
+     then detects metastable basins via density-based clustering (DBSCAN)
+     on that structural space, and classifies the protein as ordered / IDP.
      • PCA: 고차원 구조 공간의 주요 집단 운동 방향(PC1, PC2)을 찾아
        자유 에너지 지형을 2D로 시각화.
      • IDP(Intrinsically Disordered Protein) 분류: 준안정 분지가 많고
@@ -1020,8 +1020,8 @@ class LandscapeWorker(QThread):
         return np.array(v, dtype=float)
 
     def run(self):
-        import networkx as nx
         from sklearn.decomposition import PCA
+        from sklearn.cluster import DBSCAN
 
         N, S = self.N_SNAPSHOTS, self.STEPS_PER_SNAP
         self.progress.emit(
@@ -1063,31 +1063,54 @@ class LandscapeWorker(QThread):
                                       np.zeros((N, 1))])
         var_exp = pca.explained_variance_ratio_.tolist()
 
-        # ── 구조 그래프 구축 (Conformational Graph) ──────────────────────
-        # Build the sequential conformational graph:
-        # each snapshot = node, consecutive snapshots = edge.
+        # ── 밀도 기반 군집화 → 준안정 분지 (Density Clustering → Metastable Basins) ──
+        # Density-based clustering — clusters are metastable basins.
         #
-        # 마르코프 체인의 순서를 그래프로 표현:
-        #   노드(node) = 스냅샷 배열, 엣지(edge) = 연속 스냅샷 간 전이.
-        # 엣지 가중치 = |ΔE| — 에너지 변화가 작을수록 전이가 쉬움.
-        # Edge weight = |ΔE|; small weight → easy transition between conformations.
-        G = nx.Graph()
-        for i in range(N):
-            G.add_node(i, energy=float(energies[i]))
-        for i in range(N - 1):
-            G.add_edge(i, i + 1,
-                       weight=float(abs(energies[i + 1] - energies[i])))
+        # 이전 구현은 연속 스냅샷을 잇는 체인(경로) 그래프에 그래프 모듈성
+        # 군집화를 적용했다.  그러나 경로 그래프에서 탐욕적 모듈성은
+        # 실제 에너지 지형과 무관하게 거의 항상 ~sqrt(N)개의 인위적인
+        # 균등 크기 군집으로 쪼개지는 '해상도 한계(resolution limit)'를
+        # 가진다.  그 결과 열 요동만 있는 완전히 질서 있는 단일 분지
+        # 단백질도 여러 개의 가짜 분지로 쪼개져 IDP/무질서로 오분류되는
+        # 체계적 편향이 있었다 (에너지 가중치를 실제로 전달하지도 않았음).
+        #
+        # 대신 실제 구조 공간(PCA 2D 투영, `layout`)에서 밀도 기반 군집화
+        # (DBSCAN)를 수행한다: 같은 분지 내 열 요동은 조밀하게 연결되어
+        # 하나의 군집을 이루고, 궤적 자체의 전형적 스텝 이동 거리보다
+        # 뚜렷하게 큰 실제 구조 전이만 별도 군집(분지)으로 분리된다.
+        #
+        # The previous chain-graph + greedy-modularity approach suffered from
+        # modularity's well-known resolution limit on path graphs: it split
+        # almost any trajectory into ~sqrt(N) artefactual, near-equal-sized
+        # "communities" regardless of the actual energy landscape (and never
+        # even passed the |ΔE| edge weights to the algorithm) — systematically
+        # misclassifying genuinely ordered, single-basin proteins as
+        # multi-basin / disordered.
+        #
+        # Density-based clustering (DBSCAN) directly on the PCA structural
+        # layout instead groups snapshots by structural proximity: thermal
+        # jitter within one basin stays densely connected (one cluster),
+        # while only a real conformational transition — a jump clearly
+        # larger than the trajectory's own per-step noise — starts a new
+        # cluster.  eps is calibrated from the trajectory's own median
+        # consecutive-frame displacement, so it self-scales with however
+        # much the MC step size/temperature actually moves the structure.
+        step_disp   = np.linalg.norm(np.diff(layout, axis=0), axis=1)
+        step_scale  = float(np.median(step_disp)) if step_disp.size else 1.0
+        eps         = max(step_scale * 4.0, 1e-6)
+        min_pts     = max(3, int(0.05 * N))
+        labels      = DBSCAN(eps=eps, min_samples=min_pts).fit_predict(layout)
 
-        # ── 군집 탐지 → 준안정 분지 (Community Detection → Metastable Basins) ──
-        # Community detection — clusters are metastable basins.
-        #
-        # 탐욕적 모듈성(greedy modularity) 알고리즘은 모듈성 Q를 최대화하는
-        # 군집을 찾는다:  Q = Σ_c [ (내부 엣지 비율) - (기대 비율)² ]
-        # 각 군집 = 에너지 지형의 '분지(basin)' — 단백질이 오래 머무는 구조 영역.
-        # Greedy modularity maximises Q; each cluster = a metastable conformational basin.
-        # Proteins with multiple well-separated basins tend to be flexible or disordered.
-        communities = list(
-            nx.algorithms.community.greedy_modularity_communities(G))
+        # 잡음점(label == -1, 전이 도중의 과도 상태)은 어떤 분지에도 속하지
+        # 않는 것으로 취급한다.  군집이 하나도 없으면(예: N이 매우 작음)
+        # 궤적 전체를 하나의 분지로 폴백한다.
+        # Noise points (label == -1, transient in-between states) belong to
+        # no basin.  Fall back to a single whole-trajectory basin if DBSCAN
+        # finds none (e.g. very small N).
+        communities = [np.flatnonzero(labels == lbl).tolist()
+                       for lbl in sorted(set(labels)) if lbl != -1]
+        if not communities:
+            communities = [list(range(N))]
         node_comm = {node: ci
                      for ci, comm in enumerate(communities)
                      for node in comm}
