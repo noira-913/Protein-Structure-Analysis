@@ -201,11 +201,53 @@
   order-dependent fold, not an embarrassingly parallel reduction — as do
   the O(rotatable-bond-count) dihedral/disulfide sums, which are too small
   to justify a kernel launch.
-- Status: **DONE** — not build-verified in this session (no CUDA
-  toolkit/GPU available in this environment; same caveat as prior GPU-
-  touching sessions in this repo). Needs a Windows+CUDA build/run to
-  confirm it compiles and to compare GPU vs CPU energies on the bundled
-  `data/*.pdb` structures before this is trusted for production use.
+- Status: **DONE** — build- and run-verified on a real Windows+CUDA machine
+  (RTX 4070 Laptop GPU, CUDA 13.2) via `tests/calibrate_gpu.py` across all
+  11 bundled `data/*.pdb` structures: `calculate_potential()` agrees between
+  CPU and GPU to a relative difference of ~0.0001–0.0006 (float-vs-double
+  noise) on every structure, and MC sampling lowers energy on both engines.
+  That run also surfaced two real, Windows-specific bugs fixed alongside
+  this port (both were latent in the pre-port code too, just never
+  exercised on real hardware): `nvcc`'s own default C++ dialect doesn't
+  support the structured bindings this port uses (setup.py's
+  `build_cuda_extension()` calls `nvcc` directly, bypassing the
+  `/std:c++latest` that `Pybind11Extension` auto-injects for the CPU
+  build — fixed by adding `-std=c++17` there), and `Particle`/`PhysicsEngine`
+  — defined separately in each module but sharing the same class names —
+  collided at import time because MSVC's RTTI compares `type_info` by
+  decorated name across DLLs (Linux/macOS give each shared object
+  independent RTTI, so this never showed up there); fixed with
+  `py::module_local()` on both classes in both modules.
+
+**15. Hard-core nonbonded term was a discontinuous step, not just a miscalibrated threshold**
+- Found via the calibration run above: `calculate_potential()` on `Q92793.pdb`
+  (~18.5k atoms) returned +4,314,828 kcal/mol — grossly outside the sane
+  −30…+7 kcal/mol/atom range from item #13 — on BOTH engines identically
+  (confirming this is inherited physics-model behavior, not a GPU-vs-CPU
+  discrepancy). Traced to exactly one pair: Ser27 `CA` vs Phe2438 `CD1`, a
+  genuine tertiary contact (not a missing bond/exclusion — `topo.adj` shows
+  zero unbonded atoms) sitting at `r/σ = 0.5997`, 0.03% inside the
+  `HARD_CUTOFF_FRAC = 0.6` threshold from item #13. That one pair alone
+  contributed +4.6M kcal/mol via `HARD_SCALE·(σ/r)¹²`, because the old
+  `pair_e()` was a hard branch: a contact landing a fraction of a percent on
+  either side of the threshold gets either an ordinary bounded LJ repulsion
+  of a few kcal/mol, or a multi-million-kcal/mol spike — for what is
+  physically almost the same contact. P1.6's 0.6 calibration was validated
+  against one structure (1XQ8); a much larger structure had a real contact
+  close enough to find the edge of that threshold.
+- Fix: replaced the branch with a smooth additive penalty in both engines'
+  `pair_e()`/`pair_e_gpu()`: `E = edh + egb + elj`, always, plus
+  `HARD_SCALE·[(r_cut/r)¹² − 1]²` when `r < r_cut` (`r_cut = HARD_CUTOFF_FRAC·σ`).
+  At `r = r_cut` the penalty and its derivative are both exactly zero, so the
+  total is continuous and smooth across the boundary — no jump, and no new
+  threshold/width parameter to calibrate (reuses `HARD_CUTOFF_FRAC`
+  unchanged). Still diverges steeply for genuine MC-proposal overlaps
+  (`r ≪ r_cut`), so its guard-rail purpose is unaffected.
+- Status: **DONE** — verified against all 11 bundled structures: the 10 that
+  don't have any contact near the threshold reproduce their exact previous
+  `calculate_potential()` values (this change is a no-op for them, confirming
+  zero regression), and `Q92793.pdb` now returns −303,562.7 kcal/mol
+  (−16.35/atom) instead of +4,314,828.
 
 ---
 
@@ -239,7 +281,11 @@ P1.6  physics_engine.cpp — fix hard-core threshold + terminal/          ✓ DO
 P1.7  physics_engine_cuda.cu — torsion-move + topology parity with       ✓ DONE
       the CPU engine (dihedral/exclusions/disulfide/crankshaft),
       GPU-resident MC state, HARD_CUTOFF_FRAC 0.6 fix ported to GPU
-      (not build-verified — no CUDA toolkit/GPU in this environment)
+      (build- and run-verified on real Windows+CUDA hardware)
+P1.8  physics_engine.cpp/physics_engine_cuda.cu — smooth the hard-core   ✓ DONE
+      nonbonded term into a continuous penalty (was a discontinuous
+      step at HARD_CUTOFF_FRAC; found via a real large structure whose
+      closest contact landed right on the old threshold)
 ```
 
 ---

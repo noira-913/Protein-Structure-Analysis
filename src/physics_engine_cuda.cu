@@ -469,6 +469,16 @@ float hct_gpu(float r, float r2, float ri, float rj)
            + (r2 - rj*rj + ri*ri) / (2.0f*r*ri*ri) * logLU * 0.5f / r;
 }
 
+/*
+ * Hard-core term is a SMOOTH penalty added on top of edh+egb+elj when atoms
+ * overlap (r < HARD_CUTOFF_FRAC_F*sig), not a branch that replaces them --
+ * see the matching comment on pair_e() in physics_engine.cpp for the full
+ * rationale (a genuine tertiary contact landing a fraction of a percent
+ * inside the old hard threshold used to score a multi-million-kcal/mol
+ * discontinuous jump instead of an ordinary bounded LJ repulsion). At
+ * r == r_cut the penalty and its derivative are both exactly zero, so the
+ * total is continuous and smooth across the boundary.
+ */
 __device__ __forceinline__
 float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, float ai,
                  float xj, float yj, float zj, float qj, float rj, float epsj, float aj)
@@ -479,12 +489,6 @@ float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, f
     float r2  = dx*dx + dy*dy + dz*dz;
     float r   = sqrtf(r2);
     float sig = ri + rj;
-
-    if (r < sig * HARD_CUTOFF_FRAC_F) {
-        float ratio = sig / r;
-        float r6    = ratio * ratio * ratio * ratio * ratio * ratio;
-        return HARD_SCALE_F * r6 * r6;
-    }
 
     float qp  = qi * qj;
     float edh = (COULOMB_F * qp) / (EPS_WATER_F * r) * __expf(-KAPPA_F * r);
@@ -498,7 +502,17 @@ float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, f
     float s6  = sr * sr * sr * sr * sr * sr;
     float elj = 4.0f * eps * (s6*s6 - s6);
 
-    return edh + egb + elj;
+    float e = edh + egb + elj;
+
+    float r_cut = sig * HARD_CUTOFF_FRAC_F;
+    if (r < r_cut) {
+        float ratio  = r_cut / r;
+        float ratio6 = ratio * ratio * ratio * ratio * ratio * ratio;
+        float x      = ratio6 * ratio6 - 1.0f;
+        e += HARD_SCALE_F * x * x;
+    }
+
+    return e;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

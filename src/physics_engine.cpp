@@ -1766,19 +1766,47 @@ private:
     //   elj  — Lennard-Jones 12-6 van der Waals
     //          4ε[(σ/r)¹² - (σ/r)⁶] : 12항=척력(steric), 6항=분산(인력)
     //
-    // Hard-core repulsion replaces all three when atoms overlap (r < HARD_CUTOFF_FRAC·σ).
-    // r < HARD_CUTOFF_FRAC·σ 원자 겹침 시 HARD_SCALE·(σ/r)¹²로 모든 항을 대체 (충돌 방지).
+    // Hard-core term: a SMOOTH penalty added on top of edh+egb+elj when atoms
+    // overlap (r < HARD_CUTOFF_FRAC·σ), not a branch that replaces them.
+    //
+    //   E_hard(r) = HARD_SCALE · [ (r_cut/r)¹² − 1 ]²      where r_cut = HARD_CUTOFF_FRAC·σ
+    //
+    // At r = r_cut this is exactly 0 in BOTH value and slope (the bracket and
+    // its derivative both vanish there), so the total energy is continuous
+    // and smooth across the boundary — unlike the old design, which jumped
+    // straight from the ordinary LJ/GB/DH formula to HARD_SCALE·(σ/r)¹²,
+    // discarding it entirely. That discontinuity was harmless for every
+    // bundled structure checked at the time (P1.6), but real folded proteins
+    // can have a genuine, unremarkable tertiary contact land a fraction of a
+    // percent on either side of the threshold — found via a large predicted
+    // structure (Q92793, ~18.5k atoms) whose closest contact sat at
+    // r/σ = 0.5997, 0.03% inside the old cutoff: that ONE pair alone
+    // contributed +4.6M kcal/mol under the old formula (a value on the other
+    // side of the boundary would have scored a normal, bounded LJ repulsion
+    // of a few kcal/mol for what is physically the same contact). The new
+    // formula gives that same pair a ~2.5 kcal/mol penalty instead — smooth,
+    // bounded, and negligible next to the rest of the protein's energy — while
+    // still diverging steeply for genuine MC-proposal overlaps (r ≪ r_cut).
+    //
+    // 하드코어 항: r < HARD_CUTOFF_FRAC·σ 일 때 edh+egb+elj를 대체하는 대신
+    // 그 위에 "매끄러운" 벌점을 더한다. r=r_cut에서 값과 기울기가 모두 0이 되도록
+    // 구성되어 있어 경계에서 에너지가 불연속적으로 튀지 않는다.
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
         double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
-        if(r<sig*HARD_CUTOFF_FRAC) return HARD_SCALE*std::pow(sig/r,12.0);
         double qp=pi.charge*pj.charge;
         double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
         double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
         double egb=GB_COEF*qp/fgb;
         double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
         double elj=4.0*eps*(s6*s6-s6);
-        return edh+egb+elj;
+        double E=edh+egb+elj;
+        double r_cut=sig*HARD_CUTOFF_FRAC;
+        if(r<r_cut){
+            double x=std::pow(r_cut/r,12.0)-1.0;
+            E+=HARD_SCALE*x*x;
+        }
+        return E;
     }
 
     // Sum of SASA + dihedral + all pair energies within NL_CUTOFF.
