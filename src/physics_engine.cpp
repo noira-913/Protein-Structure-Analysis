@@ -1877,12 +1877,17 @@ private:
         // Zero cost for proteins without disulfide bonds (empty vector short-circuits).
         if (topo && !topo->disulfide_pairs.empty())
             E += ss_e(p, topo->disulfide_pairs);
-        size_t N = p.size();
+        // MSVC's OpenMP implementation only supports the OpenMP 2.0 canonical
+        // for-loop form, which requires a SIGNED loop variable -- size_t (i's
+        // natural type here, matching p.size()) fails to compile under
+        // MSVC+/openmp with C3016. Use a signed ptrdiff_t for the loop counter
+        // and cast back to size_t for indexing.
+        const std::ptrdiff_t N = static_cast<std::ptrdiff_t>(p.size());
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic,8) reduction(+:E)
 #endif
-        for (size_t i = 0; i < N; ++i)
-            for (size_t j : nl.nb[i]) {
+        for (std::ptrdiff_t i = 0; i < N; ++i)
+            for (size_t j : nl.nb[(size_t)i]) {
                 if (topo && topo->is_excluded((int)i, (int)j)) continue;
                 double dx = p[i].x-p[j].x, dy = p[i].y-p[j].y, dz = p[i].z-p[j].z;
                 if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
