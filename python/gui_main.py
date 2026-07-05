@@ -80,6 +80,18 @@ from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATE
 import iupred as _iupred
 
 
+def _app_base_dir():
+    """Root directory for locating the sibling ``data`` folder.
+
+    Under a PyInstaller-frozen build ``__file__`` points inside the
+    temporary/onefile extraction bundle, so the persistent cache dir must
+    instead sit next to the executable to survive across runs.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _try_gpu_backend():
     """Attempt to import the CUDA extension.  Returns (module, gpu_name) or (None, None)."""
     try:
@@ -709,7 +721,7 @@ class PipelineWorker(QThread):
           4. Versioned AlphaFold model URLs (v4 → v3 → v2 fallback)
         Returns a path string or None on failure.
         """
-        data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+        data_dir = os.path.join(_app_base_dir(), "data")
         os.makedirs(data_dir, exist_ok=True)
         for cand in [
             os.path.join(data_dir, f"{target}.pdb"),
@@ -835,7 +847,7 @@ class ComparisonWorker(QThread):
         return None
 
     def _fetch_alphafold(self, uniprot_id):
-        data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+        data_dir = os.path.join(_app_base_dir(), "data")
         dest = os.path.join(data_dir, f"AF_{uniprot_id}.pdb")
         if os.path.exists(dest):
             return dest
@@ -855,7 +867,7 @@ class ComparisonWorker(QThread):
         return None
 
     def _fetch_swissmodel(self, uniprot_id):
-        data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+        data_dir = os.path.join(_app_base_dir(), "data")
         dest = os.path.join(data_dir, f"SM_{uniprot_id}.pdb")
         if os.path.exists(dest):
             return dest
