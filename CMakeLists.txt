@@ -41,7 +41,6 @@ FetchContent_MakeAvailable(pybind11)
 find_package(OpenMP)
 
 # ── 타겟 1: 핵심 물리 엔진 ──────────────────
-# ▶ 수정: main.cpp 제거 — main.cpp는 'example' 모듈로 심볼 충돌 발생
 pybind11_add_module(protein_physics src/physics_engine.cpp)
 
 if(OpenMP_CXX_FOUND)
@@ -75,7 +74,3 @@ if(CUDA_AVAILABLE)
   target_link_libraries(protein_physics_cuda PRIVATE CUDA::cudart)
   message(STATUS "CUDA enabled -> protein_physics_cuda target added")
 endif()
-
-# ── Target 3: pybind11 example (separate module) ─────────────────
-pybind11_add_module(example src/main.cpp)
-message(STATUS "example module (main.cpp) separate build")
