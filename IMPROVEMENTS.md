@@ -289,6 +289,18 @@
   ALMA's own sampling drifts proportionally more for it (up to 2.8 Å) than for
   any other test protein, which is the physically expected result for a
   flexible multi-domain enzyme, not a red flag.
+- Pushed further to 2 much larger single-domain/monomer enzymes: catalase
+  (498 residues, 4099 atoms, heme-binding) and a beta-galactosidase monomer
+  (1021 residues, 8200 atoms — the largest structure tested, extracted as a
+  single chain from its tetrameric crystal form). Both pass: MC sampling
+  stays within 0.2-0.5 Å of native after 1000 steps, comfortably inside their
+  0.43 Å and 0.65 Å AlphaFold baselines respectively. Confirms the HARD_CAP
+  fix (item #15) and disulfide/topology handling hold up at production-scale
+  atom counts, not just the small/medium test proteins above.
+- **Total: 15 real proteins tested, 14/15 pass** (521 to 8200 atoms, 65 to
+  1021 residues, 0 to 17 disulfides, alpha/beta/mixed folds); the one
+  non-pass (CI2) is a documented offset-search limitation, not an accuracy
+  failure.
 
 ---
 

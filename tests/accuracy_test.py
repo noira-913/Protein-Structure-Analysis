@@ -101,6 +101,8 @@ TEST_PROTEINS = [
     ("Aldolase A",             "P00883", "1ALD"),
     ("Firefly luciferase",     "P08659", "1LCI"),
     ("Human serum albumin",    "P02768", "1AO6"),
+    ("Catalase",               "P00432", "7CAT"),
+    ("Beta-galactosidase monomer", "P00722", "1BGL"),
 ]
 
 OFFSET_SEARCH_RANGE = range(-200, 201)
