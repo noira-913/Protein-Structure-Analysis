@@ -58,7 +58,7 @@ GPU 가속: protein_physics_cuda 가 임포트 가능하면 시작 시 GPU 선�
 두 모듈(CPU/GPU)은 동일한 Particle / PhysicsEngine API를 노출한다.
 """
 
-import sys, os, requests, traceback, tempfile
+import sys, os, io, requests, traceback, tempfile
 import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -70,7 +70,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtCore import QUrl
-from Bio.PDB import PDBParser, PDBList
+from Bio.PDB import PDBParser, PDBList, PDBIO
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
@@ -489,36 +489,6 @@ def _parse_pdb(path, log, physics_mod):
     return (atoms, ca_indices, ca_map, topo, iupred_scores, ca_residues,
             heavy_map, heavy_indices, heavy_keys)
 
-def _parse_pdb_atoms_only(path, physics_mod):
-    """경량 PDB 파서 — Particle 목록만 반환, 인덱스 맵 없음.
-    Lightweight PDB parser — returns only the Particle list, no index maps.
-
-    ComparisonWorker에서 AlphaFold / SWISS-MODEL 구조의 에너지를 빠르게 평가할 때 사용.
-    결합 위상이나 이황화 탐지가 필요없이 단순 에너지 계산만 하면 되므로 간소화.
-    Used by ComparisonWorker to quickly evaluate AlphaFold / SWISS-MODEL energies.
-    No topology or disulfide detection needed — energy evaluation only.
-
-    _parse_pdb와 동일한 물 제거 규칙을 적용: 물 HETATM만 건너뜀, 금속 이온은 포함.
-    Same water-skip rule as _parse_pdb: drop water HETATM, keep metal ions.
-    """
-    parser = PDBParser(QUIET=True)
-    st = parser.get_structure("prot", path)
-    atoms = []
-    for atom in st.get_atoms():
-        res = atom.get_parent()
-        # 물 분자만 제거, 금속 이온/리간드는 포함 (에너지 기여 포함).
-        # Drop only water; keep metal ions and ligands (they contribute to energy).
-        if res.get_id()[0] != " " and res.get_resname().strip() in _WATER_RESNAMES:
-            continue
-        coord = atom.get_coord()
-        if not np.all(np.isfinite(coord)):
-            continue
-        charge, r, e = _atom_params(atom)
-        atoms.append(physics_mod.Particle(
-            float(coord[0]), float(coord[1]), float(coord[2]),
-            charge, r, e, False))
-    return atoms
-
 def _ca_map_from_pdb(path):
     """Return (ca_map, avg_bfactor). avg_bfactor = avg pLDDT for AlphaFold files."""
     parser = PDBParser(QUIET=True)
@@ -579,29 +549,94 @@ def _compute_rmsd(ca_map1, ca_map2):
 
     Kabsch 알고리즘 이론 (Kabsch Algorithm Theory):
     ─────────────────────────────────────────────
-    두 구조를 최적으로 겹치는 회전 행렬 R을 SVD로 구한다:
+    두 구조를 최적으로 겹치는 회전 행렬 R을 SVD로 구한다 (R을 Q에 적용해 P에 맞춘다):
       1. 각 구조의 무게중심을 원점으로 이동 (centroid subtraction)
-      2. 공분산 행렬 H = P^T Q 계산
+      2. 공분산 행렬 H = Q^T P 계산 (Q=이동할 구조, P=기준 구조 — 순서가 중요함)
       3. SVD: U, S, Vt = svd(H)
       4. 반사(reflection) 보정: d = sign(det(Vᵀ Uᵀ)) → 행렬식이 -1이면 반사이므로 보정
          d = sign(det(Vt.T @ U.T)); R = Vt.T @ diag(1, 1, d) @ U.T
-      5. RMSD = sqrt(mean(||R·q_i - p_i||²))
+      5. RMSD = sqrt(mean(||Q·Rᵀ - P||²))
 
     The Kabsch rotation handles the reflection ambiguity via SVD sign correction.
     Kabsch 회전은 SVD 부호 보정으로 반사 모호성을 처리한다.
+
+    H must be Q^T P (mobile^T @ reference), not P^T Q — swapping the order
+    yields the covariance's transpose, which SVD happily factors into a
+    *different* (generally wrong) rotation. The resulting RMSD is silently
+    inflated whenever the two structures are actually rotated relative to each
+    other — exactly the case for AlphaFold/SWISS-MODEL/PDB structures, each
+    solved/predicted in its own independent coordinate frame.
     """
     common = sorted(set(ca_map1.keys()) & set(ca_map2.keys()))
     if len(common) < 3:
         return None
-    c1 = np.array([ca_map1[k] for k in common], dtype=float)
-    c2 = np.array([ca_map2[k] for k in common], dtype=float)
+    c1 = np.array([ca_map1[k] for k in common], dtype=float)   # P: reference
+    c2 = np.array([ca_map2[k] for k in common], dtype=float)   # Q: mobile
     c1 -= c1.mean(0); c2 -= c2.mean(0)
-    H = c1.T @ c2
+    H = c2.T @ c1
     U, _, Vt = np.linalg.svd(H)
     d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
     R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
     diff = c1 - (c2 @ R.T)
     return float(np.sqrt((diff ** 2).sum(1).mean()))
+
+def _kabsch_fit(ref_map, mobile_map):
+    """공통 Cα 키를 이용해 mobile_map을 ref_map 프레임에 겹치는 (R, ref_centroid,
+    mobile_centroid)를 반환. 공통 잔기 < 3개면 None.
+    Return (R, ref_centroid, mobile_centroid) that superimposes mobile_map onto
+    ref_map's frame via their common Cα keys. None if fewer than 3 are shared.
+
+    _compute_rmsd와 동일한 SVD 유도 — 반환값을 재사용해 스칼라 RMSD뿐 아니라
+    전체 원자 좌표 변환에도 같은 정렬을 적용할 수 있게 분리했다.
+    Same SVD derivation as _compute_rmsd, factored out so the same alignment
+    can be applied to whole-structure coordinates, not just the RMSD scalar.
+    """
+    common = sorted(set(ref_map.keys()) & set(mobile_map.keys()))
+    if len(common) < 3:
+        return None
+    p = np.array([ref_map[k] for k in common], dtype=float)
+    q = np.array([mobile_map[k] for k in common], dtype=float)
+    p_c, q_c = p.mean(0), q.mean(0)
+    p0, q0 = p - p_c, q - q_c
+    H = q0.T @ p0   # Q^T P (mobile^T @ reference) — see _compute_rmsd note
+    U, _, Vt = np.linalg.svd(H)
+    d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return R, p_c, q_c
+
+def _aligned_pdb_text(path, ref_ca_map):
+    """외부 구조(AlphaFold/SWISS-MODEL)를 ref_ca_map 프레임에 Kabsch 정렬한 뒤
+    전체 원자 PDB 텍스트로 반환. 공통 Cα < 3개면 원본 텍스트를 그대로 반환.
+    Kabsch-align an external structure (AlphaFold/SWISS-MODEL) onto ref_ca_map's
+    frame and return the whole-structure PDB text. Falls back to the raw file
+    text when fewer than 3 Cα residues are shared (alignment impossible).
+
+    레이어드 뷰에서 두 구조를 겹쳐 보려면 같은 좌표계에 있어야 한다. 외부
+    구조는 독립적으로 계산/실험된 구조라 참조 구조와 좌표계가 전혀 다르므로,
+    RMSD 계산에 쓰인 것과 동일한 정렬을 원자 전체에 적용해야 겹쳐 보인다.
+    Overlaying two structures in the layered view only makes sense once they
+    share a coordinate frame. External structures are independently solved/
+    predicted, so their frame has no relation to the reference — applying the
+    same alignment used for the RMSD figure to every atom is what makes the
+    overlay visually meaningful.
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        raw_text = f.read()
+    ca_map, _ = _ca_map_from_pdb(path)
+    fit = _kabsch_fit(ref_ca_map, ca_map)
+    if fit is None:
+        return raw_text
+    R, ref_c, mob_c = fit
+    parser = PDBParser(QUIET=True)
+    st = parser.get_structure("ext", path)
+    for atom in st.get_atoms():
+        coord = atom.get_coord()
+        atom.set_coord(((coord - mob_c) @ R.T + ref_c).astype(np.float32))
+    buf = io.StringIO()
+    writer = PDBIO()
+    writer.set_structure(st)
+    writer.save(buf)
+    return buf.getvalue()
 
 def _compute_rmsf(snapshots, ca_indices):
     """Per-Cα root-mean-square fluctuation (Å) across all trajectory snapshots.
@@ -926,10 +961,20 @@ class ComparisonWorker(QThread):
         return heavy_map
 
     def _energy_for(self, path):
+        # topo 없이 calculate_potential을 호출하면 1-2/1-3 배제가 적용되지 않아
+        # 모든 공유 결합 쌍(~1.5 Å)이 비결합 항으로 평가되어 수천억 kcal/mol
+        # 단위의 허구적 척력 에너지가 나온다 — AlphaFold/SWISS-MODEL 비교
+        # 구조에서 관측된 비정상적으로 큰 양의 에너지의 원인이었다.
+        #
+        # calculate_potential without a topo skips 1-2/1-3 exclusions, so every
+        # covalent bond (~1.5 Å apart) gets scored as a non-bonded contact,
+        # producing spurious repulsive energies in the hundreds of billions of
+        # kcal/mol — the cause of the previously-observed absurd positive
+        # energies for AlphaFold/SWISS-MODEL comparison structures.
         try:
-            atoms = _parse_pdb_atoms_only(path, self.physics_mod)
+            atoms, *_, topo, _, _, _, _, _ = _parse_pdb(path, lambda *_: None, self.physics_mod)
             if atoms:
-                return self.engine.calculate_potential(atoms)
+                return self.engine.calculate_potential(atoms, topo)
         except Exception:
             pass
         return None
@@ -1236,6 +1281,8 @@ class ProteinApp(QMainWindow):
         self._rmsf_pct           = 0.0
         self._iupred_scores      = []
         self._ca_residues        = []
+        self._ref_ca_map         = {}
+        self._current_ext_entry  = None
         self._build_ui()
         self.setStyleSheet(STYLE)
 
@@ -1574,6 +1621,12 @@ class ProteinApp(QMainWindow):
         self._topo        = topo
         self._ca_indices  = ca_indices
         self._pdb_path    = pdb_path
+        # 참조 구조 Cα 맵 저장 — AlphaFold/SWISS-MODEL을 레이어드 뷰로 겹칠 때
+        # 참조 프레임에 정렬(Kabsch)하는 데 사용 (RMSD 계산과 동일한 기준).
+        # Store the reference Cα map — used to Kabsch-align AlphaFold/SWISS-MODEL
+        # structures onto the reference frame for the layered view (same
+        # reference used for the RMSD column).
+        self._ref_ca_map  = ca_map
         # ── IUPred 점수 저장 및 무질서 패널 즉시 활성화 ──────────────────────
         # IUPred 예측은 순수 서열 기반이므로 MC landscape 실행 전에도 바로 표시 가능.
         # 사용자가 무질서 버튼을 누르면 IUPred 단독 패널(단일 플롯)을 먼저 보게 되고,
@@ -1717,24 +1770,71 @@ class ProteinApp(QMainWindow):
             self.view_mode_btn.setVisible(True)
             self.landscape_toggle_btn.setText("◈  LANDSCAPE")
         if entry.get("is_mc"):
+            self._current_ext_entry = None
             self._render(entry["mc_idx"])
         else:
             path = entry.get("path")
             if path and os.path.exists(path):
-                self._render_external_pdb(path, entry["source"])
+                self._render_external(entry)
 
-    def _render_external_pdb(self, path, source_name):
+    def _render_external(self, entry):
+        """AlphaFold/SWISS-MODEL VIEW 버튼 디스패처 — 현재 뷰 모드(레이어드/
+        사이드바이사이드)에 따라 최적 MC 후보와 함께 렌더링한다.
+        VIEW-button dispatcher for AlphaFold/SWISS-MODEL entries — renders
+        alongside the best MC candidate, honoring the current view mode
+        (layered/side-by-side) toggle just like the MC candidate view does.
+        """
+        self._current_ext_entry = entry
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                pdb_text = f.read()
+            if self._view_mode == "sidebyside":
+                self._render_external_sidebyside(entry)
+            else:
+                self._render_external_layered(entry)
         except Exception as ex:
-            self._log(f"[EXT] Cannot read {path}: {ex}"); return
+            self._log(f"[RENDER ERROR] {ex}\n{traceback.format_exc()}")
 
-        pdb_esc = pdb_text.replace("\\", "\\\\").replace("`", "\\`")
-        is_af   = "AlphaFold" in source_name
-        color   = "#7c3aed" if is_af else "#d97706"
-        label   = source_name.upper()
-        n_atoms = pdb_text.count("\nATOM")
+    def _render_external_layered(self, entry):
+        path, source_name = entry.get("path"), entry["source"]
+        is_af     = "AlphaFold" in source_name
+        ext_color = "#7c3aed" if is_af else "#d97706"
+        label_ext = source_name.upper()
+
+        # 참조 구조 프레임에 Kabsch 정렬 — 그래야 겹쳐 봤을 때 실제로 겹쳐 보인다.
+        # Kabsch-align onto the reference frame first, otherwise "layered" would
+        # just show two structures floating at unrelated positions/orientations.
+        if self._ref_ca_map:
+            pdb_ext = _aligned_pdb_text(path, self._ref_ca_map)
+        else:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                pdb_ext = f.read()
+        pdb_esc = pdb_ext.replace("\\", "\\\\").replace("`", "\\`")
+        n_atoms = pdb_ext.count("\nATOM")
+
+        best_js, best_e, best_idx = "", "", None
+        if self._ensemble and self._energies:
+            best_idx = int(np.argmin(self._energies))
+            pdb_best = self._build_pdb_str(self._ensemble[best_idx])
+            best_e   = f"{self._energies[best_idx]:.1f} kcal/mol"
+            best_js  = (
+                f'  var mBest=v.addModel(`{pdb_best}`,"pdb");\n'
+                f'  mBest.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},'
+                f'sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});')
+
+        ext_js = (
+            f'  var mExt=v.addModel(`{pdb_esc}`,"pdb");\n'
+            f'  mExt.setStyle({{}},{{cartoon:{{color:"{ext_color}",thickness:0.6,opacity:0.65}},'
+            f'sphere:{{color:"{ext_color}",radius:0.50,opacity:0.60}}}});')
+
+        if best_js:
+            label  = (f"LAYERED &nbsp; {label_ext} &nbsp;over&nbsp; "
+                      f"C{best_idx+1} BEST ({best_e}) &nbsp;&middot;&nbsp; {n_atoms} ATOMS")
+            legend = ('<div id="legend">OVERLAY &nbsp; '
+                      '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE &nbsp;'
+                      f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
+        else:
+            label  = f"{label_ext} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
+            legend = (f'<div id="legend">'
+                      f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
 
         html = f"""<!DOCTYPE html><html><head>
 <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
@@ -1742,34 +1842,108 @@ class ProteinApp(QMainWindow):
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
   #v {{ width:100vw;height:100vh; }}
-  #info {{
-    position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
+  #info {{ position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
     letter-spacing:1px;color:#1e293b;pointer-events:none;
     background:rgba(255,255,255,0.88);padding:5px 10px;
-    border-radius:5px;border:1px solid #e2e8f0;
-  }}
-  #legend {{
-    position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
+    border-radius:5px;border:1px solid #e2e8f0; }}
+  #legend {{ position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
     letter-spacing:1px;color:#475569;pointer-events:none;
     background:rgba(255,255,255,0.88);padding:5px 10px;
-    border-radius:5px;border:1px solid #e2e8f0;
-  }}
+    border-radius:5px;border:1px solid #e2e8f0; }}
 </style></head><body>
 <div id="v"></div>
-<div id="info">{label} &nbsp;&middot;&nbsp; {n_atoms} ATOMS</div>
-<div id="legend"><span style="color:{color}">&#9632;</span> {label}</div>
+<div id="info">{label}</div>
+{legend}
 <script>
 (function(){{
   var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
-  var m=v.addModel(`{pdb_esc}`,"pdb");
-  m.setStyle({{}},{{cartoon:{{color:"{color}",thickness:0.8,opacity:1.0}},
-                    sphere:{{color:"{color}",radius:0.55,opacity:1.0}}}});
+{best_js}
+{ext_js}
   v.zoomTo(); v.zoom(0.85); v.render();
   setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
 }})();
 </script></body></html>"""
         self.viewer_cand_lbl.setText(
-            f'<span style="color:{color};font-weight:bold;">{label}</span>')
+            f'<span style="color:{ext_color};font-weight:bold;">{label_ext}</span> (layered)')
+        self._log(f"[EXT-LAYERED] html={len(html.encode())} bytes")
+        self._set_html(html)
+
+    def _render_external_sidebyside(self, entry):
+        path, source_name = entry.get("path"), entry["source"]
+        is_af     = "AlphaFold" in source_name
+        ext_color = "#7c3aed" if is_af else "#d97706"
+        label_ext = source_name.upper()
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            pdb_ext = f.read()
+        pdb_esc = pdb_ext.replace("\\", "\\\\").replace("`", "\\`")
+        n_atoms = pdb_ext.count("\nATOM")
+
+        left_js = (
+            f'  var mL=vL.addModel(`{pdb_esc}`,"pdb");\n'
+            f'  mL.setStyle({{}},{{cartoon:{{color:"{ext_color}",thickness:0.8,opacity:1.0}},'
+            f'sphere:{{color:"{ext_color}",radius:0.55,opacity:1.0}}}});')
+        left_info   = f"{label_ext} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
+        left_legend = f'<span style="color:{ext_color}">&#9632;</span> {label_ext}'
+
+        right_js, right_info, right_legend = "", "NO MC ENSEMBLE", ""
+        if self._ensemble and self._energies:
+            best_idx = int(np.argmin(self._energies))
+            pdb_best = self._build_pdb_str(self._ensemble[best_idx])
+            best_e   = f"{self._energies[best_idx]:.1f} kcal/mol"
+            right_js = (
+                f'  var mR=vR.addModel(`{pdb_best}`,"pdb");\n'
+                f'  mR.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},'
+                f'sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});')
+            right_info   = f"&#9733; C{best_idx+1} (BEST) &nbsp;&middot;&nbsp; {best_e}"
+            right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
+  .vpane {{ flex:1;position:relative;height:100%; }}
+  .divider {{ width:2px;background:#e2e8f0;flex-shrink:0; }}
+  .info {{ position:absolute;top:12px;left:12px;font-family:monospace;font-size:11px;
+    letter-spacing:1px;color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.9);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;z-index:10; }}
+  .legend {{ position:absolute;bottom:12px;left:12px;font-family:monospace;font-size:10px;
+    letter-spacing:1px;color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.9);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;z-index:10; }}
+  .pane-lbl {{ position:absolute;top:12px;right:12px;font-family:monospace;font-size:9px;
+    letter-spacing:2px;color:#94a3b8;pointer-events:none;z-index:10; }}
+</style></head><body>
+<div class="vpane">
+  <div id="vL" style="width:100%;height:100%;"></div>
+  <div class="info">{left_info}</div>
+  <div class="pane-lbl">{label_ext}</div>
+  <div class="legend">{left_legend}</div>
+</div>
+<div class="divider"></div>
+<div class="vpane">
+  <div id="vR" style="width:100%;height:100%;"></div>
+  <div class="info">{right_info}</div>
+  <div class="pane-lbl">COMPARISON</div>
+  <div class="legend">{right_legend}</div>
+</div>
+<script>
+(function(){{
+  var vL=$3Dmol.createViewer("vL",{{backgroundColor:"#f8fafc"}});
+{left_js}
+  vL.zoomTo(); vL.zoom(0.85); vL.render();
+  setInterval(function(){{ vL.rotate(1,'y'); vL.render(); }},50);
+  var vR=$3Dmol.createViewer("vR",{{backgroundColor:"#f8fafc"}});
+{right_js}
+  vR.zoomTo(); vR.zoom(0.85); vR.render();
+  setInterval(function(){{ vR.rotate(1,'y'); vR.render(); }},50);
+}})();
+</script></body></html>"""
+        self.viewer_cand_lbl.setText(
+            f'<span style="color:{ext_color};font-weight:bold;">{label_ext}</span> (side-by-side)')
+        self._log(f"[EXT-SBS] html={len(html.encode())} bytes")
         self._set_html(html)
 
     # ── Energy landscape ──────────────────────────────────────────
@@ -2063,7 +2237,9 @@ class ProteinApp(QMainWindow):
         else:
             self._view_mode = "layered"
             self.view_mode_btn.setText("◧  SIDE-BY-SIDE")
-        if self._ensemble:
+        if self._current_ext_entry is not None:
+            self._render_external(self._current_ext_entry)
+        elif self._ensemble:
             self._render(self._current_cand_idx)
 
     def _build_pdb_str(self, particles):
@@ -2117,7 +2293,8 @@ class ProteinApp(QMainWindow):
     def _render(self, cand_idx=0):
         self._log(f"[RENDER] mode={self._view_mode}  cand={cand_idx}  "
                   f"ensemble={len(self._ensemble)}")
-        self._current_cand_idx = cand_idx
+        self._current_cand_idx  = cand_idx
+        self._current_ext_entry = None
         if self._energies:
             self._update_candidate_bar_selection(cand_idx)
         if not self._ensemble:
