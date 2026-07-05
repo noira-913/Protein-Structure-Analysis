@@ -1027,17 +1027,18 @@ class LandscapeWorker(QThread):
         self.progress.emit(
             f"  [LANDSCAPE] Running {N}×{S}-step Markov chain…")
 
-        snapshots, energies = [], []
-        current = self.init_atoms
-        for i in range(N):
-            if i % 20 == 0:
-                self.progress.emit(f"  [LANDSCAPE] Snapshot {i}/{N}…")
-            # Each call advances the chain by S MC steps
-            current = self.engine.generate_ensemble(
-                current, self.topo, 1, S, self.T, self.max_angle)[0]
-            snapshots.append(current)
-            energies.append(self.engine.calculate_potential(current, self.topo))
-
+        # run_landscape_trajectory() advances the whole N×S-step chain in a
+        # single C++/CUDA call instead of looping here and calling
+        # generate_ensemble()+calculate_potential() N times — each of those
+        # Python-level iterations used to re-marshal the full particle array
+        # across the Python<->C++ boundary (and, on the GPU backend,
+        # reallocate device buffers from scratch) every single snapshot.
+        # See IMPROVEMENTS.md item #12. The trade-off is coarser progress
+        # feedback: this call blocks until all N snapshots are done rather
+        # than reporting every 20 snapshots, since the loop itself now lives
+        # in C++.
+        snapshots, energies = self.engine.run_landscape_trajectory(
+            self.init_atoms, self.topo, N, S, self.T, self.max_angle)
         energies = np.array(energies, dtype=float)
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")

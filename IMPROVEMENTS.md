@@ -155,10 +155,57 @@
 - Status: TODO.
 
 **12. MC trajectory round-trips CPU↔GPU**
-- LandscapeWorker does 120 Python↔GPU transfers (one per snapshot).
-- Fix: keep entire particle array on GPU device memory; only transfer Cα
-  coordinate snapshots (tiny) to host.
-- Status: TODO — requires CUDA kernel changes.
+- LandscapeWorker did 120 Python↔C++ round trips (one per snapshot), each
+  re-marshalling the full particle array via generate_ensemble()+
+  calculate_potential(), and on the GPU backend reallocating/re-uploading
+  device buffers from scratch every call.
+- Fix: `PhysicsEngine::run_landscape_trajectory()` (both engines) runs the
+  entire N_SNAPSHOTS×STEPS_PER_SNAP Markov chain in a single C++ call.
+  LandscapeWorker now calls it once instead of looping in Python. On the
+  GPU engine, atom parameters/pair-list/exclusion buffers are allocated
+  once per chain and kept resident across the whole trajectory (positions
+  + Born radii are re-uploaded once per MC step, not reallocated).
+  Snapshots still return full particle lists (not just Cα) because the
+  GUI's landscape-graph click handler renders the full structure of
+  whichever node the user picks — an all-Cα return would have silently
+  broken that feature.
+- Status: **DONE**.
+
+**14. GPU engine ran physically-invalid Cartesian MC + ignored topology**
+- `physics_engine_cuda.cu`'s `generate_ensemble()` translated one atom in
+  Cartesian space per step (the same invalid move type fixed for the CPU
+  engine by P1.5) and accepted a `topology` argument only for API parity,
+  silently ignoring it — no dihedral energy, no 1-2/1-3 exclusions, no
+  disulfide restraints. The GPU and CPU backends produced physically
+  different, non-comparable ensembles from the same PDB.
+- It also still used the pre-P1.6 hard-core threshold
+  (`r < 0.85·σ`, both in the device `pair_e_gpu()` kernel and the host
+  `pair_e_cpu()` helper) — P1.6's fix to `physics_engine.cpp` was never
+  ported here, so the GPU engine would reproduce the same
+  billions-of-kcal/mol blowup on any real all-atom structure exercising
+  legitimate 1-4/H···H contacts down to r/σ ≈ 0.67.
+- Fix: ported physics_engine.cpp's torsion-angle Metropolis MC (Rodrigues
+  rotation of one rotatable bond's j-side, lever-arm scaling, crankshaft
+  moves, adaptive proposal width) to the GPU engine, with the same bond
+  topology (1-2/1-3 exclusions, dihedral/Ramachandran energy, disulfide
+  restraints). `physics_engine.cpp`'s `BondTopology` exports the extra
+  data the CUDA module needs (`rb_atom_i/j/kind`, `dih_*` CSR arrays,
+  `disulfide_pairs`, `concerted_pairs`) as plain vectors so a separately
+  compiled pybind11 module can reconstruct an equivalent topology without
+  cross-module C++ type registration. Also lowered `HARD_CUTOFF_FRAC` to
+  0.6 in the GPU engine to match P1.6.
+- GPU/CPU split: the per-step cross-boundary nonbonded energy sum (the
+  dominant O(N·neighbors) cost for a torsion move with a large j-side) now
+  runs on the GPU via a new `cross_pair_energy_kernel`. SASA stays on the
+  CPU host in both engines — its per-atom accumulation is a sequential,
+  order-dependent fold, not an embarrassingly parallel reduction — as do
+  the O(rotatable-bond-count) dihedral/disulfide sums, which are too small
+  to justify a kernel launch.
+- Status: **DONE** — not build-verified in this session (no CUDA
+  toolkit/GPU available in this environment; same caveat as prior GPU-
+  touching sessions in this repo). Needs a Windows+CUDA build/run to
+  confirm it compiles and to compare GPU vs CPU energies on the bundled
+  `data/*.pdb` structures before this is trusted for production use.
 
 ---
 
@@ -184,11 +231,15 @@ P3.2  gui_main.py       — integrate IUPred into PDB parsing              ✓ D
 P3.3  gui_main.py/_compute_rmsd — all-heavy-atom RMSD option             ✓ DONE
 ─────────────────────────────────────────────────────────────────
 P4.1  physics_engine.cpp — cell-list NL build                            ✓ DONE
-P4.2  physics_engine_cuda.cu — GPU-resident trajectory                   TODO
+P4.2  physics_engine_cuda.cu — GPU-resident trajectory                  ✓ DONE
 ─────────────────────────────────────────────────────────────────
 P1.6  physics_engine.cpp — fix hard-core threshold + terminal/          ✓ DONE
       protonation-variant bond patch (nonbonded energy was off by
       5-6 orders of magnitude)
+P1.7  physics_engine_cuda.cu — torsion-move + topology parity with       ✓ DONE
+      the CPU engine (dihedral/exclusions/disulfide/crankshaft),
+      GPU-resident MC state, HARD_CUTOFF_FRAC 0.6 fix ported to GPU
+      (not build-verified — no CUDA toolkit/GPU in this environment)
 ```
 
 ---

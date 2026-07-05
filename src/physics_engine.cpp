@@ -2120,6 +2120,239 @@ public:
         return ens;
     }
 
+    // run_landscape_trajectory: run ONE torsion-MC chain for
+    // n_snapshots * steps_per_snapshot total steps, recording a full snapshot
+    // (particle list + energy) every steps_per_snapshot steps.
+    //
+    // This exists so LandscapeWorker (Python) can advance the whole 120×80-step
+    // Markov chain with a single call into C++ instead of looping 120 times,
+    // each iteration re-marshalling the full particle array across the
+    // Python↔C++ boundary via generate_ensemble(...)[0] + calculate_potential(...)
+    // (see IMPROVEMENTS.md item #12). The per-step physics is identical to
+    // generate_ensemble's single-chain body (duplicated rather than shared via
+    // a helper, to avoid touching that already-verified hot path).
+    std::pair<std::vector<std::vector<Particle>>, std::vector<double>>
+    run_landscape_trajectory(
+        const std::vector<Particle>& init,
+        const BondTopology& topo,
+        int n_snapshots, int steps_per_snapshot,
+        double T = 0.6,
+        double max_angle = 0.12)
+    {
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (n_snapshots <= 0 || steps_per_snapshot <= 0)
+            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+
+        size_t N   = init.size();
+        int    nrb = (int)topo.rot_bonds.size();
+        int    ncp = (int)topo.concerted_pairs.size();
+
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
+        snapshots.reserve(n_snapshots);
+        energies.reserve(n_snapshots);
+
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        double curE = total_e(st, nl, a, &topo);
+
+        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        std::vector<bool> in_side(N, false);
+
+        double cur_max = max_angle;
+        int    acc_win = 0, tot_win = 0;
+        constexpr int    TUNE_FREQ  = 200;
+        constexpr double TARGET_LO  = 0.28, TARGET_HI = 0.52;
+        constexpr double SCALE_UP   = 1.06,  SCALE_DOWN = 0.94;
+        constexpr double ANGLE_MAX  = 0.50,  ANGLE_MIN  = 0.004;
+
+        auto cross_e = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (in_side[i] == in_side[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+
+        auto try_torsion = [&]() -> std::pair<bool,bool> {
+            int            rb_idx = pick_rb(gen);
+            const RotBond& rb     = topo.rot_bonds[rb_idx];
+            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            if (side.empty()) return {false, false};
+
+            double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
+            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            if (al < 1e-10) return {false, false};
+            ax/=al; ay/=al; az/=al;
+
+            double base_d = (rb.kind == BondKind::BACKBONE_PHI ||
+                             rb.kind == BondKind::BACKBONE_PSI)
+                            ? cur_max : cur_max * 2.5;
+            base_d *= topo.rot_bond_scale[rb_idx];
+            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : side) in_side[k] = true;
+
+            std::vector<std::array<double,3>> old_pos(side.size());
+            std::vector<double>               old_born(side.size());
+            for (size_t k = 0; k < side.size(); ++k) {
+                int idx = side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double old_cross = cross_e();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+            for (int k : side)
+                rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ax, ay, az, cosD, sinD);
+            for (int k : side) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < side.size(); ++k) {
+                    int idx = side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : side) in_side[k] = false;
+            return {accepted, true};
+        };
+
+        auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+            if (ncp == 0) return {false, false};
+            int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
+            int phi_k  = topo.concerted_pairs[cp_idx].first;
+            int psi_k  = topo.concerted_pairs[cp_idx].second;
+            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            if (phi_side.empty() || psi_side.empty()) return {false, false};
+
+            for (int k : phi_side) in_side[k] = true;
+
+            const RotBond& phi_rb = topo.rot_bonds[phi_k];
+            double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
+            double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
+            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
+            p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
+
+            std::vector<std::array<double,3>> old_pos(phi_side.size());
+            std::vector<double>               old_born(phi_side.size());
+            for (size_t k = 0; k < phi_side.size(); ++k) {
+                int idx = phi_side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+            double old_cross = cross_e();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : phi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
+
+            const RotBond& psi_rb = topo.rot_bonds[psi_k];
+            double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
+            double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
+            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            if (p2l < 1e-10) {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                }
+                for (int k : phi_side) in_side[k] = false;
+                return {false, false};
+            }
+            p2ax/=p2l; p2ay/=p2l; p2az/=p2l;
+            for (int k : psi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p2ox, p2oy, p2oz, p2ax, p2ay, p2az, cosD, -sinD);
+
+            for (int k : phi_side) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : phi_side) in_side[k] = false;
+            return {accepted, true};
+        };
+
+        for (int snap = 0; snap < n_snapshots; ++snap) {
+            for (int s = 0; s < steps_per_snapshot; ++s) {
+                if (nl.needs_rebuild(st)) {
+                    nl.build(st);
+                    a    = born_radii(st, nl);
+                    curE = total_e(st, nl, a, &topo);
+                }
+                bool do_crank = ncp > 0 && uni(gen) < 0.25;
+                auto [accepted, did_move] = do_crank ? try_crankshaft() : try_torsion();
+                if (did_move) {
+                    acc_win += accepted ? 1 : 0;
+                    if (++tot_win == TUNE_FREQ) {
+                        double rate = (double)acc_win / TUNE_FREQ;
+                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        acc_win = tot_win = 0;
+                    }
+                }
+            }
+            snapshots.push_back(st);
+            // Recorded energy matches the old Python-level LandscapeWorker exactly:
+            // a from-scratch calculate_potential() call (fresh NL + fresh Born radii),
+            // not the loop's incrementally-tracked curE (which only rebuilds Born
+            // radii for the atoms that just moved, and would drift slightly from
+            // a true from-scratch value over thousands of steps).
+            energies.push_back(calculate_potential(st, &topo));
+        }
+        return {snapshots, energies};
+    }
+
     // lowest_energy_structure: scan an ensemble and return the conformation with the
     // minimum total potential energy.  Calls calculate_potential on every member,
     // so this is O(ncand · N²) and should only be called once after MC finishes.
@@ -2175,8 +2408,94 @@ PYBIND11_MODULE(protein_physics,m){
         .def_readonly("rot_bond_sides", &BondTopology::rot_bond_sides)
         .def_readonly("excl",             &BondTopology::excl)
         .def_readonly("rot_bond_scale",   &BondTopology::rot_bond_scale)
+        .def_readonly("disulfide_pairs",  &BondTopology::disulfide_pairs)
+        .def_readonly("concerted_pairs",  &BondTopology::concerted_pairs)
         .def("add_disulfide", &BondTopology::add_disulfide,
              py::arg("atom_i"), py::arg("atom_j"))
+        // ── Flat/CSR exports (rb_*, dih_*) ──────────────────────────────────
+        //
+        // rot_bonds/dihedrals hold custom C++ structs (RotBond/DihRecord) that
+        // are bound as pybind11 types only in THIS module. A second, separately
+        // compiled pybind11 module (protein_physics_cuda) cannot cast a Python
+        // BondTopology's .rot_bonds/.dihedrals into its own local struct types
+        // without re-registering py::class_<RotBond>/py::class_<DihRecord> —
+        // which pybind11 forbids for the same C++ type across modules and is
+        // meaningless here anyway (RotBond/DihRecord are distinct C++ types per
+        // translation unit). Exporting the same data as plain vectors of
+        // int/double lets any module reconstruct it via ordinary STL casts.
+        .def_property_readonly("rb_atom_i",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                for (const auto& rb : t.rot_bonds) v.push_back(rb.i);
+                return v;
+            })
+        .def_property_readonly("rb_atom_j",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                for (const auto& rb : t.rot_bonds) v.push_back(rb.j);
+                return v;
+            })
+        .def_property_readonly("rb_kind",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                for (const auto& rb : t.rot_bonds) v.push_back(static_cast<int>(rb.kind));
+                return v;
+            })
+        .def_property_readonly("dih_a",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.dihedrals.size());
+                for (const auto& d : t.dihedrals) v.push_back(d.a);
+                return v;
+            })
+        .def_property_readonly("dih_b",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.dihedrals.size());
+                for (const auto& d : t.dihedrals) v.push_back(d.b);
+                return v;
+            })
+        .def_property_readonly("dih_c",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.dihedrals.size());
+                for (const auto& d : t.dihedrals) v.push_back(d.c);
+                return v;
+            })
+        .def_property_readonly("dih_d",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.dihedrals.size());
+                for (const auto& d : t.dihedrals) v.push_back(d.d);
+                return v;
+            })
+        // CSR layout: dih_term_offsets has one entry per dihedral plus a final
+        // sentinel (length = num_dihedrals + 1); terms for dihedral k live in
+        // [offsets[k], offsets[k+1]) of the flat v2/n/gamma arrays.
+        .def_property_readonly("dih_term_offsets",
+            [](const BondTopology& t){
+                std::vector<int> v; v.reserve(t.dihedrals.size() + 1);
+                int off = 0; v.push_back(0);
+                for (const auto& d : t.dihedrals) { off += (int)d.terms.size(); v.push_back(off); }
+                return v;
+            })
+        .def_property_readonly("dih_term_v2",
+            [](const BondTopology& t){
+                std::vector<double> v;
+                for (const auto& d : t.dihedrals)
+                    for (const auto& term : d.terms) v.push_back(term.V2);
+                return v;
+            })
+        .def_property_readonly("dih_term_n",
+            [](const BondTopology& t){
+                std::vector<int> v;
+                for (const auto& d : t.dihedrals)
+                    for (const auto& term : d.terms) v.push_back(term.n);
+                return v;
+            })
+        .def_property_readonly("dih_term_gamma",
+            [](const BondTopology& t){
+                std::vector<double> v;
+                for (const auto& d : t.dihedrals)
+                    for (const auto& term : d.terms) v.push_back(term.gamma);
+                return v;
+            })
         .def_property_readonly("num_dihedrals",
             [](const BondTopology& t){ return (int)t.dihedrals.size(); })
         .def_property_readonly("num_atoms",
@@ -2210,5 +2529,10 @@ PYBIND11_MODULE(protein_physics,m){
              py::call_guard<py::gil_scoped_release>())
         .def("lowest_energy_structure",&PhysicsEngine::lowest_energy_structure,
              py::arg("ensemble"),py::call_guard<py::gil_scoped_release>())
+        .def("run_landscape_trajectory",&PhysicsEngine::run_landscape_trajectory,
+             py::arg("initial_state"),py::arg("topology"),
+             py::arg("n_snapshots"),py::arg("steps_per_snapshot"),
+             py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
+             py::call_guard<py::gil_scoped_release>())
         .def("num_threads",&PhysicsEngine::num_threads);
 }
