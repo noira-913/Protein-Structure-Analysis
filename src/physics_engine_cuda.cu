@@ -70,27 +70,19 @@ namespace py = pybind11;
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /* ── double-precision CPU-side constants ─────────────────────────────── */
-static constexpr double COULOMB    = 332.0636;
-static constexpr double EPS_WATER  = 78.5;
-static constexpr double EPS_PROT   = 1.0;
-static constexpr double KAPPA      = 0.1257;
+/* Note: pair energy / Born radii are computed exclusively on the GPU in this
+ * engine (see gpu_total_energy_topo / cross_pair_energy_kernel below), so
+ * only the constants their CPU-side neighbors (NeighborList, SASA, disulfide
+ * restraints) actually need live here. COULOMB/EPS_WATER/EPS_PROT/KAPPA/
+ * HARD_SCALE/HARD_CUTOFF_FRAC/GB_COEF only fed a double-precision pair_e_cpu()
+ * that existed for the old Cartesian-move engine; removed along with it. */
 static constexpr double GAMMA_SA   = 0.00542;
 static constexpr double BETA_SA    = 0.92;
 static constexpr double PROBE_R    = 1.4;
 static constexpr double NL_CUTOFF  = 12.0;
 static constexpr double NL_SKIN    = 2.0;
 static constexpr double NL_RCUT2   = (NL_CUTOFF + NL_SKIN) * (NL_CUTOFF + NL_SKIN);
-static constexpr double PAIR_CUT2  = NL_CUTOFF * NL_CUTOFF;
 static constexpr double HALF_SKIN2 = (NL_SKIN * 0.5) * (NL_SKIN * 0.5);
-static constexpr double HARD_SCALE = 1.0e4;
-/* HARD_CUTOFF_FRAC: kept in sync with physics_engine.cpp's P1.6 fix (see
- * IMPROVEMENTS.md item #13). The GPU engine previously still used the old,
- * miscalibrated 0.85 threshold — this file had never been touched by that
- * bugfix — which would have reproduced the same billions-of-kcal/mol
- * blowup on any real all-atom structure the moment this engine exercised
- * real (non-excluded) 1-4/H..H contacts down to r/sigma ~ 0.67. */
-static constexpr double HARD_CUTOFF_FRAC = 0.6;
-static constexpr double GB_COEF    = -0.5 * (1.0 / EPS_PROT - 1.0 / EPS_WATER) * COULOMB;
 static constexpr double K_SS       = 600.0;   /* disulfide restraint force constant (kcal/mol/Ang^2) */
 static constexpr double R0_SS      = 2.044;   /* equilibrium SG-SG distance (Ang) */
 
@@ -99,6 +91,12 @@ static constexpr double R0_SS      = 2.044;   /* equilibrium SG-SG distance (Ang
 #define EPS_WATER_F    78.5f
 #define KAPPA_F        0.1257f
 #define HARD_SCALE_F   1.0e4f
+/* HARD_CUTOFF_FRAC_F: kept in sync with physics_engine.cpp's P1.6 fix (see
+ * IMPROVEMENTS.md item #13). This GPU engine previously used the old,
+ * miscalibrated 0.85 threshold — this file had never been touched by that
+ * bugfix — which would have reproduced the same billions-of-kcal/mol
+ * blowup on any real all-atom structure the moment this engine exercised
+ * real (non-excluded) 1-4/H..H contacts down to r/sigma ~ 0.67. */
 #define HARD_CUTOFF_FRAC_F 0.6f
 /* GB_COEF_F = -0.5 * (1/1 - 1/78.5) * 332.0636  */
 #define GB_COEF_F      (-0.5f * (1.0f - 1.0f / 78.5f) * 332.0636f)
@@ -236,48 +234,6 @@ static inline double hct_cpu(double r, double r2, double ri, double rj) noexcept
     if (ri >= U) return 0.0;
     return 1.0/L - 1.0/U
            + (r2 - rj*rj + ri*ri) / (2.0*r*ri*ri) * std::log(L/U) * 0.5 / r;
-}
-
-static inline double pair_e_cpu(const Particle& pi_p, const Particle& pj_p,
-                                 double ai, double aj) noexcept
-{
-    double dx  = pi_p.x - pj_p.x;
-    double dy  = pi_p.y - pj_p.y;
-    double dz  = pi_p.z - pj_p.z;
-    double r2  = dx*dx + dy*dy + dz*dz;
-    double r   = std::sqrt(r2);
-    double sig = pi_p.radius + pj_p.radius;
-    if (r < sig * HARD_CUTOFF_FRAC)
-        return HARD_SCALE * std::pow(sig / r, 12.0);
-    double qp  = pi_p.charge * pj_p.charge;
-    double edh = (COULOMB * qp) / (EPS_WATER * r) * std::exp(-KAPPA * r);
-    double fgb = std::sqrt(r2 + ai * aj * std::exp(-r2 / (4.0 * ai * aj)));
-    double egb = GB_COEF * qp / fgb;
-    double eps = std::sqrt(pi_p.epsilon * pj_p.epsilon);
-    double s6  = std::pow(sig / r, 6.0);
-    double elj = 4.0 * eps * (s6*s6 - s6);
-    return edh + egb + elj;
-}
-
-static std::vector<double> born_radii_cpu(const std::vector<Particle>& p,
-                                           const NeighborList& nl)
-{
-    size_t N = p.size();
-    std::vector<double> sum(N, 0.0);
-    for (size_t i = 0; i < N; ++i) {
-        for (size_t j : nl.nb[i]) {
-            double r2 = d2_cpu(p[i], p[j]);
-            double r  = std::sqrt(r2);
-            sum[i] += hct_cpu(r, r2, p[i].radius, p[j].radius);
-            sum[j] += hct_cpu(r, r2, p[j].radius, p[i].radius);
-        }
-    }
-    std::vector<double> a(N);
-    for (size_t i = 0; i < N; ++i) {
-        double inv = 1.0 / p[i].radius - 0.5 * sum[i];
-        a[i] = 1.0 / std::max(inv, 2.0);
-    }
-    return a;
 }
 
 static void update_born_cpu(size_t idx,
