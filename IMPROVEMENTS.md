@@ -54,6 +54,32 @@
   explore protein conformational space at all.
 - Status: **DONE** — Rodrigues torsion move loop replaces Cartesian sampler; `BondTopology.rot_bond_sides` pre-computed; exclusions applied in ΔE cross-pair loops.
 
+**13. Nonbonded energy was wrong by 5-6 orders of magnitude (billions instead of thousands of kcal/mol)**
+- Found while running the real pipeline end-to-end on the bundled all-atom (explicit-H)
+  test structures — `calculate_potential()` returned totals like 5.7×10⁹ kcal/mol for a
+  140-residue protein instead of the expected low thousands.
+- Two compounding bugs in `physics_engine.cpp`:
+  (a) `pair_e()`'s hard-core guard fired at `r < 0.85·σ`. Measured against a real folded
+      all-atom structure, legitimate non-excluded contacts (mostly 1-4 and H···H van der
+      Waals pairs) go down to `r/σ ≈ 0.67` with nothing pathological about them — plain
+      LJ already scores them at a few kcal/mol. At 0.85·σ the guard was firing on
+      thousands of these normal contacts and replacing each with an artificial
+      `HARD_SCALE·(σ/r)¹²` spike.
+  (b) `bond_templates()` only covers each residue's internal/standard form, so atoms that
+      only exist at a chain terminus or under a non-default protonation state — N-terminal
+      NH₃⁺ (`H1`/`H2`/`H3`), C-terminal COO⁻ (`OXT`), HIS `NE2`-`HE2` when the file has it —
+      never got an `add_bond()` call. That left them out of `excl[]` too, so a real ~1.0 Å
+      covalent pair was scored as a nonbonded contact and hit the (miscalibrated) hard-core
+      guard, each contributing 10⁸–10⁹ kcal/mol on its own.
+- Fix: lowered the hard-core threshold to `HARD_CUTOFF_FRAC = 0.6` (safely below every
+  observed legitimate contact, still catches genuine MC-proposal overlaps), and added a
+  terminal/protonation-variant bonding patch in `BondTopology::build()` that connects these
+  atoms whenever both ends are actually present in the parsed structure.
+- Status: **DONE** — verified across all 11 bundled `data/*.pdb` structures: energies now
+  land in the expected range (roughly −30 to +7 kcal/mol per atom for correctly folded
+  proteins) instead of billions. `topo.adj` shows zero unbonded polymer atoms on every
+  bundled structure.
+
 **5. Trajectory lengths are too short to matter**
 - Pipeline MC: 300 steps × 5 candidates.
 - Landscape MC: 120 × 80 = 9 600 steps.
@@ -159,6 +185,10 @@ P3.3  gui_main.py/_compute_rmsd — all-heavy-atom RMSD option             ✓ D
 ─────────────────────────────────────────────────────────────────
 P4.1  physics_engine.cpp — cell-list NL build                            ✓ DONE
 P4.2  physics_engine_cuda.cu — GPU-resident trajectory                   TODO
+─────────────────────────────────────────────────────────────────
+P1.6  physics_engine.cpp — fix hard-core threshold + terminal/          ✓ DONE
+      protonation-variant bond patch (nonbonded energy was off by
+      5-6 orders of magnitude)
 ```
 
 ---

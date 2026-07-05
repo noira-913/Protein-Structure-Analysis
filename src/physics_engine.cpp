@@ -122,8 +122,31 @@ namespace py = pybind11;
 //             이 거리 밖의 쌍은 에너지 계산에서 제외 (장거리 근사)
 // NL_SKIN   : extra shell around cutoff kept in neighbor list for drift tolerance
 //             이웃 목록을 컷오프보다 약간 크게 유지해 drift 허용 — 재구축 빈도 감소
-// HARD_SCALE: energy scale for hard-core repulsion when atoms overlap (r < 0.85σ)
-//             원자가 겹칠 때(r < 0.85σ) 적용되는 강한 척력 에너지 스케일
+// HARD_SCALE: energy scale for hard-core repulsion when atoms overlap (r < HARD_CUTOFF_FRAC·σ)
+//             원자가 겹칠 때(r < HARD_CUTOFF_FRAC·σ) 적용되는 강한 척력 에너지 스케일
+// HARD_CUTOFF_FRAC: fraction of σ below which pair_e() substitutes the hard-core
+//             term for the ordinary LJ/GB/DH sum.  Calibrated empirically against
+//             an all-atom (explicit-H) folded structure (PDB 1XQ8): real, chemically
+//             valid non-excluded contacts (mostly 1-4 and H···H van der Waals pairs)
+//             go down to r/σ ≈ 0.67 with nothing pathological about them — plain LJ
+//             already evaluates them to a small, bounded, mildly repulsive energy.
+//             A threshold of 0.85 (the previous value) caught thousands of these
+//             normal contacts and replaced a ~few-kcal/mol LJ value with an
+//             artificial HARD_SCALE·(σ/r)¹² spike of 10⁴–10⁹ kcal/mol each,
+//             which is why whole-protein energies came out in the billions
+//             instead of the expected thousands.  0.6 sits safely below every
+//             observed legitimate contact while still catching genuine
+//             numerical-overlap pathologies from aggressive MC proposals.
+//             HARD_CUTOFF_FRAC: pair_e()가 통상적인 LJ/GB/DH 합 대신 하드코어 항을
+//             대입하는 σ 대비 거리 비율. 수소를 포함한 전원자 접힘 구조(PDB 1XQ8)로
+//             경험적으로 보정함: 실제로 배제되지 않는 화학적으로 정상적인 접촉
+//             (대부분 1-4 쌍과 H···H 반데르발스 쌍)은 r/σ ≈ 0.67까지 내려가며 전혀
+//             병리적이지 않다 — 통상적인 LJ만으로도 작고 유한한 약한 척력 값이 나온다.
+//             기존 값 0.85는 이런 정상 접촉 수천 개를 붙잡아 몇 kcal/mol의 LJ 값을
+//             10⁴~10⁹ kcal/mol짜리 인위적 스파이크로 대체해버렸고, 이것이 전체
+//             단백질 에너지가 수천 대신 수십억 단위로 나온 원인이다. 0.6은 관측된
+//             모든 정상 접촉보다 충분히 낮으면서도, 공격적인 MC 제안으로 인한 실제
+//             수치적 겹침 병리 현상은 여전히 잡아낸다.
 // GB_COEF   : prefactor for the GB Born term = -½(1/ε_prot - 1/ε_water)·C
 //             GB Born 항의 앞인수 — 진공→물 이동 시 에너지 이득(음수)
 static constexpr double COULOMB    = 332.0636;
@@ -139,6 +162,7 @@ static constexpr double NL_RCUT2   = (NL_CUTOFF+NL_SKIN)*(NL_CUTOFF+NL_SKIN);
 static constexpr double PAIR_CUT2  = NL_CUTOFF*NL_CUTOFF;
 static constexpr double HALF_SKIN2 = (NL_SKIN*0.5)*(NL_SKIN*0.5);
 static constexpr double HARD_SCALE = 1.0e4;
+static constexpr double HARD_CUTOFF_FRAC = 0.6;
 static constexpr double GB_COEF    = -0.5*(1.0/EPS_PROT-1.0/EPS_WATER)*COULOMB;
 
 // Particle: one heavy atom (or hydrogen) in the system.
@@ -1160,6 +1184,42 @@ public:
                 add_bond(ic->second, in->second);
         }
 
+        // ── 단계 4b: 말단/양성자화 변이 원자 패치 ───────────────────────────
+        //
+        // bond_templates()는 잔기 "내부" 표준형만 다루므로, 사슬 말단이나
+        // 비표준 양성자화 상태에서만 나타나는 원자는 어느 템플릿에도 없어
+        // add_bond()로 연결되지 않는다. 그 결과 excl[]에도 빠져, 실제로는
+        // ~1.0 Å 떨어진 공유 결합 쌍인데도 비결합 항(특히 하드코어 척력)에
+        // 그대로 들어가 수십억 kcal/mol 단위의 허구 에너지를 만들어낸다.
+        // 잔기명에 관계없이 "이 잔기에 해당 원자가 실제로 존재하는가"만
+        // 보고 연결하므로, 어떤 잔기가 사슬의 첫/마지막에 오든 안전하다.
+        //
+        // Step 4b: patch terminal / alternate-protonation atoms.
+        // bond_templates() only covers each residue's internal/standard form,
+        // so atoms that only appear at a chain terminus or under a non-default
+        // protonation state (N-terminal NH3+ H1/H2/H3, C-terminal COO⁻ OXT,
+        // HIS NE2-HE2 when the file has it regardless of the HID default used
+        // elsewhere for typing) never get an add_bond() call. That leaves them
+        // out of excl[] too, so a real ~1.0 Å covalent pair ends up evaluated
+        // as a nonbonded contact — tripping the hard-core term for billions of
+        // kcal/mol of spurious energy. This patch bonds them whenever both
+        // atoms are actually present, independent of residue identity or
+        // position in the chain.
+        for (int r : unique_res) {
+            auto bondIfPresent = [&](const char* a, const char* b) {
+                auto ia = lookup.find({r, a});
+                auto ib = lookup.find({r, b});
+                if (ia != lookup.end() && ib != lookup.end())
+                    add_bond(ia->second, ib->second);
+            };
+            bondIfPresent("N", "H1");    // N-terminal NH3+
+            bondIfPresent("N", "H2");
+            bondIfPresent("N", "H3");
+            bondIfPresent("C", "OXT");   // C-terminal COO-
+            bondIfPresent("NE2", "HE2"); // HIS epsilon-protonated (HIE/HIP); ND1-HD1 already
+                                         // covered by the HID template used for typing.
+        }
+
         // ── 단계 5: 회전 가능 결합 인덱스 추출 ──────────────────────────────
         // rot_specs()의 (원자명_i, 원자명_j, BondKind) 튜플을 실제 인덱스로 변환.
         // 원자가 조회되지 않으면 (PRO에서 N-H가 없는 경우 등) 조용히 건너뜀.
@@ -1706,12 +1766,12 @@ private:
     //   elj  — Lennard-Jones 12-6 van der Waals
     //          4ε[(σ/r)¹² - (σ/r)⁶] : 12항=척력(steric), 6항=분산(인력)
     //
-    // Hard-core repulsion replaces all three when atoms overlap (r < 0.85·σ).
-    // r < 0.85σ 원자 겹침 시 HARD_SCALE·(σ/r)¹²로 모든 항을 대체 (충돌 방지).
+    // Hard-core repulsion replaces all three when atoms overlap (r < HARD_CUTOFF_FRAC·σ).
+    // r < HARD_CUTOFF_FRAC·σ 원자 겹침 시 HARD_SCALE·(σ/r)¹²로 모든 항을 대체 (충돌 방지).
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
         double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
-        if(r<sig*0.85) return HARD_SCALE*std::pow(sig/r,12.0);
+        if(r<sig*HARD_CUTOFF_FRAC) return HARD_SCALE*std::pow(sig/r,12.0);
         double qp=pi.charge*pj.charge;
         double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
         double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
