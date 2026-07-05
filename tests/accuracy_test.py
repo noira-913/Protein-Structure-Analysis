@@ -56,6 +56,17 @@ Test proteins -- chosen for fold/feature diversity, not cherry-picked for ease:
   - 1F6S  / P00711  alpha-lactalbumin        (alpha+beta, 4 disulfides, lysozyme-
                                               family fold for comparison)
 
+  Larger proteins (more particles, more rotatable bonds -- same near-native
+  question at bigger scale):
+  - 1YPI  / P60174  triose phosphate isomerase (TIM barrel, ~250 aa, no SS)
+  - 2CBA  / P00918  carbonic anhydrase II    (beta-sheet + Zn2+ metal site, ~260 aa)
+  - 1ALD  / P00883  aldolase A               (TIM barrel, ~360 aa, tetramer in the
+                                              crystal -- restricted to chain A)
+  - 1LCI  / P08659  firefly luciferase       (~550 aa, two-domain, no SS/metals)
+  - 1AO6  / P02768  human serum albumin      (~585 aa, all-alpha, 17 disulfides --
+                                              the largest and most disulfide-dense
+                                              case in this set)
+
 Requires internet access (fetches from files.rcsb.org and alphafold.ebi.ac.uk).
 """
 
@@ -83,6 +94,13 @@ TEST_PROTEINS = [
     ("Chymotrypsin inhibitor 2", "P01053", "2CI2"),
     ("Interleukin-1 beta",     "P01584", "2I1B"),
     ("Alpha-lactalbumin",      "P00711", "1F6S"),
+    # Larger proteins (more particles) -- stress-test the same near-native
+    # energy-minimization question at bigger atom counts / more rotatable bonds.
+    ("Triose phosphate isomerase", "P60174", "1YPI"),
+    ("Carbonic anhydrase II",  "P00918", "2CBA"),
+    ("Aldolase A",             "P00883", "1ALD"),
+    ("Firefly luciferase",     "P08659", "1LCI"),
+    ("Human serum albumin",    "P02768", "1AO6"),
 ]
 
 OFFSET_SEARCH_RANGE = range(-200, 201)

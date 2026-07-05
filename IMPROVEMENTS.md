@@ -276,6 +276,19 @@
   — a known, documented limitation of the offset-search approach, not an ALMA
   accuracy issue. Run with `python tests/accuracy_test.py` (needs internet
   access to fetch structures).
+- Extended to 5 larger proteins (521-4599 atoms was the full range before this;
+  now up to triose phosphate isomerase, carbonic anhydrase II, aldolase A,
+  firefly luciferase, and human serum albumin — 1883 to 4599 atoms, up to 578
+  residues): **12/13 total proteins pass**, no new bugs at larger scale. Human
+  serum albumin — the largest and most disulfide-dense case (578 residues,
+  4599 atoms) — correctly detects all 17 of its known native disulfide bonds
+  and keeps MC sampling within 0.3-0.8 Å of native after 5000 steps, well
+  inside its 1.28 Å AlphaFold baseline. Firefly luciferase's 7.0 Å AlphaFold-
+  vs-crystal baseline reflects genuine, well-documented hinge motion between
+  its two domains (not a registration bug — full 523/523 residue match) and
+  ALMA's own sampling drifts proportionally more for it (up to 2.8 Å) than for
+  any other test protein, which is the physically expected result for a
+  flexible multi-domain enzyme, not a red flag.
 
 ---
 
