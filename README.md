@@ -392,6 +392,25 @@ python setup.py build_ext --inplace     # Builds CPU + GPU extensions if CUDA is
 Python dependencies are listed in `requirements.txt` (PyQt6, NumPy,
 BioPython, scikit-learn, NetworkX, requests, pybind11).
 
+### Portable Windows build
+
+Every tagged release (`vX.Y.Z`) publishes a single-file `ALMA.exe` via
+[GitHub Actions](.github/workflows/release.yml) — download it from the
+repo's Releases page and run it directly, no Python or installer needed.
+It creates a `data/` folder next to itself on first run to cache
+downloaded PDB structures.
+
+To build it locally on Windows:
+
+```bat
+build_portable_exe.bat
+```
+
+which builds the `protein_physics` extension for the active interpreter
+and packages `python/gui_main.py` with PyInstaller (`alma.spec`) into
+`dist\ALMA.exe`. The CI build is CPU-only; a locally built exe will also
+include the CUDA backend if the CUDA toolkit is present at build time.
+
 ## Usage
 
 ```bash
