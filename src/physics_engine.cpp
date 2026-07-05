@@ -2378,7 +2378,21 @@ public:
 // long C++ calls so that the Qt GUI thread remains responsive.
 PYBIND11_MODULE(protein_physics,m){
     m.doc()="High-perf implicit-solvent engine (Verlet NL·HCT-GB·SASA·OpenMP)";
-    py::class_<Particle>(m,"Particle")
+    // module_local(): protein_physics_cuda defines its own, separately-compiled
+    // "Particle"/"PhysicsEngine" classes with the same names. On Linux/macOS
+    // these are distinct C++ types (separate RTTI per shared object) and
+    // pybind11 would register them independently regardless; on Windows, MSVC's
+    // RTTI compares type_info by decorated NAME across DLLs, so pybind11 sees
+    // them as the SAME C++ type and refuses the second module's registration
+    // with "generic_type: type is already registered!" the moment both modules
+    // are imported in one process (gui_main.py always imports protein_physics,
+    // then conditionally protein_physics_cuda to probe for a GPU at startup).
+    // module_local() keeps each module's registration in its own per-module
+    // table instead of the shared global one, which is exactly what's needed
+    // here since Particle/PhysicsEngine instances are never passed between
+    // the two engines (gui_main.py always uses one engine module consistently
+    // for a whole session, never mixing).
+    py::class_<Particle>(m,"Particle", py::module_local())
         .def(py::init<double,double,double,double,double,double,bool>(),
              py::arg("x"),py::arg("y"),py::arg("z"),py::arg("charge"),
              py::arg("radius")=1.9,py::arg("epsilon")=0.1,py::arg("is_water")=false)
@@ -2508,7 +2522,7 @@ PYBIND11_MODULE(protein_physics,m){
             [](const BondTopology& t){ return (int)t.concerted_pairs.size(); })
         .def_property_readonly("num_disulfide_pairs",
             [](const BondTopology& t){ return (int)t.disulfide_pairs.size(); });
-    py::class_<PhysicsEngine>(m,"PhysicsEngine")
+    py::class_<PhysicsEngine>(m,"PhysicsEngine", py::module_local())
         .def(py::init<>())
         .def("calculate_potential",
              [](PhysicsEngine& self,

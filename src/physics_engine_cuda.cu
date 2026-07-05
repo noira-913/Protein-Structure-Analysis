@@ -1251,7 +1251,19 @@ PYBIND11_MODULE(protein_physics_cuda, m)
               "(CUDA Born/pair-energy kernels + torsion-angle MC, "
               "topology-aware: dihedral/exclusion/disulfide parity with protein_physics)";
 
-    py::class_<Particle>(m, "Particle")
+    // module_local(): protein_physics (the CPU module) defines its own,
+    // separately-compiled "Particle"/"PhysicsEngine" classes with the same
+    // names. On Windows, MSVC's RTTI compares type_info by decorated NAME
+    // across DLLs (unlike Linux/macOS, where each shared object has its own
+    // independent RTTI), so pybind11 sees these as the SAME C++ type and
+    // refuses this module's registration with "generic_type: type is already
+    // registered!" the moment both modules are imported in one process
+    // (gui_main.py always imports protein_physics, then conditionally
+    // protein_physics_cuda to probe for a GPU at startup). module_local()
+    // keeps this module's registration in its own per-module table instead
+    // of the shared global one -- safe here since Particle/PhysicsEngine
+    // instances are never passed between the two engines.
+    py::class_<Particle>(m, "Particle", py::module_local())
         .def(py::init<double, double, double, double, double, double, bool>(),
              py::arg("x"),
              py::arg("y"),
@@ -1268,7 +1280,7 @@ PYBIND11_MODULE(protein_physics_cuda, m)
         .def_readwrite("epsilon",  &Particle::epsilon)
         .def_readwrite("is_water", &Particle::is_water);
 
-    py::class_<PhysicsEngine>(m, "PhysicsEngine")
+    py::class_<PhysicsEngine>(m, "PhysicsEngine", py::module_local())
         .def(py::init<>())
         .def("calculate_potential",
              [](PhysicsEngine& self, const std::vector<Particle>& particles,
