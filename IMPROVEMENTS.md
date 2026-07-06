@@ -381,11 +381,61 @@
   succeeds, the simulated GPU call fails, the worker logs the fallback,
   emits `gpu_fallback`, retries on CPU, and the `finished` signal fires
   normally — the analysis completes instead of crashing. `tests/bridge_test.py`
-  still passes (no regression to the normal all-CPU or all-GPU paths). Does
-  NOT fix the underlying PTX/toolchain mismatch itself (that's an environment
-  issue on whichever machine runs a mismatched distributed build, not
-  something fixable from this repo's build flags alone) — only prevents it
-  from crashing the app.
+  still passes (no regression to the normal all-CPU or all-GPU paths). At the
+  time this was written the underlying PTX/toolchain mismatch itself was
+  believed to be an unfixable environment issue on whichever machine runs a
+  mismatched distributed build — **that assumption was wrong; see item #18,
+  which root-causes and actually fixes it.**
+
+**18. The "unsupported toolchain" PTX error (item #17) was a real, fixable release-build bug, not an unavoidable environment mismatch**
+- Root-caused by extracting the actual downloaded `ALMA.exe`'s bundled
+  `protein_physics_cuda.cp312-win_amd64.pyd` from its PyInstaller temp
+  extraction directory and running it directly: `cuobjdump --list-elf`
+  showed it contains compiled code for **only `sm_75`** (Turing) — none of
+  the `sm_86`/`sm_89`/`sm_90` (Ampere/Ada/Hopper) targets `setup.py` asks
+  nvcc for. An RTX 4070 (Ada, `sm_89`) has no matching native code in that
+  binary, so the driver falls back to JIT-compiling the embedded `sm_75`
+  PTX — which is what was actually failing.
+- Pulled the release workflow's own build log (`gh run view --log`) for the
+  run that produced this exact download and found the real cause: CUDA
+  12.4's nvcc hits a **fatal** `host_config.h` error — `unsupported
+  Microsoft Visual Studio version` — because `windows-latest` now ships a
+  newer default MSVC (Visual Studio "18", toolset 14.51.x) than CUDA 12.4
+  supports (2017-2022 only, i.e. up to roughly the 14.3x/14.4x generation).
+  `build_cuda_extension()` catches nvcc's nonzero exit and returns `False`
+  without failing the job, so this alone should have just meant "no GPU
+  extension shipped" — a safe, if disappointing, degradation.
+- What actually shipped instead: `git log` showed
+  `protein_physics_cuda.cp312-win_amd64.pyd` (plus its `.exp`/`.lib`
+  build-artifact siblings) had been **accidentally committed to the repo on
+  2026-06-09** and never removed — `.gitignore`'s `*.pyd` rule doesn't
+  retroactively untrack files already committed. The release workflow's
+  "Verify CUDA extension was actually built" step only checked that *a*
+  `protein_physics_cuda*.pyd` file existed on disk, which that ~1-month-old
+  stale tracked copy always satisfied — so every release since has silently
+  shipped that same ancient, `sm_75`-only extension regardless of whether
+  the *current* commit's build actually succeeded.
+- Fix, three parts closing each link in the chain:
+  1. `git rm --cached` the stale tracked `protein_physics.cp312-win_amd64.pyd`
+     / `protein_physics_cuda.cp312-win_amd64.{pyd,exp,lib}` — these were
+     never supposed to be tracked and were never rebuilt since being
+     committed.
+  2. Pinned `ilammy/msvc-dev-cmd@v1`'s `toolset: 14.3` in `release.yml` —
+     `windows-latest` ships multiple MSVC toolset generations side by side
+     specifically so older toolchains like CUDA 12.4 can select a compatible
+     one instead of defaulting to the newest.
+  3. Hardened the verify step: it now checks the built `.pyd`'s
+     `LastWriteTimeUtc` is after the build step actually started (catches
+     any future stale-file masking the same way), and runs
+     `cuobjdump --list-elf` to confirm all four expected architectures
+     (`sm_75`/`86`/`89`/`90`) actually compiled, not just that *some* file
+     with the right name exists.
+- Status: **DONE** for the fix; **not yet re-verified end-to-end** — this
+  needs a fresh tagged release build to confirm the pinned toolset lets
+  nvcc succeed and the hardened verify step passes with all 4 architectures
+  present. The item #17 CPU-fallback safety net stays regardless, since a
+  driver/toolchain mismatch on some future user's specific machine is still
+  possible even from a correctly-built extension.
 
 ---
 
@@ -436,6 +486,11 @@ P1.10 tests/accuracy_test.py — real-protein accuracy validation vs        ✓ 
 P1.11 gui_main.py — PipelineWorker/LandscapeWorker fall back to CPU on    ✓ DONE
       a GPU runtime (not just startup) failure instead of crashing the
       whole analysis; see item #17
+P1.12 .github/workflows/release.yml + removed stale tracked cp312        ✓ DONE
+      artifacts — root-caused and fixed item #17's actual cause: CUDA
+      12.4 vs. windows-latest's default MSVC, masked for ~1 month by an
+      accidentally-committed stale .pyd; see item #18. Needs a fresh
+      tagged release to re-verify end-to-end.
 ```
 
 ---
