@@ -70,7 +70,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtCore import QUrl
-from Bio.PDB import PDBParser, PDBList, PDBIO
+from Bio.PDB import PDBParser, PDBList, PDBIO, Select
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
@@ -619,11 +619,39 @@ def _kabsch_fit(ref_map, mobile_map):
     R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
     return R, p_c, q_c
 
+class _NotNucleicAcidOrWater(Select):
+    """Bio.PDB Select filter: drop nucleic acid / water residues from output.
+
+    핵산/물 잔기를 출력에서 제외하는 Bio.PDB Select 필터.
+
+    _parse_pdb()가 이미 이런 잔기를 건너뛰어 calculate_potential()에는
+    영향을 주지 않지만(item #20), _aligned_pdb_text()는 별도로 원본 파일을
+    통째로 읽어 렌더링용 PDB 텍스트를 만들기 때문에 같은 필터가 필요하다.
+    그렇지 않으면 에너지는 고쳐졌어도 레이어드 3D 뷰에는 여전히 결합된
+    DNA/RNA(예: SWISS-MODEL이 단백질-DNA 복합체를 템플릿으로 골랐을 때)가
+    남아 있어 시각적으로는 여전히 "이상"해 보인다.
+
+    _parse_pdb() already skips these residues so calculate_potential() is
+    unaffected (item #20), but _aligned_pdb_text() separately re-reads the
+    raw file to build the rendering PDB text, so it needs the same filter.
+    Without it, the energy is fixed but the layered 3D view still shows the
+    bound DNA/RNA (e.g. when SWISS-MODEL picked a protein-DNA co-crystal as
+    its template) tangled through the protein, still looking "wrong" visually
+    even though the underlying physics is now correct.
+    """
+
+    def accept_residue(self, residue):
+        resname = residue.get_resname().strip()
+        return resname not in _NUCLEOTIDE_RESNAMES and resname not in _WATER_RESNAMES
+
+
 def _aligned_pdb_text(path, ref_ca_map):
     """외부 구조(AlphaFold/SWISS-MODEL)를 ref_ca_map 프레임에 Kabsch 정렬한 뒤
-    전체 원자 PDB 텍스트로 반환. 공통 Cα < 3개면 원본 텍스트를 그대로 반환.
+    전체 원자 PDB 텍스트로 반환(핵산/물 잔기는 제외). 공통 Cα < 3개면 원본
+    텍스트를 그대로 반환.
     Kabsch-align an external structure (AlphaFold/SWISS-MODEL) onto ref_ca_map's
-    frame and return the whole-structure PDB text. Falls back to the raw file
+    frame and return the whole-structure PDB text, excluding nucleic acid and
+    water residues (see _NotNucleicAcidOrWater). Falls back to the raw file
     text when fewer than 3 Cα residues are shared (alignment impossible).
 
     레이어드 뷰에서 두 구조를 겹쳐 보려면 같은 좌표계에 있어야 한다. 외부
@@ -650,7 +678,7 @@ def _aligned_pdb_text(path, ref_ca_map):
     buf = io.StringIO()
     writer = PDBIO()
     writer.set_structure(st)
-    writer.save(buf)
+    writer.save(buf, select=_NotNucleicAcidOrWater())
     return buf.getvalue()
 
 def _compute_rmsf(snapshots, ca_indices):

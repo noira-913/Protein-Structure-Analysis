@@ -529,6 +529,23 @@
   sequence), and `calculate_potential() = 569.6` kcal/mol (8.9 kcal/mol/atom
   — squarely in the "thousands, not millions" range every other test
   protein in this file lands in). `tests/bridge_test.py` still passes.
+- Follow-up (same session, reported by the user after re-testing): fixing
+  the energy did **not** fix the layered 3D view — it still showed the DNA
+  tangled through the protein, because `_aligned_pdb_text()` (the function
+  that builds the rendering PDB text for the AlphaFold/SWISS-MODEL layered
+  comparison) re-reads and re-writes the raw external file independently of
+  `_parse_pdb()`, with no residue filtering of its own. Added a
+  `Bio.PDB.Select` subclass (`_NotNucleicAcidOrWater`) that drops
+  `_NUCLEOTIDE_RESNAMES`/`_WATER_RESNAMES` residues when `PDBIO.save()`
+  writes the aligned structure out, so the visual overlay matches what the
+  energy calculation already saw. Verified against the same `SM_P39476.pdb`:
+  the rendered PDB text now contains only the 17 standard amino acid
+  resnames actually present (no `DA`/`DC`/`DG`/`DT`/`HOH`), 640 atom lines —
+  matching the energy-calculation atom count exactly. `_render_layered()`
+  (the MC-candidates-only layered view, no external reference) was checked
+  too and needed no fix — it only ever renders MC ensemble particles, which
+  the physics engine generates straight from the already-filtered parsed
+  atoms, never from a re-read raw file.
 
 ---
 
