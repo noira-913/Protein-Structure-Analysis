@@ -864,8 +864,33 @@ def _compute_rmsf(snapshots, ca_indices):
             if pidx < len(particles):
                 p = particles[pidx]
                 coords[si, ci] = [p.x, p.y, p.z]
-    mean_pos = coords.mean(axis=0)                          # [n_ca, 3]
-    diff     = coords - mean_pos[np.newaxis]                # [n_snaps, n_ca, 3]
+
+    # 요동을 재기 전 모든 스냅샷을 첫 스냅샷 프레임에 Kabsch 중첩한다 —
+    # 안 그러면 실제 내부 유연성과 "형태는 같은데 절대 위치/방향만 다름"이
+    # 뒤섞인다. 토션각 MC는 궤적 내내 절대 자세를 유지할 이유가 없고,
+    # 다중 분지 탐색(서로 다른 시드에서 독립적으로 뻗어나감)은 이 문제를
+    # 훨씬 크게 만든다 — 각 분지가 서로 다른 절대 방향으로 표류한 채
+    # 그대로 풀링되면 거의 모든 잔기가 실제로는 그대로인데도 "매우
+    # 유연"한 것처럼 보인다.
+    #
+    # Kabsch-superpose every snapshot onto the first one before measuring
+    # fluctuation -- otherwise RMSF conflates real internal flexibility
+    # with whole-molecule pose drift. Torsion-angle MC has no reason to
+    # keep a fixed absolute position/orientation over a trajectory, and
+    # multi-branch exploration (independent drift per branch) makes this
+    # much worse: pooling raw, unaligned snapshots from several
+    # independently-drifted branches can make nearly every residue look
+    # "highly flexible" even when the actual fold barely changes. Same
+    # principle as the layered-view/basin-comparison Kabsch fixes
+    # elsewhere in this file.
+    ref = coords[0]
+    aligned = np.empty_like(coords)
+    aligned[0] = ref
+    for si in range(1, n_snaps):
+        aligned[si] = _kabsch_align_points(ref, coords[si])
+
+    mean_pos = aligned.mean(axis=0)                          # [n_ca, 3]
+    diff     = aligned - mean_pos[np.newaxis]                # [n_snaps, n_ca, 3]
     return np.sqrt((diff ** 2).sum(axis=2).mean(axis=0))   # [n_ca]
 
 def _extract_ca_residues(pdb_path):
@@ -1163,7 +1188,16 @@ class ComparisonWorker(QThread):
                 data = r.json()
                 structs = data.get("result", {}).get("structures", [])
                 if structs:
-                    best = max(structs, key=lambda s: s.get("gmqe", 0))
+                    # s.get("gmqe", 0) only falls back to 0 when the key is
+                    # ABSENT -- SWISS-MODEL's API returns many older
+                    # template-based entries with the key present but set to
+                    # null (None), so most real responses mix None and float
+                    # gmqe values. max() comparing None to None (or None to a
+                    # float) raises TypeError, crashing this fetch outright
+                    # for any protein whose SWISS-MODEL entries aren't all
+                    # freshly gmqe-scored (confirmed live against P39476: all
+                    # bar one of the 16 returned structures had gmqe=null).
+                    best = max(structs, key=lambda s: s.get("gmqe") or 0)
                     coord_url = best.get("coordinates")
                     if coord_url:
                         r2 = requests.get(coord_url, timeout=30)
@@ -1981,9 +2015,29 @@ class ProteinApp(QMainWindow):
         self._render_empty()
         self._view_stack.addWidget(self.web)          # index 0
 
-        # Page 1: energy landscape (matplotlib canvas + IDP badge)
+        # Page 1: energy landscape -- split view: dominant/selected structure
+        # (left) alongside the graph + basin panels (right), instead of
+        # replacing the 3D view entirely. Landing on the landscape page used
+        # to mean losing the structure view outright, and clicking any node/
+        # basin/sub-candidate yanked you straight back out to the full
+        # structure page just to see it -- bad navigation UX for something
+        # you're meant to click through repeatedly while exploring.
         landscape_page = QWidget()
-        lp_v = QVBoxLayout(landscape_page)
+        lp_outer = QHBoxLayout(landscape_page)
+        lp_outer.setContentsMargins(0, 0, 0, 0); lp_outer.setSpacing(0)
+
+        landscape_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.landscape_web = QWebEngineView()
+        self.landscape_web.setStyleSheet("border:none;")
+        self.landscape_web.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        self._landscape_html_tmpfile = os.path.join(
+            tempfile.gettempdir(), "alma_landscape_viewer.html")
+        landscape_splitter.addWidget(self.landscape_web)
+
+        landscape_graph_col = QWidget()
+        lp_v = QVBoxLayout(landscape_graph_col)
         lp_v.setContentsMargins(0, 0, 0, 0); lp_v.setSpacing(0)
 
         # IDP indicator bar
@@ -2042,6 +2096,11 @@ class ProteinApp(QMainWindow):
         self._landscape_canvas.setStyleSheet("border:none;")
         self._landscape_fig.canvas.mpl_connect("pick_event", self._on_graph_pick)
         lp_v.addWidget(self._landscape_canvas)
+
+        landscape_splitter.addWidget(landscape_graph_col)
+        landscape_splitter.setStretchFactor(0, 2)
+        landscape_splitter.setStretchFactor(1, 3)
+        lp_outer.addWidget(landscape_splitter)
 
         self._view_stack.addWidget(landscape_page)   # index 1
 
@@ -2311,6 +2370,15 @@ class ProteinApp(QMainWindow):
             f.write(html)
         self.web.setUrl(QUrl.fromLocalFile(self._html_tmpfile))
 
+    def _set_landscape_html(self, html):
+        """Same as _set_html but targets the landscape page's own embedded
+        3D viewer (separate temp file/widget) -- lets basin/sub-candidate/
+        node clicks update the structure in place on the landscape page
+        instead of forcing a jump back to the main structure page."""
+        with open(self._landscape_html_tmpfile, "w", encoding="utf-8") as f:
+            f.write(html)
+        self.landscape_web.setUrl(QUrl.fromLocalFile(self._landscape_html_tmpfile))
+
     # ── Comparison table ──────────────────────────────────────────
 
     def _clear_comp_table_rows(self):
@@ -2482,7 +2550,7 @@ class ProteinApp(QMainWindow):
 {best_js}
 {ext_js}
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
         self.viewer_cand_lbl.setText(
@@ -2496,8 +2564,18 @@ class ProteinApp(QMainWindow):
         ext_color = "#7c3aed" if is_af else "#d97706"
         label_ext = source_name.upper()
 
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            pdb_ext = f.read()
+        # _render_external_layered already filters nucleic acid/water
+        # residues and Kabsch-aligns onto the reference frame (see
+        # _aligned_pdb_text) -- this side-by-side view read the raw file
+        # directly instead, so a co-crystallized DNA/RNA template (e.g. a
+        # protein-DNA complex used as a SWISS-MODEL homology source) showed
+        # up tangled through the protein here even though the layered view
+        # and the energy/RMSD numbers already excluded it correctly.
+        if self._ref_ca_map:
+            pdb_ext = _aligned_pdb_text(path, self._ref_ca_map)
+        else:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                pdb_ext = f.read()
         pdb_esc = pdb_ext.replace("\\", "\\\\").replace("`", "\\`")
         n_atoms = pdb_ext.count("\nATOM")
 
@@ -2556,11 +2634,11 @@ class ProteinApp(QMainWindow):
   var vL=$3Dmol.createViewer("vL",{{backgroundColor:"#f8fafc"}});
 {left_js}
   vL.zoomTo(); vL.zoom(0.85); vL.render();
-  setInterval(function(){{ vL.rotate(1,'y'); vL.render(); }},50);
+  (function spinL(){{ vL.rotate(1,'y'); vL.render(); requestAnimationFrame(spinL); }})();
   var vR=$3Dmol.createViewer("vR",{{backgroundColor:"#f8fafc"}});
 {right_js}
   vR.zoomTo(); vR.zoom(0.85); vR.render();
-  setInterval(function(){{ vR.rotate(1,'y'); vR.render(); }},50);
+  (function spinR(){{ vR.rotate(1,'y'); vR.render(); requestAnimationFrame(spinR); }})();
 }})();
 </script></body></html>"""
         self.viewer_cand_lbl.setText(
@@ -2800,17 +2878,18 @@ E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
   m.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0,style:"trace"}},
                     sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
 
         self.viewer_cand_lbl.setText(
             f'<span style="color:#1d4ed8;font-weight:bold;">BASIN {basin_idx+1}</span> '
             f'· {basin["population"]*100:.0f}% pop')
-        self._set_html(html)
-        self._view_stack.setCurrentIndex(0)
-        self.view_mode_btn.setVisible(True)
-        self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+        # Render into the landscape page's own embedded viewer, not the
+        # main structure page -- clicking around the structural pool should
+        # update the split-view structure in place, not yank the user back
+        # to the full structure page every time.
+        self._set_landscape_html(html)
 
     def _build_ca_pdb_str(self, particles, transform=None):
         """Cα-only synthetic PDB text, indexed the same way as the region
@@ -2884,17 +2963,15 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   mSub.setStyle({{resi:{resi_list}}},{{cartoon:{{color:"#dc2626",thickness:1.0,opacity:1.0,style:"trace"}},
                       sphere:{{color:"#dc2626",radius:0.65,opacity:1.0}}}});
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
 
         self.viewer_cand_lbl.setText(
             f'<span style="color:#7c3aed;font-weight:bold;">SUB-CANDIDATE</span> '
             f'REGION {lo+1}-{hi+1} · #{cand_idx+1}/{len(cands)}')
-        self._set_html(html)
-        self._view_stack.setCurrentIndex(0)
-        self.view_mode_btn.setVisible(True)
-        self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+        # Stays on the landscape page -- see _render_basin for why.
+        self._set_landscape_html(html)
 
     def _draw_landscape(self, data):
         """Render the conformational graph on the matplotlib canvas.
@@ -3045,24 +3122,29 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   m.setStyle({{}},{{cartoon:{{color:"#0891b2",thickness:0.8,opacity:1.0}},
                     sphere:{{color:"#0891b2",radius:0.55,opacity:1.0}}}});
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
 
         self.viewer_cand_lbl.setText(
             f'<span style="color:#0891b2;font-weight:bold;">'
             f'SNAPSHOT #{snap_idx + 1}</span> · {energy:.1f} kcal/mol')
-        self._set_html(html)
-        # Auto-switch to structure view so the user sees the loaded conformation
-        self._view_stack.setCurrentIndex(0)
-        self.view_mode_btn.setVisible(True)
-        self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+        # Renders into the landscape page's own embedded viewer (split view)
+        # instead of switching away to the main structure page -- clicking
+        # through nodes is meant to be repeated many times while exploring,
+        # so it shouldn't force a page jump each time.
+        self._set_landscape_html(html)
 
     def _toggle_landscape(self):
         if self._view_stack.currentIndex() == 0:
             self._view_stack.setCurrentIndex(1)
             self.view_mode_btn.setVisible(False)
             self.landscape_toggle_btn.setText("⊡  STRUCTURE")
+            # Default the split view's structure panel to the dominant basin
+            # (index 0 -- basin_summary is population-sorted) rather than
+            # leaving it blank on first open.
+            if self._basin_summary:
+                self._render_basin(0)
         else:
             self._view_stack.setCurrentIndex(0)
             self.view_mode_btn.setVisible(True)
@@ -3261,7 +3343,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
 {best_js}
 {sel_js}
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
         self._log(f"[LAYERED] html={len(html.encode())} bytes")
@@ -3352,11 +3434,11 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   var vL=$3Dmol.createViewer("vL",{{backgroundColor:"#f8fafc"}});
 {left_js}
   vL.zoomTo(); vL.zoom(0.85); vL.render();
-  setInterval(function(){{ vL.rotate(1,'y'); vL.render(); }},50);
+  (function spinL(){{ vL.rotate(1,'y'); vL.render(); requestAnimationFrame(spinL); }})();
   var vR=$3Dmol.createViewer("vR",{{backgroundColor:"#f8fafc"}});
 {right_js}
   vR.zoomTo(); vR.zoom(0.85); vR.render();
-  setInterval(function(){{ vR.rotate(1,'y'); vR.render(); }},50);
+  (function spinR(){{ vR.rotate(1,'y'); vR.render(); requestAnimationFrame(spinR); }})();
 }})();
 </script></body></html>"""
         self._log(f"[SBS] html={len(html.encode())} bytes")
@@ -3575,7 +3657,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
     }}
   }});
   v.zoomTo(); v.zoom(0.85); v.render();
-  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
 }})();
 </script></body></html>"""
 
