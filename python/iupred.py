@@ -253,6 +253,22 @@ _BIAS:  float = 0.7
 # terminal residues toward lower disorder scores (smaller e_sum magnitude).
 _WINDOW: int = 10
 
+# 2차 평활화 반경 (Secondary smoothing half-width):
+# _WINDOW의 이웃 합산만으로는 e_sum(i)가 여전히 잔기 i 자신의 정체성(row
+# 선택)에 크게 좌우돼, 이웃은 거의 그대로인데도 인접 잔기 사이에서 값이
+# 급격히 진동한다 (예: Asp 다음에 Ile가 오면 완전히 다른 상호작용 행을 씀).
+# IUPred2A는 원본 논문에서 이 노이즈를 줄이기 위해 에너지 프로파일에 추가
+# 이동평균을 적용한다 — 여기서도 동일하게 적용해 매끄러운 곡선을 얻는다.
+#
+# The _WINDOW neighbor-sum alone still leaves e_sum(i) dominated by residue
+# i's own identity (which row of E_PAIR gets used), so the profile can swing
+# sharply between adjacent residues even though their neighborhoods barely
+# differ (e.g. an Asp immediately followed by an Ile pulls from completely
+# different interaction rows). IUPred2A's published method applies a further
+# running-average smoothing pass over the raw energy profile for exactly
+# this reason — applied here too, to avoid a falsely jagged disorder curve.
+_SMOOTH_HALF_WINDOW: int = 5
+
 # ── 3→1 글자 아미노산 코드 변환 맵 (Three-letter to one-letter code map) ──────
 # PDB 파일의 3글자 잔기명을 1글자 코드로 변환한다.
 # HIS의 세 가지 프로토네이션 형태(HID/HIE/HIP)는 모두 'H'로 매핑.
@@ -317,6 +333,18 @@ def score(sequence: str) -> list[float]:
         for j in range(lo, hi):
             if j != i:
                 e_sum[i] += row[idx[j]]
+
+    # 2차 평활화: 원본 e_sum 프로파일에 이동평균을 적용해 잔기별 정체성으로
+    # 인한 고주파 진동을 제거한다 (알고리즘 설명 상단 참고).
+    # Secondary smoothing: running average over the raw e_sum profile to
+    # remove the high-frequency, per-residue-identity oscillation (see the
+    # algorithm note above _SMOOTH_HALF_WINDOW).
+    smoothed: list[float] = [0.0] * n
+    for i in range(n):
+        lo = max(0, i - _SMOOTH_HALF_WINDOW)
+        hi = min(n, i + _SMOOTH_HALF_WINDOW + 1)
+        smoothed[i] = sum(e_sum[lo:hi]) / (hi - lo)
+    e_sum = smoothed
 
     # 시그모이드 변환: e_sum → [0, 1] 무질서 확률.
     # exp(-x)가 지수 오버플로우를 일으킬 수 있으므로 OverflowError를 잡는다.
