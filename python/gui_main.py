@@ -650,6 +650,22 @@ def _kabsch_fit(ref_map, mobile_map):
     R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
     return R, p_c, q_c
 
+def _ensemble_ca_map(ref_ca_map, ca_indices, particles):
+    """ref_ca_map과 동일한 잔기 키로 MC 앙상블 후보의 Cα 좌표 맵을 재구성.
+    Rebuild an MC ensemble candidate's Cα coordinate map, keyed the same way
+    as ref_ca_map, so it can be Kabsch-fit against it (same logic as
+    CompareWorker._mc_ca_map, needed here too for the layered 3D view).
+    """
+    keys = list(ref_ca_map.keys())
+    ca_map = {}
+    for j, key in enumerate(keys):
+        if j < len(ca_indices):
+            pidx = ca_indices[j]
+            if pidx < len(particles):
+                p = particles[pidx]
+                ca_map[key] = np.array([p.x, p.y, p.z])
+    return ca_map
+
 class _NotNucleicAcidOrWater(Select):
     """Bio.PDB Select filter: drop nucleic acid / water residues from output.
 
@@ -1976,7 +1992,21 @@ class ProteinApp(QMainWindow):
         best_js, best_e, best_idx = "", "", None
         if self._ensemble and self._energies:
             best_idx = int(np.argmin(self._energies))
-            pdb_best = self._build_pdb_str(self._ensemble[best_idx])
+            # 후보를 참조 프레임에 Kabsch 정렬 — 안 그러면 RMSD 표는 작게 나와도
+            # (자체적으로 정렬 후 계산되므로) 실제 렌더링은 MC의 원본(비정렬)
+            # 좌표계에 남아, 정렬된 참조 구조와 전혀 다른 위치/방향에 떠 보인다.
+            # Kabsch-align the candidate onto the reference frame first — without
+            # this, the RMSD table (which aligns internally before scoring) can
+            # read as tiny while the rendered candidate — still in its raw,
+            # unaligned MC coordinates — floats at a completely different
+            # position/orientation than the aligned reference structure.
+            transform = None
+            if self._ref_ca_map:
+                cand_ca_map = _ensemble_ca_map(
+                    self._ref_ca_map, self._ca_indices, self._ensemble[best_idx])
+                if cand_ca_map:
+                    transform = _kabsch_fit(self._ref_ca_map, cand_ca_map)
+            pdb_best = self._build_pdb_str(self._ensemble[best_idx], transform)
             best_e   = f"{self._energies[best_idx]:.1f} kcal/mol"
             best_js  = (
                 f'  var mBest=v.addModel(`{pdb_best}`,"pdb");\n'
@@ -2429,12 +2459,20 @@ class ProteinApp(QMainWindow):
         elif self._ensemble:
             self._render(self._current_cand_idx)
 
-    def _build_pdb_str(self, particles):
+    def _build_pdb_str(self, particles, transform=None):
+        """transform, given, is (R, ref_centroid, mobile_centroid) from
+        _kabsch_fit — applied to each atom before writing, so a candidate can
+        be rendered in an external reference's frame instead of its own raw
+        MC coordinates (see _render_external_layered)."""
         lines = []
         for i, p in enumerate(particles):
+            x, y, z = p.x, p.y, p.z
+            if transform is not None:
+                R, ref_c, mob_c = transform
+                x, y, z = (np.array([x, y, z]) - mob_c) @ R.T + ref_c
             lines.append(
                 f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
-                f"{p.x:8.3f}{p.y:8.3f}{p.z:8.3f}  1.00  0.50           C")
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.50           C")
         return "\n".join(lines)
 
     def _update_candidate_bar_selection(self, active_idx):
