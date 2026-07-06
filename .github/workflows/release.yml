@@ -62,13 +62,20 @@ jobs:
       # 12.6.2, so asking it for cuda: "13.2.0" fails with "Version not
       # available" even though 13.2.0 itself is a real CUDA release. v0.2.35
       # (latest as of this writing) has 13.2.0 in its table.
+      # sub-packages ["nvcc", "cudart"] (the previous, narrower selection) was
+      # enough under 12.4.1, but under 13.2.0 it left out whatever component
+      # now ships include/crt/host_config.h -- CUDA's package layout has
+      # shifted between major versions before, and nvcc's build failed with
+      # "Cannot open include file: 'crt/host_config.h'" as a result. Omitting
+      # sub-packages entirely installs the full toolkit (this action's own
+      # documented behavior when the input is left empty), matching the
+      # complete local install already verified against this repo.
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: "13.2.0"
           method: "network"
-          sub-packages: '["nvcc", "cudart"]'
           use-github-cache: true
 
       - name: Record build start time
@@ -94,11 +101,21 @@ jobs:
       #      whatever DID compile doesn't quietly fall back to a PTX-JIT path
       #      that may not even work (the "unsupported toolchain" error this
       #      whole investigation started from).
+      # Filter is pinned to cp312 (matching the python-version: "3.12" pin in
+      # the "Set up Python" step above), not a bare "protein_physics_cuda*.pyd"
+      # glob -- that broader glob previously matched an unrelated
+      # protein_physics_cuda.cp314-win_amd64.pyd (a different Python ABI,
+      # tracked in git for a contributor's local cp314 dev environment) and
+      # reported it as "found" even though nothing for THIS job's Python 3.12
+      # had actually built, which the LastWriteTime check below then correctly
+      # flagged as stale (it is -- for cp312 purposes, no cp312 file exists at
+      # all in that scenario). Matching the exact ABI tag this job can
+      # actually use avoids relying on the timestamp check to catch it.
       - name: Verify CUDA extension was actually built
         run: |
-          $cuda_pyd = Get-ChildItem -Path . -Filter "protein_physics_cuda*.pyd" -ErrorAction SilentlyContinue
+          $cuda_pyd = Get-ChildItem -Path . -Filter "protein_physics_cuda.cp312-win_amd64.pyd" -ErrorAction SilentlyContinue
           if (-not $cuda_pyd) {
-            Write-Error "protein_physics_cuda*.pyd was not produced even though the CUDA toolkit was installed — setup.py's build_cuda_extension() failed silently (see the build log above for nvcc's actual error). Failing the job instead of shipping a silently CPU-only release."
+            Write-Error "protein_physics_cuda.cp312-win_amd64.pyd was not produced even though the CUDA toolkit was installed — setup.py's build_cuda_extension() failed silently (see the build log above for nvcc's actual error). Failing the job instead of shipping a silently CPU-only release."
             exit 1
           }
           Write-Host "Found CUDA extension: $($cuda_pyd.Name)"
