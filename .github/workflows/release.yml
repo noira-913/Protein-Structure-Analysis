@@ -57,8 +57,13 @@ jobs:
       # real Windows+CUDA dev machine (build succeeds, calculate_potential/
       # generate_ensemble/run_landscape_trajectory all run correctly on an
       # RTX 4070 -- see IMPROVEMENTS.md items #14/#18).
+      # Jimver/cuda-toolkit is pinned by RELEASE version too, not just the CUDA
+      # version input -- v0.2.19's own bundled version table only goes up to
+      # 12.6.2, so asking it for cuda: "13.2.0" fails with "Version not
+      # available" even though 13.2.0 itself is a real CUDA release. v0.2.35
+      # (latest as of this writing) has 13.2.0 in its table.
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: "13.2.0"
