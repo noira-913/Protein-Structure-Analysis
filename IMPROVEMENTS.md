@@ -438,12 +438,33 @@
      `cuobjdump --list-elf` to confirm all four expected architectures
      (`sm_75`/`86`/`89`/`90`) actually compiled, not just that *some* file
      with the right name exists.
-- Status: **DONE**, re-verification in progress — the `toolset: 14.3` attempt
-  was caught by actually re-running the workflow rather than assuming it
-  worked (see part 2 above); a fresh run against the CUDA 13.2.0 fix is
-  pending as of this writing. The item #17 CPU-fallback safety net stays
-  regardless, since a driver/toolchain mismatch on some future user's
-  specific machine is still possible even from a correctly-built extension.
+  4. Re-running against that fix surfaced two more real problems, each fixed
+     in turn rather than assumed away: `Jimver/cuda-toolkit@v0.2.19`'s own
+     bundled CUDA version table only went up to `12.6.2` (`13.2.0` didn't
+     exist in it at all) — bumped the action pin to `v0.2.35`, confirmed by
+     diffing both tags' `src/links/windows-links.ts`. Then, with the action
+     fixed, nvcc failed with `Cannot open include file: 'crt/host_config.h'`
+     — the narrower `sub-packages: ["nvcc", "cudart"]` selection (fine under
+     12.4.1) left out whatever component now ships that header under
+     13.2.0's reorganized layout; removed the restriction so it installs the
+     full toolkit instead. Also caught (via the same run) the verify step's
+     broad glob matching an unrelated, wrong-ABI tracked `cp314` file and
+     reporting it as "found" — pinned the filter to the exact `cp312` tag
+     this job's Python 3.12 produces, and untracked the `cp314`
+     `.pyd`/`.exp`/`.lib` artifacts too (the same mistake as the `cp312`
+     ones, just not yet noticed).
+- Status: **DONE and re-verified end-to-end.** A fresh `workflow_dispatch`
+  run (`gh run view <id> --log`) completed successfully in 20m14s and
+  printed exactly what the hardened verify step was built to confirm:
+  `Found CUDA extension: protein_physics_cuda.cp312-win_amd64.pyd` (the
+  correct, fresh, correct-ABI file — not a stale or wrong-ABI one) followed
+  by `cuobjdump --list-elf` listing all four architectures and
+  `Confirmed compiled code for all expected architectures: sm_75, sm_86,
+  sm_89, sm_90`. This is the first release build in at least a month to
+  actually ship a complete, freshly-compiled CUDA extension. The item #17
+  CPU-fallback safety net stays regardless, since a driver/toolchain
+  mismatch on some future user's specific machine is still possible even
+  from a correctly-built extension.
 
 **19. Landscape exploration always branched from the raw parsed input, never from the MC-relaxed best candidate**
 - `_start_landscape()` always passed `self._init_atoms` — the unrelaxed,
