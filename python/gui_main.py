@@ -77,6 +77,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import protein_physics
 from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES, _NUCLEOTIDE_RESNAMES
+from amber_params import missing_hydrogen_charge as _amber_missing_h_charge
 import iupred as _iupred
 
 
@@ -462,6 +463,35 @@ def _parse_pdb(path, log, physics_mod):
         log(f"  ⚠  {skipped} atoms skipped (invalid coords)")
     if n_ions:
         log(f"  ions: {n_ions} metal/ion atoms included")
+
+    # ── 수소 결손 전하 보정 (United-atom charge correction) ───────────────────
+    # PDB 결정구조는 거의 항상 수소를 해상하지 않으므로, 위 루프에서 만든 원자
+    # 목록에는 애초에 수소 Particle이 없다. PARTIAL_CHARGES는 전원자(all-atom)
+    # 전하이므로, 수소가 없으면 그 수소가 상쇄했어야 할 전하가 통째로 누락되어
+    # 모든 잔기가 물리적으로 잘못된 순전하를 갖게 된다 (예: ALA는 원래 중성인데
+    # 중원자만 합산하면 -0.535, LYS는 +1이어야 하는데 -0.88). amber_params.
+    # missing_hydrogen_charge()로 이 결손을 모(母) 중원자에 되돌려준다("united
+    # atom" 근사) — 단, 그 잔기 인스턴스에 실제로 해당 수소가 있으면 이미 자체
+    # Particle이 전하를 갖고 있으므로 보정하지 않는다.
+    #
+    # Real PDB structures almost never resolve hydrogens, so the atom list
+    # built above never had hydrogen Particles to begin with. PARTIAL_CHARGES
+    # holds full all-atom charges, so omitting hydrogens silently drops the
+    # charge they would have carried, leaving every residue with an
+    # unphysical net charge (e.g. ALA reads -0.535 instead of neutral; LYS
+    # reads -0.88 instead of +1). Fold each missing hydrogen's charge back
+    # onto its parent heavy atom (a standard "united atom" approximation) via
+    # amber_params.missing_hydrogen_charge() — skipped for any hydrogen that
+    # IS actually present in this residue instance, since its own Particle
+    # already carries that charge.
+    residue_atomnames: dict[int, set] = {}
+    for _ridx, _aname in zip(meta_residx, meta_atomnames):
+        residue_atomnames.setdefault(_ridx, set()).add(_aname)
+    for _i, (_resname, _atomname, _ridx) in enumerate(
+            zip(meta_resnames, meta_atomnames, meta_residx)):
+        _extra = _amber_missing_h_charge(_resname, _atomname, residue_atomnames[_ridx])
+        if _extra:
+            atoms[_i].charge += _extra
 
     # ── 결합 위상 그래프 구성 (Build covalent bond topology) ─────────────────
     # BondTopology는 HETATM 잔기(bond_templates에 없음)를 조용히 건너뛴다.

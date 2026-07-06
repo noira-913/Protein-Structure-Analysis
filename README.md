@@ -219,6 +219,20 @@ charges are the corresponding **RESP** charges from the same force
 field, covering every heavy atom of all 20 standard amino acids plus the
 common histidine protonation-state variants (HID/HIE/HIP).
 
+Real PDB structures (X-ray, most SWISS-MODEL/AlphaFold outputs) essentially
+never resolve hydrogen positions, so parsing only ever creates particles for
+the heavy atoms actually present in a file. Since ff14SB's RESP charges are
+full all-atom charges (heavy atom and each attached hydrogen carrying its own
+partial charge), naively dropping unresolved hydrogens would leave every
+residue with a large, spurious net charge — e.g. alanine's heavy atoms alone
+sum to −0.535 rather than the true neutral 0.000; lysine's sum to −0.882
+rather than the true +1.000. ALMA corrects for this with a **united-atom
+charge fold-in**: for every hydrogen that would be bonded to a given heavy
+atom (per the same static residue templates used for bond topology) but is
+absent from the parsed structure, that hydrogen's charge is added onto its
+heavy-atom parent. A hydrogen that genuinely is present (e.g. a neutron or NMR
+structure) is left alone, since its own particle already carries the charge.
+
 Non-amino-acid HETATM records are not silently discarded:
 
 - **Water** (HOH, WAT, TIP3, SOL, …) is always dropped — explicit water
@@ -330,7 +344,8 @@ disagreements with the AlphaFold prediction in low-confidence regions.
 Supporting Python modules:
 
 - `python/amber_params.py` — AMBER ff14SB VDW/charge lookup tables,
-  metal ion parameters, water residue-name set.
+  metal ion parameters, water residue-name set, united-atom charge
+  correction for missing hydrogens.
 - `python/iupred.py` — sequence-based disorder predictor.
 
 The GPU extension is a separate build artifact from the CPU extension;
@@ -438,6 +453,7 @@ python/gui_main.py            PyQt6 desktop application
 python/amber_params.py        AMBER ff14SB atom-type / charge / ion parameter tables
 python/iupred.py              Sequence-based disorder predictor
 tests/bridge_test.py          Python↔C++ data bridge integrity tests
+tests/accuracy_test.py        Real-protein force-field accuracy validation (RCSB + AlphaFold)
 data/                         Cached/example PDB structures
 IMPROVEMENTS.md               Known limitations and implementation roadmap
 ```

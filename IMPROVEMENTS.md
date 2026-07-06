@@ -89,6 +89,33 @@ limitation of that test harness's alignment heuristic, not the physics engine.)*
   (`physics_engine_cuda.cu`) engines carry all three fixes.
 - **Disulfide bonds** — SG–SG pairs < 2.5 Å detected during parsing, excluded from
   non-bonded energy, harmonic restraint applied (K=600 kcal/mol/Å², r₀=2.044 Å).
+- **United-atom charge correction for missing hydrogens** — real PDB structures
+  (X-ray, most SWISS-MODEL/AlphaFold outputs) essentially never resolve hydrogen
+  positions, so `_parse_pdb` only ever creates Particles for the heavy atoms
+  actually present in the file. `PARTIAL_CHARGES` holds full all-atom ff14SB
+  charges (heavy atom + attached H charged separately), so when the H particle is
+  never created, its charge was previously dropped on the floor — every residue's
+  heavy atoms then carried a large, spurious net charge that should have been
+  cancelled by a hydrogen that was never instantiated (e.g. ALA heavy-only summed
+  to -0.5351 instead of its true net 0.0000; LYS heavy-only summed to -0.8815
+  instead of its true net +1.0000). This corrupted electrostatics/GB for every
+  atom in every structure ever analyzed, not just an edge case. Fixed in
+  `amber_params.py`/`gui_main.py`: when a hydrogen that would be bonded to a
+  given heavy atom (per static residue templates mirroring `bond_templates()` in
+  `physics_engine.cpp`) is absent from the specific residue instance being
+  parsed, its charge is folded onto its heavy-atom parent (a standard "united
+  atom" approximation) — `amber_params.missing_hydrogen_charge()`. If the
+  hydrogen IS present (e.g. a neutron/NMR structure with explicit H), no
+  correction is applied for that atom, since its own Particle already carries
+  the charge. Verified: corrected per-residue net charges now match true formal
+  charges exactly (ALA → 0.0, LYS → +1.0, ASP/GLU → -1.0, etc.). Re-ran the full
+  `tests/accuracy_test.py` suite (all 15 proteins, CPU+GPU, 200/1000/5000 MC
+  steps) after the fix: **14/15 still pass** at the same ~2x-AlphaFold-RMSD bar
+  (2CI2 is still the pre-existing N/A numbering-alignment case, not a new
+  failure) — the corrected electrostatics changes per-atom energetics
+  substantially but doesn't regress near-native stability on this test set,
+  and it removes a real, systematic source of error from every future
+  accuracy measurement.
 
 ### Coverage
 - **Ligands/metals/cofactors** — HETATM no longer dropped; metal ions get proper

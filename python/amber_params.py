@@ -767,3 +767,96 @@ def get_atom_params(resname: str, atomname: str) -> tuple[float, float, float]:
         r, e = _ELEM_FALLBACK.get(elem, _ELEM_FALLBACK.get(elem[0], _VDW_FALLBACK))
 
     return charge, r, e
+
+
+# ── United-atom charge correction (missing hydrogens) ─────────────────────────
+#
+# Real PDB structures (X-ray, most SWISS-MODEL/AlphaFold outputs) essentially
+# never resolve hydrogen positions, so _parse_pdb only ever creates Particles
+# for the heavy atoms actually present in the file. PARTIAL_CHARGES above holds
+# full all-atom ff14SB charges (heavy atom + attached H separately) — e.g. the
+# backbone amide N is -0.4157 and its H is +0.2719, summing to a physically
+# tiny net -0.1438 for the N-H unit. If the H particle is simply never created
+# (because the file has none), that +0.2719 is dropped on the floor: every
+# residue's heavy atoms then carry a large, spurious net charge that should
+# have been cancelled by hydrogens that were never instantiated (e.g. ALA
+# heavy-only sums to -0.5351 instead of its true net 0.0000; LYS heavy-only
+# sums to -0.8815 instead of its true net +1.0000 -- see amber_params tests).
+# This corrupts electrostatics/GB for every atom in every structure ever
+# analyzed, not just an edge case.
+#
+# Fix: when a hydrogen that WOULD be bonded to a given heavy atom (per the
+# static residue templates below, mirroring bond_templates() in
+# physics_engine.cpp) is absent from the specific residue instance being
+# parsed, fold that hydrogen's charge onto its heavy-atom parent (a standard
+# "united atom" approximation). If the hydrogen IS present (e.g. a
+# neutron/NMR structure with explicit H), its charge is already carried by
+# its own Particle, so no correction is applied for that atom.
+_H_PARENT: dict[tuple[str, str], str] = {}
+
+def _hp(resname: str, pairs: list[tuple[str, str]]) -> None:
+    for heavy, hydrogens in pairs:
+        for h in hydrogens.split():
+            _H_PARENT[(resname, h)] = heavy
+
+_hp("GLY", [("N", "H"), ("CA", "HA2 HA3")])
+_hp("ALA", [("N", "H"), ("CA", "HA"), ("CB", "HB1 HB2 HB3")])
+_hp("VAL", [("N", "H"), ("CA", "HA"), ("CB", "HB"),
+            ("CG1", "HG11 HG12 HG13"), ("CG2", "HG21 HG22 HG23")])
+_hp("LEU", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG"),
+            ("CD1", "HD11 HD12 HD13"), ("CD2", "HD21 HD22 HD23")])
+_hp("ILE", [("N", "H"), ("CA", "HA"), ("CB", "HB"), ("CG1", "HG12 HG13"),
+            ("CD1", "HD11 HD12 HD13"), ("CG2", "HG21 HG22 HG23")])
+_hp("PRO", [("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3"),
+            ("CD", "HD2 HD3")])
+_hp("PHE", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CD1", "HD1"),
+            ("CE1", "HE1"), ("CZ", "HZ"), ("CE2", "HE2"), ("CD2", "HD2")])
+_hp("TRP", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CD1", "HD1"),
+            ("NE1", "HE1"), ("CZ2", "HZ2"), ("CH2", "HH2"), ("CZ3", "HZ3"),
+            ("CE3", "HE3")])
+_hp("SER", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("OG", "HG")])
+_hp("THR", [("N", "H"), ("CA", "HA"), ("CB", "HB"), ("OG1", "HG1"),
+            ("CG2", "HG21 HG22 HG23")])
+_hp("CYS", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("SG", "HG")])
+_hp("MET", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3"),
+            ("CE", "HE1 HE2 HE3")])
+_hp("ASP", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3")])
+_hp("ASN", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"),
+            ("ND2", "HD21 HD22")])
+_hp("GLU", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3")])
+_hp("GLN", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3"),
+            ("NE2", "HE21 HE22")])
+_hp("LYS", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3"),
+            ("CD", "HD2 HD3"), ("CE", "HE2 HE3"), ("NZ", "HZ1 HZ2 HZ3")])
+_hp("ARG", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CG", "HG2 HG3"),
+            ("CD", "HD2 HD3"), ("NE", "HE"),
+            ("NH1", "HH11 HH12"), ("NH2", "HH21 HH22")])
+_hp("HID", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("ND1", "HD1"),
+            ("CE1", "HE1"), ("CD2", "HD2")])
+_hp("HIE", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CE1", "HE1"),
+            ("NE2", "HE2"), ("CD2", "HD2")])
+_hp("HIP", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("ND1", "HD1"),
+            ("CE1", "HE1"), ("NE2", "HE2"), ("CD2", "HD2")])
+_hp("HIS", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("ND1", "HD1"),
+            ("CE1", "HE1"), ("CD2", "HD2")])  # HIS defaults to HID, see above
+_hp("TYR", [("N", "H"), ("CA", "HA"), ("CB", "HB2 HB3"), ("CD1", "HD1"),
+            ("CE1", "HE1"), ("OH", "HH"), ("CE2", "HE2"), ("CD2", "HD2")])
+
+# Reverse index: (resname, heavy_atomname) -> [hydrogen_atomname, ...]
+_HEAVY_CHILDREN: dict[tuple[str, str], list[str]] = {}
+for (_res, _h), _heavy in _H_PARENT.items():
+    _HEAVY_CHILDREN.setdefault((_res, _heavy), []).append(_h)
+
+
+def missing_hydrogen_charge(resname: str, heavy_atomname: str,
+                             present_atomnames: "set[str]") -> float:
+    """Extra charge to fold onto (resname, heavy_atomname) for every hydrogen
+    that would normally bond to it but is absent from present_atomnames (the
+    set of atom names actually parsed for that residue instance). Returns 0.0
+    if every expected hydrogen is present (already carried by its own
+    Particle) or if the heavy atom has no hydrogen children at all."""
+    total = 0.0
+    for h in _HEAVY_CHILDREN.get((resname, heavy_atomname), ()):
+        if h not in present_atomnames:
+            total += PARTIAL_CHARGES.get((resname, h), 0.0)
+    return total
