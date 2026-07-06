@@ -124,6 +124,20 @@ def build_cuda_extension(cuda_home, nvcc):
 
     cmd = [
         nvcc, "-O2",
+        # nvcc is invoked directly here (not through setuptools/Pybind11Extension,
+        # which auto-injects /std:c++latest for the CPU build), so it falls back
+        # to its own default C++ dialect unless told otherwise -- one too old to
+        # support structured bindings (auto [i, j] = ...) used in physics_engine_cuda.cu.
+        "-std=c++17",
+        # Explicit target architectures: recent CUDA releases (13.x) have dropped
+        # older compute-capability defaults, and CI runners (windows-latest) have
+        # no physical GPU to auto-detect one from (nvcc's -arch=native needs a
+        # GPU present at compile time). Offline codegen for a fixed architecture
+        # list needs neither. Covers Turing/Ampere/Ada/Hopper.
+        "-gencode", "arch=compute_75,code=sm_75",
+        "-gencode", "arch=compute_86,code=sm_86",
+        "-gencode", "arch=compute_89,code=sm_89",
+        "-gencode", "arch=compute_90,code=sm_90",
         compiler_flag, host_opts,
         f"-I{py_include}", f"-I{pb11_include}", f"-I{cuda_include}",
         "--shared",

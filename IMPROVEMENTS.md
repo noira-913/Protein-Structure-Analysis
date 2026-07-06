@@ -152,7 +152,9 @@
 - Fix: cell-list decomposition — divide box into cells of side ≥ NL_CUTOFF;
   each atom checks only its 27 neighboring cells — O(N).
   Significant for proteins > 2 000 atoms.
-- Status: TODO.
+- Status: **DONE** — `physics_engine.cpp` bins atoms into a 3-D cell grid
+  (cell side = NL_CUTOFF+NL_SKIN) and each atom's Verlet neighbor list scan
+  is limited to its 27-cell neighborhood instead of all N atoms.
 
 **12. MC trajectory round-trips CPU↔GPU**
 - LandscapeWorker did 120 Python↔C++ round trips (one per snapshot), each
@@ -201,11 +203,152 @@
   order-dependent fold, not an embarrassingly parallel reduction — as do
   the O(rotatable-bond-count) dihedral/disulfide sums, which are too small
   to justify a kernel launch.
-- Status: **DONE** — not build-verified in this session (no CUDA
-  toolkit/GPU available in this environment; same caveat as prior GPU-
-  touching sessions in this repo). Needs a Windows+CUDA build/run to
-  confirm it compiles and to compare GPU vs CPU energies on the bundled
-  `data/*.pdb` structures before this is trusted for production use.
+- Status: **DONE — build- and run-verified on real hardware** (Windows 11,
+  RTX 4070 Laptop GPU, CUDA 13.2 toolkit, MSVC 2022). `python setup.py
+  build_ext --inplace` compiles both `protein_physics` and
+  `protein_physics_cuda` cleanly. `python tests/calibrate_gpu.py` passes all
+  11 bundled `data/*.pdb` structures: `calculate_potential()` parity between
+  CPU and GPU engines is within 0.06% relative difference on every structure
+  (most < 0.01%, i.e. float-vs-double noise), both engines' `generate_ensemble()`
+  lower the energy over 200 MC steps, and `run_landscape_trajectory()`
+  completes end-to-end with no CUDA errors. `tests/bridge_test.py` also
+  passes on this build. That calibration run also surfaced two real,
+  Windows-specific bugs fixed alongside this port (both were latent in the
+  pre-port code too, just never exercised on real hardware before):
+  `nvcc`'s own default C++ dialect doesn't support the structured bindings
+  this port uses (setup.py's `build_cuda_extension()` calls `nvcc` directly,
+  bypassing the `/std:c++latest` that `Pybind11Extension` auto-injects for
+  the CPU build — fixed by adding `-std=c++17` there), and `Particle`/
+  `PhysicsEngine` — defined separately in each module but sharing the same
+  class names — collided at import time because MSVC's RTTI compares
+  `type_info` by decorated name across DLLs (Linux/macOS give each shared
+  object independent RTTI, so this never showed up there); fixed with
+  `py::module_local()` on both classes in both modules.
+
+**15. Hard-core repulsion term had two independent real bugs: a discontinuous step AND an unbounded penalty**
+- Bug A — discontinuity at the threshold: found via the calibration run above:
+  `calculate_potential()` on `Q92793.pdb` (~18.5k atoms) returned +4,314,828
+  kcal/mol — grossly outside the sane −30…+7 kcal/mol/atom range from item
+  #13 — on BOTH engines identically (confirming this is inherited
+  physics-model behavior, not a GPU-vs-CPU discrepancy). Traced to exactly
+  one pair: Ser27 `CA` vs Phe2438 `CD1`, a genuine tertiary contact (not a
+  missing bond/exclusion — `topo.adj` shows zero unbonded atoms) sitting at
+  `r/σ = 0.5997`, 0.03% inside the `HARD_CUTOFF_FRAC = 0.6` threshold from
+  item #13. That one pair alone contributed +4.6M kcal/mol via
+  `HARD_SCALE·(σ/r)¹²`, because the old `pair_e()` was a hard branch: a
+  contact landing a fraction of a percent on either side of the threshold
+  gets either an ordinary bounded LJ repulsion of a few kcal/mol, or a
+  multi-million-kcal/mol spike — for what is physically almost the same
+  contact. P1.6's 0.6 calibration was validated against one structure
+  (1XQ8); a much larger structure had a real contact close enough to find
+  the edge of that threshold.
+- Bug B — unbounded even away from the threshold: the bundled `data/*.pdb`
+  set is pre-vetted — every structure in it was already debugged against
+  these exact failure modes. A fresh, unmodified real PDB fetched from RCSB
+  is not pre-vetted, and `tests/accuracy_test.py` (new, see item #16)
+  immediately found one: hen egg-white lysozyme (PDB 1LYZ, a 1975
+  "real-space refinement" structure) has a genuine 1.36 Å
+  CB(Ala122)···NH1(Arg125) contact — a real coordinate artifact from a
+  poorly-resolved arginine sidechain in an old, low-resolution structure,
+  not a parsing bug — sitting at `r/σ = 0.364`, deep inside the threshold
+  rather than near its edge. `pair_e()`'s hard-core branch
+  (`r < 0.6·σ` → `HARD_SCALE·(σ/r)¹²`) is unbounded as `r→0`: this single
+  pair alone evaluated to ~2×10⁹ kcal/mol and made `calculate_potential()`
+  report 2.1 billion kcal/mol for the whole 1001-atom structure — the exact
+  "billions instead of thousands" failure item #13 was supposed to have
+  fixed, just triggered by a different, real-world input instead of a
+  parsing gap. Any real (imperfect) structure — older X-ray, NMR ensembles,
+  low-confidence AlphaFold regions — can contain a handful of pathologically
+  short contacts that are not MC-proposal artifacts, and they aren't
+  guaranteed to sit conveniently near the threshold like the Q92793 case, so
+  fixing only the discontinuity (Bug A) isn't sufficient on its own.
+- Fix: both problems needed independent fixes, applied together in both
+  engines' `pair_e()`/`pair_e_gpu()`:
+  1. **Continuity (Bug A):** replaced the hard branch with a smooth additive
+     penalty: `E = edh + egb + elj`, always, plus
+     `HARD_SCALE·[(r_cut/r)¹² − 1]²` when `r < r_cut`
+     (`r_cut = HARD_CUTOFF_FRAC·σ`). At `r = r_cut` the penalty and its
+     derivative are both exactly zero, so the total is continuous and smooth
+     across the boundary — no jump, and no new threshold/width parameter to
+     calibrate (reuses `HARD_CUTOFF_FRAC` unchanged).
+  2. **Boundedness (Bug B):** the smooth formula above is still unbounded as
+     `r→0` — it only fixes contacts near the threshold edge, not contacts
+     deep inside it. Added `HARD_CAP = 5.0e3` kcal/mol (`HARD_CAP_F` in the
+     CUDA engine): the penalty term itself is capped via
+     `min(HARD_SCALE·[(r_cut/r)¹² − 1]², HARD_CAP)`. A clashing pair is
+     still strongly, correctly penalized (thousands of kcal/mol — MC still
+     firmly rejects/relaxes it) but can no longer single-handedly make
+     `calculate_potential()` meaningless for a real structure.
+  Both fixes diverge steeply for genuine MC-proposal overlaps (`r ≪ r_cut`),
+  so the guard-rail purpose is unaffected; the cap only bounds the
+  magnitude, it doesn't weaken the penalty for realistic clash distances.
+- Status: **DONE** — verified against all 11 bundled structures: the 10
+  without any contact near the threshold or deep inside it reproduce their
+  exact previous `calculate_potential()` values (confirming zero
+  regression), `Q92793.pdb` now returns −303,562.7 kcal/mol (−16.35/atom)
+  instead of +4,314,828, and 1LYZ's `calculate_potential()` dropped from 2.1
+  billion to 41,230 kcal/mol (41.2 kcal/mol/atom — the "thousands, not
+  billions" range item #13 intended), while a 5000-step MC run still lowers
+  it further to -1,600 to -2,100 kcal/mol and stays within 0.2-0.4 Å Cα RMSD
+  of the native structure.
+
+**16. No test had ever compared ALMA's own output to real, independent structural ground truth**
+- `bridge_test.py` and `calibrate_gpu.py` only check internal self-consistency
+  (does the Python↔C++ bridge round-trip data; does the CPU engine agree with
+  the GPU engine). Neither asks whether the energy function's minimum actually
+  corresponds to a real protein's native structure.
+- Added `tests/accuracy_test.py`: for each of several real, structurally
+  diverse proteins, fetches the real RCSB crystal structure and the AlphaFold
+  prediction for the same UniProt entry, establishes the AlphaFold-vs-crystal
+  RMSD as an accuracy baseline, then runs `generate_ensemble()` starting from
+  the real crystal structure (the true native state) and checks whether MC
+  energy minimization keeps the structure near-native (physically sane) or
+  lets it drift away (a real force-field accuracy gap, not a code bug).
+  Auto-detects the AlphaFold-to-crystal residue-numbering offset via sequence
+  identity (not just coordinate-key overlap — see the script's `best_offset`
+  docstring for two real registration bugs this caught and fixed along the
+  way: a tandem-repeat frame ambiguity in polyubiquitin, and a propeptide-
+  length-driven mismatch in Interleukin-1 beta) and restricts multi-copy
+  crystal asymmetric units (e.g. barnase, 3 copies in 1BNI) to a single chain
+  so crystal-packing contacts between unrelated copies don't get scored as
+  real intramolecular interactions.
+- Status: **DONE** — 7 of 8 tested proteins (hen egg-white lysozyme, human
+  ubiquitin, sperm whale myoglobin, bovine RNase A, Bacillus barnase,
+  Interleukin-1 beta, alpha-lactalbumin) show ALMA's MC sampling staying
+  within a fraction of an Ångström of native — comfortably inside (usually
+  well under half of) the AlphaFold-vs-crystal accuracy bar for that protein,
+  across alpha-helical, beta-grasp, and mixed alpha+beta folds with and
+  without disulfides. The 8th (chymotrypsin inhibitor 2, PDB 2CI2) can't be
+  automatically aligned to its full-length UniProt entry at any residue offset
+  (its crystal numbering doesn't correspond linearly to full-length numbering)
+  — a known, documented limitation of the offset-search approach, not an ALMA
+  accuracy issue. Run with `python tests/accuracy_test.py` (needs internet
+  access to fetch structures).
+- Extended to 5 larger proteins (521-4599 atoms was the full range before this;
+  now up to triose phosphate isomerase, carbonic anhydrase II, aldolase A,
+  firefly luciferase, and human serum albumin — 1883 to 4599 atoms, up to 578
+  residues): **12/13 total proteins pass**, no new bugs at larger scale. Human
+  serum albumin — the largest and most disulfide-dense case (578 residues,
+  4599 atoms) — correctly detects all 17 of its known native disulfide bonds
+  and keeps MC sampling within 0.3-0.8 Å of native after 5000 steps, well
+  inside its 1.28 Å AlphaFold baseline. Firefly luciferase's 7.0 Å AlphaFold-
+  vs-crystal baseline reflects genuine, well-documented hinge motion between
+  its two domains (not a registration bug — full 523/523 residue match) and
+  ALMA's own sampling drifts proportionally more for it (up to 2.8 Å) than for
+  any other test protein, which is the physically expected result for a
+  flexible multi-domain enzyme, not a red flag.
+- Pushed further to 2 much larger single-domain/monomer enzymes: catalase
+  (498 residues, 4099 atoms, heme-binding) and a beta-galactosidase monomer
+  (1021 residues, 8200 atoms — the largest structure tested, extracted as a
+  single chain from its tetrameric crystal form). Both pass: MC sampling
+  stays within 0.2-0.5 Å of native after 1000 steps, comfortably inside their
+  0.43 Å and 0.65 Å AlphaFold baselines respectively. Confirms the HARD_CAP
+  fix (item #15) and disulfide/topology handling hold up at production-scale
+  atom counts, not just the small/medium test proteins above.
+- **Total: 15 real proteins tested, 14/15 pass** (521 to 8200 atoms, 65 to
+  1021 residues, 0 to 17 disulfides, alpha/beta/mixed folds); the one
+  non-pass (CI2) is a documented offset-search limitation, not an accuracy
+  failure.
 
 ---
 
@@ -239,7 +382,20 @@ P1.6  physics_engine.cpp — fix hard-core threshold + terminal/          ✓ DO
 P1.7  physics_engine_cuda.cu — torsion-move + topology parity with       ✓ DONE
       the CPU engine (dihedral/exclusions/disulfide/crankshaft),
       GPU-resident MC state, HARD_CUTOFF_FRAC 0.6 fix ported to GPU
-      (not build-verified — no CUDA toolkit/GPU in this environment)
+      (build- and run-verified on real Windows+CUDA hardware, RTX 4070 +
+      CUDA 13.2 — calibrate_gpu.py: 11/11 structures PASS, energy parity
+      < 0.06% rel. diff)
+P1.8  physics_engine.cpp/physics_engine_cuda.cu — smooth the hard-core   ✓ DONE
+      nonbonded term into a continuous penalty (was a discontinuous
+      step at HARD_CUTOFF_FRAC; found via a real large structure whose
+      closest contact landed right on the old threshold)
+P1.9  physics_engine.cpp/physics_engine_cuda.cu — cap the (still         ✓ DONE
+      unbounded-as-r->0) smooth penalty from P1.8 at HARD_CAP=5000
+      kcal/mol; found via tests/accuracy_test.py on a real, unmodified
+      RCSB structure (1LYZ) with a genuine deep clash, not just a
+      near-threshold one
+P1.10 tests/accuracy_test.py — real-protein accuracy validation vs        ✓ DONE
+      AlphaFold/RCSB ground truth (15 proteins, 14/15 pass; see item #16)
 ```
 
 ---

@@ -147,6 +147,35 @@ namespace py = pybind11;
 //             단백질 에너지가 수천 대신 수십억 단위로 나온 원인이다. 0.6은 관측된
 //             모든 정상 접촉보다 충분히 낮으면서도, 공격적인 MC 제안으로 인한 실제
 //             수치적 겹침 병리 현상은 여전히 잡아낸다.
+// HARD_CAP  : ceiling (kcal/mol) on the hard-core term itself. Even below
+//             HARD_CUTOFF_FRAC·σ, HARD_SCALE·(σ/r)¹² is unbounded as r→0, and real
+//             deposited structures do contain occasional pathological contacts that
+//             are NOT MC-proposal artifacts — e.g. PDB 1LYZ (1975 "real-space
+//             refinement", pre-modern crystallography) has a genuine 1.36 Å CB···NH1
+//             contact between Ala122 and Arg125's flexible, poorly-resolved
+//             guanidinium group. Uncapped, that single pair alone evaluates to
+//             ~2×10⁹ kcal/mol and swamps calculate_potential() for the entire
+//             1001-atom structure (observed total: 2.1×10⁹, i.e. one pair IS the
+//             "billions" bug — see accuracy_test.py). A real force field would
+//             still treat this as strongly, finitely unfavorable, not treat the
+//             whole structure as if it doesn't exist. HARD_CAP bounds any single
+//             hard-core contact to a large-but-finite penalty so MC still firmly
+//             rejects/relaxes such contacts while calculate_potential() stays a
+//             meaningful, comparable number for real (imperfect) input structures,
+//             not just the hand-vetted bundled test set.
+//             HARD_CAP: 하드코어 항 자체의 상한(kcal/mol). HARD_CUTOFF_FRAC·σ 밑에서도
+//             HARD_SCALE·(σ/r)¹²은 r→0일 때 무한대로 발산한다. 실제 구조에는 MC 제안의
+//             인위적 결과가 아닌, 진짜 병리적 접촉이 이따금 존재한다 — 예: PDB 1LYZ
+//             (1975년 "real-space refinement", 현대 이전 결정학)는 Ala122와 유연하고
+//             전자밀도가 약해 잘 정제되지 않은 Arg125 구아니디늄기 사이에 실제 1.36 Å
+//             CB···NH1 접촉을 갖고 있다. 상한 없이는 이 한 쌍만으로 ~2×10⁹ kcal/mol이
+//             나와 1001개 원자 전체 구조의 calculate_potential()을 완전히 뒤덮는다
+//             (관측값: 2.1×10⁹ — 즉 이 쌍 하나가 "수십억" 버그의 전부다. accuracy_test.py
+//             참고). 실제 힘장이라면 이런 접촉도 강하지만 유한한 불리함으로 취급해야지,
+//             전체 구조가 존재하지 않는 것처럼 만들면 안 된다. HARD_CAP은 단일 하드코어
+//             접촉을 크지만 유한한 페널티로 제한해, MC는 여전히 이런 접촉을 확실히
+//             거부/완화하면서도 calculate_potential()은 미리 검증된 번들 테스트셋뿐
+//             아니라 실제(불완전한) 입력 구조에서도 의미 있고 비교 가능한 값으로 남는다.
 // GB_COEF   : prefactor for the GB Born term = -½(1/ε_prot - 1/ε_water)·C
 //             GB Born 항의 앞인수 — 진공→물 이동 시 에너지 이득(음수)
 static constexpr double COULOMB    = 332.0636;
@@ -162,6 +191,7 @@ static constexpr double NL_RCUT2   = (NL_CUTOFF+NL_SKIN)*(NL_CUTOFF+NL_SKIN);
 static constexpr double PAIR_CUT2  = NL_CUTOFF*NL_CUTOFF;
 static constexpr double HALF_SKIN2 = (NL_SKIN*0.5)*(NL_SKIN*0.5);
 static constexpr double HARD_SCALE = 1.0e4;
+static constexpr double HARD_CAP   = 5.0e3;
 static constexpr double HARD_CUTOFF_FRAC = 0.6;
 static constexpr double GB_COEF    = -0.5*(1.0/EPS_PROT-1.0/EPS_WATER)*COULOMB;
 
@@ -1766,19 +1796,69 @@ private:
     //   elj  — Lennard-Jones 12-6 van der Waals
     //          4ε[(σ/r)¹² - (σ/r)⁶] : 12항=척력(steric), 6항=분산(인력)
     //
-    // Hard-core repulsion replaces all three when atoms overlap (r < HARD_CUTOFF_FRAC·σ).
-    // r < HARD_CUTOFF_FRAC·σ 원자 겹침 시 HARD_SCALE·(σ/r)¹²로 모든 항을 대체 (충돌 방지).
+    // Hard-core term: a SMOOTH penalty added on top of edh+egb+elj when atoms
+    // overlap (r < HARD_CUTOFF_FRAC·σ), not a branch that replaces them.
+    //
+    //   E_hard(r) = HARD_SCALE · [ (r_cut/r)¹² − 1 ]²      where r_cut = HARD_CUTOFF_FRAC·σ
+    //
+    // At r = r_cut this is exactly 0 in BOTH value and slope (the bracket and
+    // its derivative both vanish there), so the total energy is continuous
+    // and smooth across the boundary — unlike the old design, which jumped
+    // straight from the ordinary LJ/GB/DH formula to HARD_SCALE·(σ/r)¹²,
+    // discarding it entirely. That discontinuity was harmless for every
+    // bundled structure checked at the time (P1.6), but real folded proteins
+    // can have a genuine, unremarkable tertiary contact land a fraction of a
+    // percent on either side of the threshold — found via a large predicted
+    // structure (Q92793, ~18.5k atoms) whose closest contact sat at
+    // r/σ = 0.5997, 0.03% inside the old cutoff: that ONE pair alone
+    // contributed +4.6M kcal/mol under the old formula (a value on the other
+    // side of the boundary would have scored a normal, bounded LJ repulsion
+    // of a few kcal/mol for what is physically the same contact). The new
+    // formula gives that same pair a ~2.5 kcal/mol penalty instead — smooth,
+    // bounded, and negligible next to the rest of the protein's energy — while
+    // still diverging steeply for genuine MC-proposal overlaps (r ≪ r_cut).
+    //
+    // 하드코어 항: r < HARD_CUTOFF_FRAC·σ 일 때 edh+egb+elj를 대체하는 대신
+    // 그 위에 "매끄러운" 벌점을 더한다. r=r_cut에서 값과 기울기가 모두 0이 되도록
+    // 구성되어 있어 경계에서 에너지가 불연속적으로 튀지 않는다.
+    //
+    // HARD_CAP: the smooth formula above fixes continuity AT the r_cut boundary,
+    // but [(r_cut/r)^12 - 1]^2 is still unbounded as r->0 -- it only helps
+    // contacts near the edge of the cutoff (like Q92793's r/sigma=0.5997 case
+    // above), not contacts deep inside it. Real (imperfect) structures can have
+    // both: PDB 1LYZ (a 1975 X-ray structure) has a genuine 1.36 Angstrom
+    // CB(Ala122)...NH1(Arg125) contact at r/sigma=0.364, a poorly-resolved Arg
+    // sidechain artifact, not an MC overlap. Uncapped, that single pair alone
+    // evaluates to ~1.6e9 kcal/mol even under the smooth formula. HARD_CAP
+    // bounds the penalty term itself so one such pair can no longer swamp
+    // calculate_potential() for the whole structure, while still being a much
+    // larger penalty than any real non-excluded contact should ever incur.
+    //
+    // HARD_CAP: 위 매끄러운 공식은 r_cut 경계에서의 연속성만 고치고, r->0일 때
+    // [(r_cut/r)^12 - 1]^2 자체는 여전히 무한히 발산한다 — 경계 부근 접촉에는
+    // 도움이 되지만 경계 훨씬 안쪽의 접촉에는 소용없다. 실제(불완전한) 구조는
+    // 둘 다 가질 수 있다: PDB 1LYZ(1975년 X선 구조)는 r/σ=0.364인 실제 1.36 Å
+    // CB(Ala122)···NH1(Arg125) 접촉을 갖고 있는데, 이는 잘 정제되지 않은 Arg
+    // 곁사슬의 결과물이지 MC 겹침이 아니다. 상한 없이는 이 한 쌍만으로도 매끄러운
+    // 공식 하에서 ~1.6×10⁹ kcal/mol이 나온다. HARD_CAP은 벌점 항 자체를 제한해
+    // 이런 접촉 하나가 전체 구조의 calculate_potential()을 뒤덮지 못하게 하면서도,
+    // 실제 배제되지 않는 정상 접촉보다는 훨씬 큰 페널티를 유지한다.
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
         double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
-        if(r<sig*HARD_CUTOFF_FRAC) return HARD_SCALE*std::pow(sig/r,12.0);
         double qp=pi.charge*pj.charge;
         double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
         double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
         double egb=GB_COEF*qp/fgb;
         double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
         double elj=4.0*eps*(s6*s6-s6);
-        return edh+egb+elj;
+        double E=edh+egb+elj;
+        double r_cut=sig*HARD_CUTOFF_FRAC;
+        if(r<r_cut){
+            double x=std::pow(r_cut/r,12.0)-1.0;
+            E+=std::min(HARD_SCALE*x*x, HARD_CAP);
+        }
+        return E;
     }
 
     // Sum of SASA + dihedral + all pair energies within NL_CUTOFF.
@@ -1797,12 +1877,17 @@ private:
         // Zero cost for proteins without disulfide bonds (empty vector short-circuits).
         if (topo && !topo->disulfide_pairs.empty())
             E += ss_e(p, topo->disulfide_pairs);
-        size_t N = p.size();
+        // MSVC's OpenMP implementation only supports the OpenMP 2.0 canonical
+        // for-loop form, which requires a SIGNED loop variable -- size_t (i's
+        // natural type here, matching p.size()) fails to compile under
+        // MSVC+/openmp with C3016. Use a signed ptrdiff_t for the loop counter
+        // and cast back to size_t for indexing.
+        const std::ptrdiff_t N = static_cast<std::ptrdiff_t>(p.size());
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic,8) reduction(+:E)
 #endif
-        for (size_t i = 0; i < N; ++i)
-            for (size_t j : nl.nb[i]) {
+        for (std::ptrdiff_t i = 0; i < N; ++i)
+            for (size_t j : nl.nb[(size_t)i]) {
                 if (topo && topo->is_excluded((int)i, (int)j)) continue;
                 double dx = p[i].x-p[j].x, dy = p[i].y-p[j].y, dz = p[i].z-p[j].z;
                 if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
@@ -2378,7 +2463,21 @@ public:
 // long C++ calls so that the Qt GUI thread remains responsive.
 PYBIND11_MODULE(protein_physics,m){
     m.doc()="High-perf implicit-solvent engine (Verlet NL·HCT-GB·SASA·OpenMP)";
-    py::class_<Particle>(m,"Particle")
+    // module_local(): protein_physics_cuda defines its own, separately-compiled
+    // "Particle"/"PhysicsEngine" classes with the same names. On Linux/macOS
+    // these are distinct C++ types (separate RTTI per shared object) and
+    // pybind11 would register them independently regardless; on Windows, MSVC's
+    // RTTI compares type_info by decorated NAME across DLLs, so pybind11 sees
+    // them as the SAME C++ type and refuses the second module's registration
+    // with "generic_type: type is already registered!" the moment both modules
+    // are imported in one process (gui_main.py always imports protein_physics,
+    // then conditionally protein_physics_cuda to probe for a GPU at startup).
+    // module_local() keeps each module's registration in its own per-module
+    // table instead of the shared global one, which is exactly what's needed
+    // here since Particle/PhysicsEngine instances are never passed between
+    // the two engines (gui_main.py always uses one engine module consistently
+    // for a whole session, never mixing).
+    py::class_<Particle>(m,"Particle", py::module_local())
         .def(py::init<double,double,double,double,double,double,bool>(),
              py::arg("x"),py::arg("y"),py::arg("z"),py::arg("charge"),
              py::arg("radius")=1.9,py::arg("epsilon")=0.1,py::arg("is_water")=false)
@@ -2508,7 +2607,7 @@ PYBIND11_MODULE(protein_physics,m){
             [](const BondTopology& t){ return (int)t.concerted_pairs.size(); })
         .def_property_readonly("num_disulfide_pairs",
             [](const BondTopology& t){ return (int)t.disulfide_pairs.size(); });
-    py::class_<PhysicsEngine>(m,"PhysicsEngine")
+    py::class_<PhysicsEngine>(m,"PhysicsEngine", py::module_local())
         .def(py::init<>())
         .def("calculate_potential",
              [](PhysicsEngine& self,

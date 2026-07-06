@@ -70,27 +70,19 @@ namespace py = pybind11;
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /* ── double-precision CPU-side constants ─────────────────────────────── */
-static constexpr double COULOMB    = 332.0636;
-static constexpr double EPS_WATER  = 78.5;
-static constexpr double EPS_PROT   = 1.0;
-static constexpr double KAPPA      = 0.1257;
+/* Note: pair energy / Born radii are computed exclusively on the GPU in this
+ * engine (see gpu_total_energy_topo / cross_pair_energy_kernel below), so
+ * only the constants their CPU-side neighbors (NeighborList, SASA, disulfide
+ * restraints) actually need live here. COULOMB/EPS_WATER/EPS_PROT/KAPPA/
+ * HARD_SCALE/HARD_CUTOFF_FRAC/GB_COEF only fed a double-precision pair_e_cpu()
+ * that existed for the old Cartesian-move engine; removed along with it. */
 static constexpr double GAMMA_SA   = 0.00542;
 static constexpr double BETA_SA    = 0.92;
 static constexpr double PROBE_R    = 1.4;
 static constexpr double NL_CUTOFF  = 12.0;
 static constexpr double NL_SKIN    = 2.0;
 static constexpr double NL_RCUT2   = (NL_CUTOFF + NL_SKIN) * (NL_CUTOFF + NL_SKIN);
-static constexpr double PAIR_CUT2  = NL_CUTOFF * NL_CUTOFF;
 static constexpr double HALF_SKIN2 = (NL_SKIN * 0.5) * (NL_SKIN * 0.5);
-static constexpr double HARD_SCALE = 1.0e4;
-/* HARD_CUTOFF_FRAC: kept in sync with physics_engine.cpp's P1.6 fix (see
- * IMPROVEMENTS.md item #13). The GPU engine previously still used the old,
- * miscalibrated 0.85 threshold — this file had never been touched by that
- * bugfix — which would have reproduced the same billions-of-kcal/mol
- * blowup on any real all-atom structure the moment this engine exercised
- * real (non-excluded) 1-4/H..H contacts down to r/sigma ~ 0.67. */
-static constexpr double HARD_CUTOFF_FRAC = 0.6;
-static constexpr double GB_COEF    = -0.5 * (1.0 / EPS_PROT - 1.0 / EPS_WATER) * COULOMB;
 static constexpr double K_SS       = 600.0;   /* disulfide restraint force constant (kcal/mol/Ang^2) */
 static constexpr double R0_SS      = 2.044;   /* equilibrium SG-SG distance (Ang) */
 
@@ -99,7 +91,21 @@ static constexpr double R0_SS      = 2.044;   /* equilibrium SG-SG distance (Ang
 #define EPS_WATER_F    78.5f
 #define KAPPA_F        0.1257f
 #define HARD_SCALE_F   1.0e4f
+/* HARD_CUTOFF_FRAC_F: kept in sync with physics_engine.cpp's P1.6 fix (see
+ * IMPROVEMENTS.md item #13). This GPU engine previously used the old,
+ * miscalibrated 0.85 threshold — this file had never been touched by that
+ * bugfix — which would have reproduced the same billions-of-kcal/mol
+ * blowup on any real all-atom structure the moment this engine exercised
+ * real (non-excluded) 1-4/H..H contacts down to r/sigma ~ 0.67. */
 #define HARD_CUTOFF_FRAC_F 0.6f
+/* HARD_CAP_F: ceiling (kcal/mol) on the hard-core term. Mirrors the CPU
+ * engine's fix in physics_engine.cpp (see the HARD_CAP comment there) --
+ * real deposited structures (e.g. PDB 1LYZ, a 1975 structure with a genuine
+ * 1.36 Ang CB...NH1 contact) can contain pathological-but-real short
+ * contacts that are not MC-proposal artifacts. Left uncapped, HARD_SCALE_F *
+ * (sigma/r)^12 is unbounded as r->0 and a single such pair can swamp the
+ * whole structure's energy by 5-6 orders of magnitude. */
+#define HARD_CAP_F 5.0e3f
 /* GB_COEF_F = -0.5 * (1/1 - 1/78.5) * 332.0636  */
 #define GB_COEF_F      (-0.5f * (1.0f - 1.0f / 78.5f) * 332.0636f)
 #define PAIR_CUT2_F    144.0f          /* 12^2 */
@@ -236,48 +242,6 @@ static inline double hct_cpu(double r, double r2, double ri, double rj) noexcept
     if (ri >= U) return 0.0;
     return 1.0/L - 1.0/U
            + (r2 - rj*rj + ri*ri) / (2.0*r*ri*ri) * std::log(L/U) * 0.5 / r;
-}
-
-static inline double pair_e_cpu(const Particle& pi_p, const Particle& pj_p,
-                                 double ai, double aj) noexcept
-{
-    double dx  = pi_p.x - pj_p.x;
-    double dy  = pi_p.y - pj_p.y;
-    double dz  = pi_p.z - pj_p.z;
-    double r2  = dx*dx + dy*dy + dz*dz;
-    double r   = std::sqrt(r2);
-    double sig = pi_p.radius + pj_p.radius;
-    if (r < sig * HARD_CUTOFF_FRAC)
-        return HARD_SCALE * std::pow(sig / r, 12.0);
-    double qp  = pi_p.charge * pj_p.charge;
-    double edh = (COULOMB * qp) / (EPS_WATER * r) * std::exp(-KAPPA * r);
-    double fgb = std::sqrt(r2 + ai * aj * std::exp(-r2 / (4.0 * ai * aj)));
-    double egb = GB_COEF * qp / fgb;
-    double eps = std::sqrt(pi_p.epsilon * pj_p.epsilon);
-    double s6  = std::pow(sig / r, 6.0);
-    double elj = 4.0 * eps * (s6*s6 - s6);
-    return edh + egb + elj;
-}
-
-static std::vector<double> born_radii_cpu(const std::vector<Particle>& p,
-                                           const NeighborList& nl)
-{
-    size_t N = p.size();
-    std::vector<double> sum(N, 0.0);
-    for (size_t i = 0; i < N; ++i) {
-        for (size_t j : nl.nb[i]) {
-            double r2 = d2_cpu(p[i], p[j]);
-            double r  = std::sqrt(r2);
-            sum[i] += hct_cpu(r, r2, p[i].radius, p[j].radius);
-            sum[j] += hct_cpu(r, r2, p[j].radius, p[i].radius);
-        }
-    }
-    std::vector<double> a(N);
-    for (size_t i = 0; i < N; ++i) {
-        double inv = 1.0 / p[i].radius - 0.5 * sum[i];
-        a[i] = 1.0 / std::max(inv, 2.0);
-    }
-    return a;
 }
 
 static void update_born_cpu(size_t idx,
@@ -513,6 +477,19 @@ float hct_gpu(float r, float r2, float ri, float rj)
            + (r2 - rj*rj + ri*ri) / (2.0f*r*ri*ri) * logLU * 0.5f / r;
 }
 
+/*
+ * Hard-core term is a SMOOTH penalty added on top of edh+egb+elj when atoms
+ * overlap (r < HARD_CUTOFF_FRAC_F*sig), not a branch that replaces them --
+ * see the matching comment on pair_e() in physics_engine.cpp for the full
+ * rationale (a genuine tertiary contact landing a fraction of a percent
+ * inside the old hard threshold used to score a multi-million-kcal/mol
+ * discontinuous jump instead of an ordinary bounded LJ repulsion). At
+ * r == r_cut the penalty and its derivative are both exactly zero, so the
+ * total is continuous and smooth across the boundary. The penalty is also
+ * capped at HARD_CAP_F: the smooth formula alone is still unbounded as
+ * r->0, which matters for contacts deep inside the cutoff (not just near
+ * the boundary) -- see the HARD_CAP comment in physics_engine.cpp.
+ */
 __device__ __forceinline__
 float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, float ai,
                  float xj, float yj, float zj, float qj, float rj, float epsj, float aj)
@@ -523,12 +500,6 @@ float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, f
     float r2  = dx*dx + dy*dy + dz*dz;
     float r   = sqrtf(r2);
     float sig = ri + rj;
-
-    if (r < sig * HARD_CUTOFF_FRAC_F) {
-        float ratio = sig / r;
-        float r6    = ratio * ratio * ratio * ratio * ratio * ratio;
-        return HARD_SCALE_F * r6 * r6;
-    }
 
     float qp  = qi * qj;
     float edh = (COULOMB_F * qp) / (EPS_WATER_F * r) * __expf(-KAPPA_F * r);
@@ -542,7 +513,21 @@ float pair_e_gpu(float xi, float yi, float zi, float qi, float ri, float epsi, f
     float s6  = sr * sr * sr * sr * sr * sr;
     float elj = 4.0f * eps * (s6*s6 - s6);
 
-    return edh + egb + elj;
+    float e = edh + egb + elj;
+
+    float r_cut = sig * HARD_CUTOFF_FRAC_F;
+    if (r < r_cut) {
+        float ratio  = r_cut / r;
+        float ratio6 = ratio * ratio * ratio * ratio * ratio * ratio;
+        float x      = ratio6 * ratio6 - 1.0f;
+        /* HARD_CAP_F: the smooth formula above is continuous at r_cut but still
+         * unbounded as r->0 -- see the matching HARD_CAP comment on pair_e() in
+         * physics_engine.cpp (a real 1LYZ contact at r/sigma=0.364 evaluates to
+         * ~1.6e9 even under this smooth formula without a cap). */
+        e += fminf(HARD_SCALE_F * x * x, HARD_CAP_F);
+    }
+
+    return e;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1251,7 +1236,19 @@ PYBIND11_MODULE(protein_physics_cuda, m)
               "(CUDA Born/pair-energy kernels + torsion-angle MC, "
               "topology-aware: dihedral/exclusion/disulfide parity with protein_physics)";
 
-    py::class_<Particle>(m, "Particle")
+    // module_local(): protein_physics (the CPU module) defines its own,
+    // separately-compiled "Particle"/"PhysicsEngine" classes with the same
+    // names. On Windows, MSVC's RTTI compares type_info by decorated NAME
+    // across DLLs (unlike Linux/macOS, where each shared object has its own
+    // independent RTTI), so pybind11 sees these as the SAME C++ type and
+    // refuses this module's registration with "generic_type: type is already
+    // registered!" the moment both modules are imported in one process
+    // (gui_main.py always imports protein_physics, then conditionally
+    // protein_physics_cuda to probe for a GPU at startup). module_local()
+    // keeps this module's registration in its own per-module table instead
+    // of the shared global one -- safe here since Particle/PhysicsEngine
+    // instances are never passed between the two engines.
+    py::class_<Particle>(m, "Particle", py::module_local())
         .def(py::init<double, double, double, double, double, double, bool>(),
              py::arg("x"),
              py::arg("y"),
@@ -1268,7 +1265,7 @@ PYBIND11_MODULE(protein_physics_cuda, m)
         .def_readwrite("epsilon",  &Particle::epsilon)
         .def_readwrite("is_water", &Particle::is_water);
 
-    py::class_<PhysicsEngine>(m, "PhysicsEngine")
+    py::class_<PhysicsEngine>(m, "PhysicsEngine", py::module_local())
         .def(py::init<>())
         .def("calculate_potential",
              [](PhysicsEngine& self, const std::vector<Particle>& particles,
