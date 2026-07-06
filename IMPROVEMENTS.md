@@ -3,19 +3,46 @@
 ## Status
 
 All P1 (physics model), P2 (coverage), P3 (analysis), and P4 (performance)
-milestones are complete, including GPU/CPU parity on real hardware, real-protein
-accuracy validation against AlphaFold/RCSB ground truth, and a CI release pipeline
-that actually verifies what it ships. Three items remain, all deliberately deferred
-as low-priority (not blocking, not forgotten) — see below.
+milestones are complete, including GPU/CPU parity on real hardware and a CI release
+pipeline that actually verifies what it ships. Force-field **accuracy is validated
+against real structures but not a closed matter** — see item #1 below, which stays
+open on purpose. Three further items remain, deliberately deferred as low-priority
+(not blocking, not forgotten) — see below.
 
 ## Remaining Work
 
-**1. Bond stretching + angle bending energy terms (P1.4c)**
+**1. Force-field accuracy — validated to a first bar, not "done"**
+`tests/accuracy_test.py` currently passes 14/15 real proteins by a specific,
+deliberately modest bar: MC sampling starting from the true native structure stays
+within ~2x the AlphaFold-vs-crystal RMSD baseline. That's a real, meaningful check
+(it has already caught and fixed multiple real energy-function bugs — see the
+hard-core repulsion history and the nucleic-acid filtering fix below), but it is
+not the same as being competitive with production MD/scoring tools, and it doesn't
+by itself prove the energy function is *accurate*, only that it isn't *badly
+wrong* for the cases tested. Concretely still open:
+  - Broaden the test set further (more folds, more disulfide/metal/ligand cases,
+    larger multi-domain assemblies) — every new real structure tested so far has
+    found at least one genuine issue (the hard-core cap, the nucleic-acid filter),
+    so more coverage should be expected to keep finding real gaps, not just
+    confirming what's already known.
+  - The current pass bar (~2x AlphaFold RMSD) is a sanity check, not a target —
+    consider tightening it or adding a second, independent accuracy metric (e.g.
+    decoy discrimination: does the energy function actually rank near-native
+    conformations below deliberately perturbed ones by a wide margin, not just a
+    plausible one).
+  - Real-world sessions keep surfacing accuracy-adjacent issues in structures the
+    test set doesn't cover (disordered linkers being compared against ordered
+    references, co-crystallized ligands/nucleic acids contaminating a reference
+    structure) — each one so far turned out to be either genuine biology or a
+    real parsing bug, not a red flag on the physics itself, but there's no reason
+    to assume that streak continues without more testing.
+
+**2. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
 indefinitely unless a future move type (e.g. bond-length perturbation) needs them.
 
-**2. Full GAFF2 force field for organic ligands/cofactors**
+**3. Full GAFF2 force field for organic ligands/cofactors**
 Currently: HETATM ligands get an element-based fallback (radius/ε by element only,
 zero partial charge) rather than real small-molecule parameters. A full fix means
 shipping a GAFF2 atom-type table and either calling `antechamber` programmatically
@@ -23,7 +50,7 @@ or caching parameters for common cofactors (ATP, heme, NAD⁺, FAD, PLP…). Met
 already have proper tabulated parameters (`amber_params.ION_PARAMS`) — only organic
 ligands are affected.
 
-**3. Membrane/lipid slab model**
+**4. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
 a low-ε bilayer-region model; no such model exists yet. Low priority — no membrane
 protein test cases in current use.
@@ -82,15 +109,16 @@ limitation of that test harness's alignment heuristic, not the physics engine.)*
   parse (before any MC run) and shown alongside the trajectory-based RMSF view.
 - **All-heavy-atom RMSD** — Kabsch alignment on the full heavy-atom set (not just
   Cα), catching sidechain-packing differences that Cα-only RMSD misses.
-- **Real-protein accuracy validation** — `tests/accuracy_test.py` fetches real RCSB
-  crystal structures + AlphaFold predictions, establishes the AlphaFold-vs-crystal
-  RMSD as an accuracy baseline, and checks whether MC sampling starting from the
-  true native structure stays near-native or drifts away. **15 proteins tested
-  (521–8200 atoms, 65–1021 residues, 0–17 disulfides, α/β/mixed folds), 14/15
-  pass** — MC sampling stays within a fraction of an Ångström of native, well
-  inside the AlphaFold baseline, across every fold type and size tested. (The one
-  non-pass, 2CI2, is the numbering-alignment limitation noted above, not an
-  accuracy failure.) Needs internet access; run with `python tests/accuracy_test.py`.
+- **Real-protein accuracy validation (first bar passed, not closed — see "Remaining
+  Work" #1)** — `tests/accuracy_test.py` fetches real RCSB crystal structures +
+  AlphaFold predictions, establishes the AlphaFold-vs-crystal RMSD as an accuracy
+  baseline, and checks whether MC sampling starting from the true native structure
+  stays near-native or drifts away. **15 proteins tested (521–8200 atoms, 65–1021
+  residues, 0–17 disulfides, α/β/mixed folds), 14/15 pass** — MC sampling stays
+  within a fraction of an Ångström of native, well inside the AlphaFold baseline,
+  across every fold type and size tested. (The one non-pass, 2CI2, is the
+  numbering-alignment limitation noted above, not an accuracy failure.) Needs
+  internet access; run with `python tests/accuracy_test.py`.
 - **Landscape exploration branches from the best MC candidate** — `_start_landscape()`
   used to always start from the raw parsed input; it now starts from the
   lowest-energy candidate from the initial pipeline run, so exploring the
