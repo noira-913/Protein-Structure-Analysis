@@ -30,8 +30,26 @@ jobs:
       # environment (PATH + INCLUDE + LIB), not just cl.exe's directory on
       # PATH — a plain PowerShell shell on windows-latest doesn't set this
       # up by itself (that's normally vcvarsall.bat's job).
+      #
+      # toolset is pinned to 14.3x: windows-latest has shipped a newer default
+      # MSVC (Visual Studio "18", toolset 14.51.x) than CUDA 12.4's nvcc
+      # supports -- host_config.h's version check fails with a FATAL
+      # "unsupported Microsoft Visual Studio version" error against it (CUDA
+      # 12.4 only supports MSVC 2017-2022, i.e. up to roughly the 14.3x/14.4x
+      # toolset generation). That fatal error was never caught here because
+      # build_cuda_extension() failing didn't fail this job, and a STALE,
+      # accidentally-committed protein_physics_cuda.cp312-win_amd64.pyd left
+      # over from an old commit (long since removed) satisfied the "does a
+      # .pyd exist" check below, silently shipping a years-stale (sm_75-only)
+      # CUDA extension in every release build since -- which fails at
+      # runtime on any newer GPU/driver with "the provided PTX was compiled
+      # with an unsupported toolchain." windows-latest ships multiple MSVC
+      # toolset generations side by side specifically for this kind of
+      # compatibility need; pinning here selects one nvcc actually supports.
       - name: Set up MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: 14.3
 
       # windows-latest has no GPU, but nvcc doesn't need one to COMPILE —
       # only to run the resulting kernels. Installing the toolkit here lets
@@ -47,9 +65,29 @@ jobs:
           sub-packages: '["nvcc", "cudart"]'
           use-github-cache: true
 
+      - name: Record build start time
+        id: build_start
+        run: echo "timestamp=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT
+
       - name: Build protein_physics extensions (CPU + CUDA)
         run: python setup.py build_ext --inplace
 
+      # Two real failure modes found in the field, both caught here now:
+      #   1. build_cuda_extension() silently failing (returns False, logs to
+      #      the build step's own output, but doesn't fail THIS step) used to
+      #      be "verified" by just checking a protein_physics_cuda*.pyd
+      #      exists on disk -- which an accidentally-committed, years-stale
+      #      copy from an old commit always satisfied, even when the actual
+      #      build for THIS commit failed outright. Checking the file's
+      #      LastWriteTime is after this job's build actually started closes
+      #      that gap.
+      #   2. nvcc silently producing a fatbinary for only SOME of the
+      #      requested -gencode targets (observed: CUDA 12.4 + an
+      #      incompatible host MSVC produced only sm_75, silently dropping
+      #      86/89/90) -- checked here via cuobjdump, so a GPU newer than
+      #      whatever DID compile doesn't quietly fall back to a PTX-JIT path
+      #      that may not even work (the "unsupported toolchain" error this
+      #      whole investigation started from).
       - name: Verify CUDA extension was actually built
         run: |
           $cuda_pyd = Get-ChildItem -Path . -Filter "protein_physics_cuda*.pyd" -ErrorAction SilentlyContinue
@@ -58,6 +96,23 @@ jobs:
             exit 1
           }
           Write-Host "Found CUDA extension: $($cuda_pyd.Name)"
+
+          $buildStart = [DateTimeOffset]::FromUnixTimeSeconds([long]"${{ steps.build_start.outputs.timestamp }}").UtcDateTime
+          if ($cuda_pyd.LastWriteTimeUtc -lt $buildStart) {
+            Write-Error "protein_physics_cuda*.pyd's last-write time ($($cuda_pyd.LastWriteTimeUtc)) predates this job's build step ($buildStart) -- this is a STALE file (e.g. an old committed artifact), not a fresh build. nvcc likely failed silently; check the build step's log above for its actual error."
+            exit 1
+          }
+
+          $cuobjdump = Join-Path $env:CUDA_PATH "bin\cuobjdump.exe"
+          $elfList = & $cuobjdump --list-elf $cuda_pyd.FullName 2>&1
+          Write-Host ($elfList -join "`n")
+          $expectedArchs = @("sm_75", "sm_86", "sm_89", "sm_90")
+          $missing = $expectedArchs | Where-Object { -not ($elfList -match $_) }
+          if ($missing) {
+            Write-Error "protein_physics_cuda*.pyd is missing compiled code for: $($missing -join ', '). setup.py requests -gencode entries for sm_75/86/89/90, but nvcc only produced a subset -- this ships a working-but-degraded (or, on GPUs matching only the missing architectures, non-functional) CUDA extension. Check the build step's log above for per-architecture nvcc warnings/errors."
+            exit 1
+          }
+          Write-Host "Confirmed compiled code for all expected architectures: $($expectedArchs -join ', ')"
 
       - name: Build portable ALMA.exe
         run: pyinstaller alma.spec --noconfirm --clean
