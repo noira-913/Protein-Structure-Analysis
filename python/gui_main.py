@@ -64,6 +64,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QMessageBox, QFrame,
     QProgressBar, QSplitter, QGridLayout, QScrollArea, QStackedWidget,
+    QComboBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -666,6 +667,109 @@ def _ensemble_ca_map(ref_ca_map, ca_indices, particles):
                 ca_map[key] = np.array([p.x, p.y, p.z])
     return ca_map
 
+def _kabsch_align_points(ref_pts, mobile_pts):
+    """ref_pts, mobile_pts: (n,3) arrays of the same points in
+    correspondence (same order, no keys needed). Returns mobile_pts
+    optimally Kabsch-rotated/translated onto ref_pts' frame.
+
+    Same SVD derivation as _kabsch_fit/_compute_rmsd, but operating
+    directly on arrays instead of residue-keyed maps -- needed for
+    landscape basin comparisons, where two representative snapshots can
+    have drifted to completely different absolute positions/orientations
+    (torsion-angle MC has no reason to keep a molecule's overall pose
+    fixed) even when their actual shape is nearly identical. Comparing raw
+    coordinates without this conflates "real conformational difference"
+    with "same shape, different orientation" -- exactly the bug already
+    fixed once for the external layered 3D view (see _render_external_layered).
+    """
+    ref_c, mob_c = ref_pts.mean(0), mobile_pts.mean(0)
+    p0, q0 = ref_pts - ref_c, mobile_pts - mob_c
+    H = q0.T @ p0
+    U, _, Vt = np.linalg.svd(H)
+    d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return (mobile_pts - mob_c) @ R.T + ref_c
+
+def _backbone_ncac_indices(ca_map, heavy_map, heavy_indices):
+    """ca_map과 동일한 잔기 순서로 N/CA/C 원자 인덱스를 반환한다 — 어떤 후보의
+    원시 입자 좌표에서도 phi/psi 이면각을 계산할 수 있게 (2차 구조 근사용,
+    _secondary_structure_string 참고).
+    Per-residue backbone N/CA/C atom indices, in the same residue order as
+    ca_map, so phi/psi dihedral angles can be computed from any candidate's
+    raw particle coordinates (used for the secondary-structure abstraction —
+    see _secondary_structure_string).
+    """
+    heavy_idx_by_key = {key: idx for key, idx in zip(heavy_map.keys(), heavy_indices)}
+    n_idx, ca_idx, c_idx = [], [], []
+    for (chain, resseq) in ca_map.keys():
+        n_idx.append(heavy_idx_by_key.get((chain, resseq, "N")))
+        ca_idx.append(heavy_idx_by_key.get((chain, resseq, "CA")))
+        c_idx.append(heavy_idx_by_key.get((chain, resseq, "C")))
+    return n_idx, ca_idx, c_idx
+
+def _dihedral_angle(p0, p1, p2, p3):
+    """4개 원자 좌표로부터 이면각(도) 계산 — 표준 공식."""
+    b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
+    b1n = b1 / (np.linalg.norm(b1) + 1e-12)
+    v = b0 - np.dot(b0, b1n) * b1n
+    w = b2 - np.dot(b2, b1n) * b1n
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b1n, v), w)
+    return float(np.degrees(np.arctan2(y, x)))
+
+def _secondary_structure_string(particles, n_idx, ca_idx, c_idx):
+    """잔기별 2차 구조 근사 문자열('H'=나선, 'E'=가닥, 'C'=코일/루프) —
+    골격 phi/psi 이면각만으로 분류한다.
+
+    완전한 DSSP가 아니다(DSSP는 골격 수소결합 패턴도 함께 쓴다) — 훨씬
+    저렴한 표준 라마찬드란 영역 근사다: (phi, psi)가 알파나선 또는
+    베타가닥의 핵심 영역에 들어가는지만 본다. 이는 분지들을 원자 좌표
+    차이가 아니라 "범주" 차이로 비교하기 위한 성긴 구조적 추상화로
+    충분하다 — 매 잔기가 항상 라벨을 얻으며(알려진 안정 구조 라이브러리와
+    맞춰볼 필요가 전혀 없다), 논의된 "안정 구조와 비교 불가능한 IDP 구간"
+    문제 자체가 애초에 발생하지 않는다.
+
+    Simplified per-residue secondary-structure label ('H'=helix, 'E'=strand,
+    'C'=coil/turn) from backbone phi/psi dihedral angles alone.
+
+    This is NOT full DSSP (which additionally uses backbone H-bonding
+    geometry) -- it's the much cheaper, standard Ramachandran-region proxy:
+    classify (phi, psi) into the core alpha-helix or beta-strand basins,
+    else coil. Good enough as a coarse structural abstraction for comparing
+    basins by *category* rather than raw atom displacement -- every
+    conformation always gets a label this way, with no comparison against
+    an external structure library required (the "IDP region with no similar
+    stable structure available" problem doesn't arise in the first place).
+    """
+    n = len(ca_idx)
+    labels = ["C"] * n
+
+    def pos(idx):
+        if idx is None or idx >= len(particles):
+            return None
+        p = particles[idx]
+        return np.array([p.x, p.y, p.z])
+
+    for i in range(1, n - 1):
+        c_prev, n_i, ca_i, c_i, n_next = (
+            pos(c_idx[i - 1]), pos(n_idx[i]), pos(ca_idx[i]), pos(c_idx[i]), pos(n_idx[i + 1]))
+        if any(v is None for v in (c_prev, n_i, ca_i, c_i, n_next)):
+            continue
+        phi = _dihedral_angle(c_prev, n_i, ca_i, c_i)
+        psi = _dihedral_angle(n_i, ca_i, c_i, n_next)
+        if -100 <= phi <= -30 and -67 <= psi <= -7:
+            labels[i] = "H"
+        elif -180 <= phi <= -45 and (90 <= psi <= 180 or -180 <= psi <= -150):
+            labels[i] = "E"
+    return "".join(labels)
+
+def _ss_diff_fraction(ss_a, ss_b):
+    """두 2차 구조 문자열 사이의 잔기별 불일치 비율."""
+    n = min(len(ss_a), len(ss_b))
+    if n == 0:
+        return 0.0
+    return sum(1 for i in range(n) if ss_a[i] != ss_b[i]) / n
+
 class _NotNucleicAcidOrWater(Select):
     """Bio.PDB Select filter: drop nucleic acid / water residues from output.
 
@@ -1194,7 +1298,8 @@ class LandscapeWorker(QThread):
     N_SNAPSHOTS    = 120   # total trajectory length
     STEPS_PER_SNAP = 80    # MC steps between each snapshot
 
-    def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12):
+    def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
+                 extra_seeds=None, backbone_ncac=None):
         super().__init__()
         self.engine      = engine
         self.init_atoms  = init_atoms
@@ -1203,6 +1308,15 @@ class LandscapeWorker(QThread):
         self.physics_mod = physics_mod if physics_mod is not None else protein_physics
         self.T           = T
         self.max_angle   = max_angle
+        # 다중 분지 탐색용 추가 시드 (예: 상위 K개 MC 후보) — 없으면 기존처럼
+        # 단일 궤적으로 동작한다.
+        # Extra seeds for multi-branch exploration (e.g. the next-best K MC
+        # candidates) — falls back to the original single-trajectory
+        # behavior when empty.
+        self.extra_seeds = list(extra_seeds) if extra_seeds else []
+        # (n_idx, ca_idx, c_idx) per residue, ca_map order — for the
+        # secondary-structure abstraction (see _secondary_structure_string).
+        self.backbone_ncac = backbone_ncac
 
     def _ca_vec(self, particles):
         """Flatten Cα coordinates of one snapshot into a 1-D vector."""
@@ -1217,33 +1331,65 @@ class LandscapeWorker(QThread):
         from sklearn.decomposition import PCA
         from sklearn.cluster import DBSCAN
 
-        N, S = self.N_SNAPSHOTS, self.STEPS_PER_SNAP
-        self.progress.emit(
-            f"  [LANDSCAPE] Running {N}×{S}-step Markov chain…")
+        S = self.STEPS_PER_SNAP
+        seeds = [self.init_atoms] + self.extra_seeds
+        n_branches = len(seeds)
+        N_per = max(20, self.N_SNAPSHOTS // n_branches) if n_branches > 1 else self.N_SNAPSHOTS
 
-        # run_landscape_trajectory() advances the whole N×S-step chain in a
-        # single C++/CUDA call instead of looping here and calling
-        # generate_ensemble()+calculate_potential() N times — each of those
-        # Python-level iterations used to re-marshal the full particle array
-        # across the Python<->C++ boundary (and, on the GPU backend,
-        # reallocate device buffers from scratch) every single snapshot.
-        # See IMPROVEMENTS.md item #12. The trade-off is coarser progress
-        # feedback: this call blocks until all N snapshots are done rather
-        # than reporting every 20 snapshots, since the loop itself now lives
-        # in C++.
-        try:
-            snapshots, energies = self.engine.run_landscape_trajectory(
-                self.init_atoms, self.topo, N, S, self.T, self.max_angle)
-        except Exception as ex:
-            if self.physics_mod is protein_physics:
-                raise  # already on CPU -- nothing left to fall back to
-            self.progress.emit(f"  ⚠ GPU engine failed at runtime ({ex}) — falling back to CPU")
-            self.gpu_fallback.emit(str(ex))
-            self.physics_mod = protein_physics
-            self.engine = protein_physics.PhysicsEngine()
-            snapshots, energies = self.engine.run_landscape_trajectory(
-                self.init_atoms, self.topo, N, S, self.T, self.max_angle)
-        energies = np.array(energies, dtype=float)
+        # ── 다중 분지 탐색 (Multi-branch exploration) ────────────────────
+        # 시드 하나(최적 후보)에서만 뻗으면, 안정 단백질에서는 문제없다
+        # (우물이 하나뿐이라 어디서 시작해도 결국 거기로 수렴) — 하지만
+        # 지배적 상태 자체가 없는 진짜 IDP에서는 "최적" 시드가 사실상
+        # 임의의 표본일 뿐이라 거기서 뻗은 궤적 하나가 실제 인구 분포를
+        # 대표하지 못한다. 상위 K개 후보에서 각각 뻗어 전부 모아 군집화
+        # 하면 특정 시작점에 치우치지 않은 인구 가중 분포를 얻는다.
+        #
+        # Branching from a single seed (the best candidate) is fine for a
+        # stable protein (one deep well -- any start converges there), but
+        # for a protein with no dominant state (a real IDP) that "best"
+        # seed is close to an arbitrary sample, so one trajectory from it
+        # doesn't represent the real population. Branching from several
+        # top candidates and pooling all of them gives a population-
+        # weighted picture that isn't biased toward one starting point.
+        all_snapshots, all_energies, branch_lengths = [], [], []
+        for bi, seed in enumerate(seeds):
+            if n_branches > 1:
+                self.progress.emit(
+                    f"  [LANDSCAPE] Branch {bi+1}/{n_branches}: "
+                    f"running {N_per}×{S}-step chain…")
+            else:
+                self.progress.emit(
+                    f"  [LANDSCAPE] Running {N_per}×{S}-step Markov chain…")
+
+            # run_landscape_trajectory() advances the whole N×S-step chain in a
+            # single C++/CUDA call instead of looping here and calling
+            # generate_ensemble()+calculate_potential() N times — each of those
+            # Python-level iterations used to re-marshal the full particle array
+            # across the Python<->C++ boundary (and, on the GPU backend,
+            # reallocate device buffers from scratch) every single snapshot.
+            # See IMPROVEMENTS.md item #12. The trade-off is coarser progress
+            # feedback: this call blocks until all N snapshots are done rather
+            # than reporting every 20 snapshots, since the loop itself now lives
+            # in C++.
+            try:
+                snaps, ens = self.engine.run_landscape_trajectory(
+                    seed, self.topo, N_per, S, self.T, self.max_angle)
+            except Exception as ex:
+                if self.physics_mod is protein_physics:
+                    raise  # already on CPU -- nothing left to fall back to
+                self.progress.emit(f"  ⚠ GPU engine failed at runtime ({ex}) — falling back to CPU")
+                self.gpu_fallback.emit(str(ex))
+                self.physics_mod = protein_physics
+                self.engine = protein_physics.PhysicsEngine()
+                snaps, ens = self.engine.run_landscape_trajectory(
+                    seed, self.topo, N_per, S, self.T, self.max_angle)
+            all_snapshots.extend(snaps)
+            all_energies.extend(ens)
+            branch_lengths.append(len(snaps))
+
+        snapshots = all_snapshots
+        energies  = np.array(all_energies, dtype=float)
+        N = len(energies)
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")
 
@@ -1299,7 +1445,20 @@ class LandscapeWorker(QThread):
         # cluster.  eps is calibrated from the trajectory's own median
         # consecutive-frame displacement, so it self-scales with however
         # much the MC step size/temperature actually moves the structure.
-        step_disp   = np.linalg.norm(np.diff(layout, axis=0), axis=1)
+        # 분지 경계(서로 다른 시드에서 온 스냅샷 사이)는 실제 연속 스텝이
+        # 아니므로 여기서 제외한다 — 안 그러면 다중 분지 탐색에서 시드가
+        # 서로 멀리 떨어져 있을 때 가짜 "큰 이동"이 껴 eps 보정을 왜곡한다.
+        # Exclude branch boundaries (between snapshots from different
+        # seeds) -- they aren't real consecutive steps, and including them
+        # would inject spurious "large jumps" into the eps calibration
+        # whenever multi-branch seeds happen to be far apart structurally.
+        diffs, offset = [], 0
+        for length in branch_lengths:
+            if length > 1:
+                diffs.append(np.linalg.norm(
+                    np.diff(layout[offset:offset + length], axis=0), axis=1))
+            offset += length
+        step_disp   = np.concatenate(diffs) if diffs else np.array([0.0])
         step_scale  = float(np.median(step_disp)) if step_disp.size else 1.0
         eps         = max(step_scale * 4.0, 1e-6)
         min_pts     = max(3, int(0.05 * N))
@@ -1324,38 +1483,232 @@ class LandscapeWorker(QThread):
         #
         # kT = 0.592 kcal/mol @ 300K — 열 요동 에너지 스케일.
         # 유의미한 분지: 전체 스냅샷의 5% 이상을 차지하는 군집.
-        # e_spread = 유의미한 분지들의 최소 에너지 차이 → 지형의 '거칠기'.
+        #
+        # "경쟁 분지" (Competitive basins): DBSCAN은 정상적인 열 요동만으로도
+        # (곁사슬 회전 하나, 국소 접촉 재배열 하나) PCA 공간에서 새로운 밀집
+        # 군집을 쉽게 만들어낸다 — 실제로 다른 접힘 상태가 아니어도. 5개의
+        # 실제 안정 단백질(1LYZ, 1UBQ, 1MBN, 7RSA, 1BNI)로 보정해 본 결과,
+        # 단순히 "유의미한 분지 수 ≥ 2"만으로 판정하면 5개 전부가
+        # POSSIBLY DISORDERED로 잘못 분류됐다 — 심지어 최적 분지가 전체의
+        # 66%를 차지한 미오글로빈(funnel=0.66)까지도. 실제로 경쟁하는 준안정
+        # 상태라면 전역 최저 에너지에서 열적으로 실제 도달 가능한 범위 안에
+        # 있어야 한다; 그보다 훨씬(수백~수만 kcal/mol) 높은 에너지의 분지는
+        # 일시적인 뒤틀림/충돌 상태일 뿐 진짜 대체 접힘이 아니다 — 그런 상태를
+        # 실제로 볼츠만 분포로 그 정도 비율(≥5%)만큼 방문했다는 것 자체가
+        # 물리적으로 불가능하며, DBSCAN이 하나의 진짜 분지를 기하학적으로
+        # 잘게 쪼갠 결과에 가깝다.
         #
         # 분류 기준:
-        #   IDP:               ≥3개 분지 AND e_spread < 5kT
+        #   IDP:               ≥3개 "경쟁" 분지 AND e_spread < 5kT
         #                      (여러 분지가 비슷한 에너지 → 지형이 평탄 → 무질서)
-        #   POSSIBLY DISORDERED: ≥2개 분지 OR 최저 분지가 전체의 50% 미만 차지
-        #                        (부분적 무질서 또는 다중 접힘 상태)
-        #   ORDERED:           단일 지배적 분지 (깔때기형 에너지 지형)
-        #                      (funnel landscape → 단일 안정 구조)
-        # IDP: ≥3 significant basins AND e_spread < 5kT (flat landscape → disordered)
-        # ORDERED: single dominant basin (funnel landscape → stable native fold)
+        #   POSSIBLY DISORDERED: ≥2개 "경쟁" 분지 AND 최적 분지가 전체의 70% 미만
+        #                        (진짜 열적으로 경쟁하는 대체 상태가 있고, 그것이
+        #                        지배적이지 않을 때만 무질서 신호로 카운트)
+        #   ORDERED:           그 외 (단일 지배적 분지, 또는 다른 분지가 있어도
+        #                      에너지상 실제로 경쟁하지 않음)
+        #
+        # Competitive basins: DBSCAN readily carves a new dense cluster out of
+        # perfectly normal thermal jitter (one side-chain flip, one local
+        # contact rearrangement) even in a genuinely single-funnel landscape.
+        # Calibrated against 5 real, textbook well-folded proteins (1LYZ,
+        # 1UBQ, 1MBN, 7RSA, 1BNI): naively gating on "sig basins >= 2" alone
+        # misclassified all 5 as POSSIBLY DISORDERED -- including myoglobin
+        # with funnel=0.66 (two-thirds of the trajectory in one basin). A
+        # real competing metastable state must have its own minimum within
+        # thermal reach (generously, 20kT) of the global minimum; clusters
+        # far above that are transient distortions/clashes encountered en
+        # route, not real alternate folds -- visiting one at >=5% Boltzmann
+        # weight would be physically impossible, so its presence just means
+        # DBSCAN geometrically fragmented one real basin.
+        #
+        # IDP: >=3 competitive basins AND e_spread < 5kT (flat landscape)
+        # POSSIBLY DISORDERED: >=2 competitive basins AND funnel < 0.7
+        # ORDERED: otherwise (single dominant basin, or other basins present
+        #          but not actually energetically competitive)
         kT  = 0.592          # kcal/mol at 300 K
+        COMPETITIVE_KT = 20  # generous thermal-reach cutoff for a real altnerate basin
         sig = [c for c in communities if len(c) >= 0.05 * N]
+
+        # "지배적" 분지 = 유의미한 분지 중 가장 인구가 많은 것 (에너지가 가장
+        # 낮은 단일 스냅샷이 속한 분지가 아니라). 안정 단백질에서는 보통 둘이
+        # 같은 분지를 가리키지만(진짜 우물이 인구도 가장 많고 에너지도 가장
+        # 낮다), 지배적 상태 자체가 없는 IDP에서는 "에너지 최솟값 하나"가
+        # 우연히 방문한 희귀 요동일 뿐일 수 있다 — 인구를 기준으로 삼아야
+        # 그런 경우에도 의미 있는 기준점이 된다.
+        #
+        # "Dominant" basin = the significant basin with the largest
+        # population, not the one containing the single lowest-energy
+        # snapshot. For a stable protein these usually coincide (the real
+        # well is both the most populated and the lowest-energy one), but
+        # for a protein with no dominant state (a real IDP), the single
+        # lowest-energy point can be a rare fluctuation rather than
+        # anything representative -- population is the more meaningful
+        # anchor either way.
+        best_comm = max(sig, key=len) if sig else max(communities, key=len)
+        funnel    = len(best_comm) / N
+        best_e    = min(float(energies[i]) for i in best_comm)
+
+        competitive = [c for c in sig
+                       if min(float(energies[i]) for i in c) - best_e
+                       < COMPETITIVE_KT * kT]
+
         e_spread = 0.0
-        if len(sig) > 1:
-            mins = [min(float(energies[i]) for i in c) for c in sig]
+        if len(competitive) > 1:
+            mins = [min(float(energies[i]) for i in c) for c in competitive]
             e_spread = float(max(mins) - min(mins))
 
-        best_comm  = min(communities,
-                         key=lambda c: min(float(energies[i]) for i in c))
-        funnel     = len(best_comm) / N
-
-        if len(sig) >= 3 and e_spread < 5 * kT:
+        if len(competitive) >= 3 and e_spread < 5 * kT:
             idp_label, idp_color = "IDP", "#dc2626"
-        elif len(sig) >= 2 or funnel < 0.5:
+        elif len(competitive) >= 2 and funnel < 0.7:
             idp_label, idp_color = "POSSIBLY DISORDERED", "#d97706"
         else:
             idp_label, idp_color = "ORDERED", "#16a34a"
 
         self.progress.emit(
-            f"  [LANDSCAPE] Done · {len(sig)} significant basins · "
+            f"  [LANDSCAPE] Done · {len(sig)} significant basins "
+            f"({len(competitive)} competitive) · "
             f"funnel={funnel:.2f} · {idp_label}")
+
+        # ── 동적 후보 탐색 (Dynamic sub-candidate picking) ────────────────
+        # 경쟁 분지가 있다는 것은 어느 특정 구간(예: 유비퀴틴의 유연한
+        # C-말단 꼬리)이 여러 형태를 취할 수 있다는 뜻이다. 그 구간을
+        # 짚어내고, 이미 충분히 샘플링됐는지(재사용) 아니면 더 탐색해야
+        # 하는지(전용 재탐색) — 혹은 둘 다인지(하이브리드) — 그 구간의
+        # 인구 비율과 크기로부터 그때그때 판단한다. 정적 규칙 하나로
+        # 고정하지 않는 이유: 이미 잘 샘플링된 분지를 다시 도는 것은
+        # 낭비고, 거의 방문되지 않은 작은 구간은 전용 탐색이 싸고 유용하며,
+        # 큰 구간은 전용 탐색이 비싸므로 기존 샘플에 의존하는 편이 낫다.
+        #
+        # Dynamic sub-candidate picking: a competitive basin means some
+        # specific region (e.g. ubiquitin's flexible C-terminal tail) can
+        # take on more than one shape. Pinpoint that region, then decide
+        # per-region whether the general landscape run already sampled it
+        # well enough (reuse), whether it's under-sampled and cheap to
+        # refine (dedicated re-search), or both (hybrid) -- based on how
+        # much of the trajectory already visited it and how large it is.
+        # Not a fixed rule: re-running a well-sampled basin wastes compute;
+        # a small, barely-visited region is cheap to refine directly; a
+        # large region makes a dedicated re-run expensive, so lean on what
+        # was already sampled instead.
+        sub_candidates = []
+        dom_idx = min(best_comm, key=lambda i: float(energies[i]))
+        dominant_particles = snapshots[dom_idx]
+
+        # ── 2차 구조 근사 (Secondary-structure abstraction) ───────────────
+        # 원자 좌표 대신 잔기별 나선/가닥/코일 범주로 분지를 비교한다 —
+        # 어떤 IDP 구간도 항상 라벨을 가지므로(외부 안정 구조 라이브러리와
+        # 맞출 필요가 없다), 순수 변위만으로는 못 잡는 "같은 위치가 나선에서
+        # 가닥으로 바뀜" 같은 범주적 차이까지 구간 표시에 반영한다.
+        # Compare basins by per-residue helix/strand/coil category instead
+        # of raw atom displacement -- every region always gets a label (no
+        # matching against an external stable-structure library needed),
+        # catching categorical changes (e.g. helix -> strand at the same
+        # position) that pure displacement alone would miss.
+        ss_dominant = None
+        if self.backbone_ncac is not None:
+            n_idx, ca_idx, c_idx = self.backbone_ncac
+            ss_dominant = _secondary_structure_string(dominant_particles, n_idx, ca_idx, c_idx)
+
+        if len(competitive) >= 2:
+            dom_vec = self._ca_vec(dominant_particles).reshape(-1, 3)
+            for c in competitive:
+                rep_idx = min(c, key=lambda i: float(energies[i]))
+                if rep_idx == dom_idx:
+                    continue
+                rep_vec = self._ca_vec(snapshots[rep_idx]).reshape(-1, 3)
+                if rep_vec.shape != dom_vec.shape:
+                    continue
+                # 원시 좌표를 그대로 비교하면 실제 형태 차이와 "형태는 같은데
+                # 절대 위치/방향만 다름"이 뒤섞인다 — 다중 분지 탐색에서는
+                # 서로 다른 시드에서 뻗어나가므로 이 문제가 특히 크다(레이어드
+                # 3D 뷰에서 이미 한 번 고친 것과 같은 종류의 버그). 비교 전에
+                # Kabsch 정렬로 절대 자세 차이를 제거한다.
+                # Comparing raw coordinates conflates real shape differences
+                # with "same shape, different absolute pose" -- especially
+                # bad with multi-branch exploration, since branches start
+                # from different seeds (the same class of bug already fixed
+                # once for the external layered 3D view). Kabsch-align first
+                # to remove pose differences before measuring shape change.
+                rep_vec = _kabsch_align_points(dom_vec, rep_vec)
+                disp = np.linalg.norm(rep_vec - dom_vec, axis=1)
+                # 절대 2A 문턱 대신, 이 분지 자체의 최대 변위에 상대적인 문턱을
+                # 쓴다 — PCA/DBSCAN은 잔기 전체에 걸쳐 흩어진 작은 변화(각
+                # 잔기는 2A를 넘지 않음)만으로도 두 구조를 구분해낼 수 있으므로,
+                # 절대 문턱은 실제 "경쟁 분지"를 자주 놓친다(실측: 유비퀴틴
+                # 재실행에서 2개 경쟁 분지가 있었는데도 0개 구간이 잡힘). 이
+                # 분지의 최대 변위의 절반(최소 1A)을 문턱으로 삼으면 그 분지를
+                # 구분 짓는 실제 원인 잔기를 항상 잡아내되, 변위가 전부 너무
+                # 작을 때는(모두 <1A) 여전히 아무 구간도 표시하지 않는다.
+                #
+                # Use a threshold relative to this basin's own peak
+                # displacement instead of a fixed 2A cutoff -- PCA/DBSCAN can
+                # tell two structures apart from small changes spread across
+                # many residues (none individually crossing 2A), so a fixed
+                # absolute cutoff often misses real competitive basins
+                # (observed: a ubiquitin re-run found 2 competitive basins
+                # but flagged 0 regions). Half of this basin's own peak
+                # displacement (floor 1A) always catches whatever residues
+                # actually drive the difference, while basins where nothing
+                # moves more than 1A still correctly flag nothing.
+                threshold = max(1.0, 0.5 * float(disp.max()))
+                flagged_set = set(np.flatnonzero(disp > threshold).tolist())
+
+                ss_diff_frac = 0.0
+                if ss_dominant is not None:
+                    ss_rep = _secondary_structure_string(
+                        snapshots[rep_idx], *self.backbone_ncac)
+                    ss_diff_frac = _ss_diff_fraction(ss_dominant, ss_rep)
+                    flagged_set |= {i for i in range(min(len(ss_dominant), len(ss_rep)))
+                                    if ss_dominant[i] != ss_rep[i]}
+
+                if not flagged_set:
+                    continue
+                region = (min(flagged_set), max(flagged_set))
+                region_size = region[1] - region[0] + 1
+                pop_frac = len(c) / N
+
+                strategy = self._pick_strategy(pop_frac, region_size)
+                self.progress.emit(
+                    f"  [LANDSCAPE] Competitive basin: {pop_frac*100:.0f}% pop, "
+                    f"residues {region[0]+1}-{region[1]+1} differ up to "
+                    f"{disp.max():.1f} A (SS diff {ss_diff_frac*100:.0f}%) -> {strategy}")
+
+                candidates = []
+                if strategy in ("reuse", "hybrid"):
+                    candidates += [
+                        {"particles": snapshots[i], "energy": float(energies[i]),
+                         "source": "landscape"} for i in c]
+                if strategy in ("dedicated", "hybrid"):
+                    candidates += self._dedicated_subsearch(snapshots[rep_idx])
+
+                # Keep the best (lowest-energy) candidates first for the UI picker.
+                candidates.sort(key=lambda d: d["energy"])
+                sub_candidates.append({
+                    "region": region, "population": float(pop_frac),
+                    "strategy": strategy, "energy": float(energies[rep_idx]),
+                    "ss_diff": float(ss_diff_frac),
+                    "candidates": candidates,
+                })
+
+        # ── 구조 풀 (Structural pool) ──────────────────────────────────────
+        # 지배적 상태가 없는 IDP라도, 그저 "무질서"라는 라벨 하나로 끝내지
+        # 않고 실제로 자주 나타나는(=인구 비율이 높은) 구조들의 순위 목록을
+        # 만든다 — 서브 구간과 별개로, 유의미한 분지 전부를 인구순으로.
+        # Even without a dominant state, an IDP still has a pool of
+        # frequently-occurring structures -- rank every significant basin
+        # by population (independent of the sub-region picking above),
+        # rather than collapsing everything down to just a disorder label.
+        basin_summary = []
+        for c in sig:
+            rep_idx = min(c, key=lambda i: float(energies[i]))
+            e_vals = [float(energies[i]) for i in c]
+            basin_summary.append({
+                "population": len(c) / N,
+                "energy_min": min(e_vals), "energy_max": max(e_vals),
+                "particles": snapshots[rep_idx],
+                "is_dominant": c is best_comm,
+            })
+        basin_summary.sort(key=lambda b: -b["population"])
 
         self.result.emit({
             "snapshots":    snapshots,
@@ -1369,7 +1722,49 @@ class LandscapeWorker(QThread):
             "e_spread":     float(e_spread),
             "idp_label":    idp_label,
             "idp_color":    idp_color,
+            "dominant_particles": dominant_particles,
+            "sub_candidates": sub_candidates,
+            "basin_summary": basin_summary,
         })
+
+    def _pick_strategy(self, pop_frac, region_size):
+        """Decide reuse vs. dedicated vs. hybrid for one competitive basin.
+
+        pop_frac: fraction of the N landscape snapshots already in this
+        basin (how well the general run already sampled it).
+        region_size: number of residues flagged as differing from the
+        dominant basin (a proxy for how expensive a focused re-run is).
+        """
+        if pop_frac >= 0.15:
+            return "reuse"          # already decently sampled, don't re-spend compute
+        if region_size <= 8:
+            return "dedicated" if pop_frac < 0.08 else "hybrid"
+        return "hybrid" if pop_frac >= 0.08 else "reuse"
+
+    def _dedicated_subsearch(self, seed_particles):
+        """Focused re-exploration seeded at a competitive basin's
+        representative conformation, run at a smaller angle/temperature
+        budget so it refines around that basin instead of wandering back to
+        the dominant one or elsewhere.
+
+        This is not a literal bond-restricted MC -- the C++ engine doesn't
+        expose a per-bond move mask, so building one would mean
+        re-implementing its adjacency/downstream-atom traversal in Python.
+        Seeding from the basin's own representative plus a tighter
+        temperature/max-angle achieves the same practical goal (denser
+        sampling of that specific alternate conformation) without new
+        native-extension work.
+        """
+        N_sub, S_sub = 40, 40
+        T_sub, angle_sub = self.T * 0.5, self.max_angle * 0.5
+        try:
+            snaps, energies = self.engine.run_landscape_trajectory(
+                seed_particles, self.topo, N_sub, S_sub, T_sub, angle_sub)
+        except Exception as ex:
+            self.progress.emit(f"  [LANDSCAPE] Dedicated sub-search failed: {ex}")
+            return []
+        return [{"particles": s, "energy": float(e), "source": "dedicated"}
+                for s, e in zip(snaps, energies)]
 
 # ═══════════════════════════════════════════════════════════════════
 #  Helper widgets
@@ -1434,6 +1829,10 @@ class ProteinApp(QMainWindow):
         self._ca_indices         = []
         self._landscape_snaps    = []
         self._landscape_energies = np.array([])
+        self._sub_candidates     = []
+        self._basin_summary      = []
+        self._landscape_dominant_particles = None
+        self._active_subcand     = None   # (region_idx, cand_idx) currently rendered
         self._rmsf               = None
         self._rmsf_residues      = []
         self._rmsf_n_disordered  = 0
@@ -1606,6 +2005,36 @@ class ProteinApp(QMainWindow):
         self.idp_status_lbl.setStyleSheet("font-size:10px;font-weight:bold;color:#94a3b8;margin-left:6px;")
         idp_h.addWidget(self.idp_status_lbl)
         lp_v.addWidget(idp_bar)
+
+        # Sub-region bar — populated when the landscape run finds a
+        # competitive alternate basin (see LandscapeWorker._pick_strategy).
+        # One row per flagged region, each with a picker for its
+        # sub-candidates (reused/dedicated/hybrid depending on how that
+        # basin was explored).
+        self._subregion_panel = QWidget()
+        self._subregion_panel.setStyleSheet(
+            "background:#fffbeb;border-bottom:1px solid #fde68a;")
+        self._subregion_v = QVBoxLayout(self._subregion_panel)
+        self._subregion_v.setContentsMargins(16, 4, 16, 4)
+        self._subregion_v.setSpacing(3)
+        self._subregion_panel.setVisible(False)
+        lp_v.addWidget(self._subregion_panel)
+        self._subregion_rows = []
+
+        # Structural pool bar — population-ranked list of every significant
+        # basin found, independent of the sub-region picker above. Exists
+        # even when there's no single dominant state (e.g. a real IDP):
+        # rather than collapsing everything to one disorder label, this
+        # shows what actually recurs and how often.
+        self._basinpool_panel = QWidget()
+        self._basinpool_panel.setStyleSheet(
+            "background:#eff6ff;border-bottom:1px solid #bfdbfe;")
+        self._basinpool_v = QVBoxLayout(self._basinpool_panel)
+        self._basinpool_v.setContentsMargins(16, 4, 16, 4)
+        self._basinpool_v.setSpacing(3)
+        self._basinpool_panel.setVisible(False)
+        lp_v.addWidget(self._basinpool_panel)
+        self._basinpool_rows = []
 
         # Matplotlib canvas
         self._landscape_fig = Figure(facecolor="#f8fafc", tight_layout=True)
@@ -2162,12 +2591,29 @@ class ProteinApp(QMainWindow):
         # positions are actually reachable from that most-likely state,
         # rather than from the unrelaxed starting coordinates. Falls back to
         # the raw parsed structure if no ensemble exists yet (defensive).
+        # 상위 K개 후보에서 각각 뻗어나가는 다중 분지 탐색 (Multi-branch
+        # exploration from the top-K candidates) — 안정 단백질에서는 진짜
+        # 우물 하나로 다 수렴하므로 사실상 단일 궤적과 다를 바 없지만,
+        # 지배적 상태가 없는 단백질(IDP)에서는 "최적" 후보 하나가 우연한
+        # 표본일 뿐일 수 있어 그 하나에서만 뻗으면 편향된다.
+        #
+        # Multi-branch exploration from the top-K candidates -- for a
+        # stable protein this converges to the same real well regardless
+        # (so it behaves like the old single-trajectory version), but for a
+        # protein with no dominant state (an IDP) the single "best"
+        # candidate can be close to an arbitrary sample, so branching from
+        # it alone biases the result.
         start_atoms = self._init_atoms
+        extra_seeds = []
         branch_note = ""
         if self._ensemble and self._energies:
-            best_idx = int(np.argmin(self._energies))
+            order = np.argsort(self._energies)
+            top_k = order[:min(3, len(order))]
+            best_idx = int(top_k[0])
             start_atoms = self._ensemble[best_idx]
-            branch_note = f" (branching from best candidate, {self._energies[best_idx]:.1f} kcal/mol)"
+            extra_seeds = [self._ensemble[int(i)] for i in top_k[1:]]
+            branch_note = (f" (branching from {len(top_k)} best candidates, "
+                            f"best={self._energies[best_idx]:.1f} kcal/mol)")
 
         self.landscape_start_btn.setEnabled(False)
         self.landscape_start_btn.setText("◈  COMPUTING…")
@@ -2184,8 +2630,14 @@ class ProteinApp(QMainWindow):
             self.landscape_start_btn.setText("◈  EXPLORE LANDSCAPE")
             return
 
+        backbone_ncac = None
+        if self._ref_ca_map and self._heavy_map and self._heavy_indices:
+            backbone_ncac = _backbone_ncac_indices(
+                self._ref_ca_map, self._heavy_map, self._heavy_indices)
+
         self._landscape_worker = LandscapeWorker(
-            ls_engine, start_atoms, self._ca_indices, self._topo, self._physics_mod)
+            ls_engine, start_atoms, self._ca_indices, self._topo, self._physics_mod,
+            extra_seeds=extra_seeds, backbone_ncac=backbone_ncac)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
         self._landscape_worker.gpu_fallback.connect(self._on_gpu_fallback)
@@ -2194,6 +2646,10 @@ class ProteinApp(QMainWindow):
     def _on_landscape_done(self, data):
         self._landscape_snaps    = data["snapshots"]
         self._landscape_energies = data["energies"]
+        self._landscape_dominant_particles = data.get("dominant_particles")
+        self._sub_candidates     = data.get("sub_candidates", [])
+        self._basin_summary      = data.get("basin_summary", [])
+        self._active_subcand     = None
         self.landscape_start_btn.setText("◈  RE-EXPLORE")
         self.landscape_start_btn.setEnabled(True)
         self.landscape_toggle_btn.setEnabled(True)
@@ -2204,6 +2660,8 @@ class ProteinApp(QMainWindow):
         self.idp_status_lbl.setStyleSheet(
             f"font-size:10px;font-weight:bold;color:{color};margin-left:6px;")
 
+        self._build_subregion_panel(self._sub_candidates)
+        self._build_basinpool_panel(self._basin_summary)
         self._draw_landscape(data)
 
         # Compute RMSF from trajectory and draw disorder profile
@@ -2219,6 +2677,224 @@ class ProteinApp(QMainWindow):
         self._log(f"[LANDSCAPE] Classification: {lbl}  ·  "
                   f"{data['n_sig']} metastable basins  ·  "
                   f"funnel={data['funnel']:.2f}")
+
+    # ── Sub-region / sub-candidate picker ──────────────────────────
+
+    def _build_subregion_panel(self, sub_candidates):
+        """(Re)build the sub-region bar from the landscape worker's dynamic
+        sub-candidate picking (see LandscapeWorker._pick_strategy). One row
+        per flagged region, each with a dropdown of that region's
+        sub-candidates (sourced from the general run, a dedicated
+        re-search, or both) and a VIEW button."""
+        for row in self._subregion_rows:
+            self._subregion_v.removeWidget(row); row.deleteLater()
+        self._subregion_rows.clear()
+
+        if not sub_candidates:
+            self._subregion_panel.setVisible(False)
+            return
+
+        for ri, region in enumerate(sub_candidates):
+            lo, hi = region["region"]
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+            lbl = QLabel(
+                f"REGION {lo+1}-{hi+1} &middot; {region['strategy']} &middot; "
+                f"{region['population']*100:.0f}% pop &middot; "
+                f"SS diff {region.get('ss_diff', 0)*100:.0f}% &middot; "
+                f"{len(region['candidates'])} sub-candidates")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setStyleSheet("color:#92400e;font-size:9px;letter-spacing:0.5px;")
+            h.addWidget(lbl)
+            combo = QComboBox()
+            combo.setFixedHeight(20)
+            combo.setStyleSheet("font-size:9px;")
+            for ci, cand in enumerate(region["candidates"]):
+                combo.addItem(f"#{ci+1}  {cand['energy']:.1f} kcal/mol "
+                              f"({cand['source']})")
+            h.addWidget(combo)
+            btn = QPushButton("VIEW")
+            btn.setFixedHeight(20)
+            btn.setStyleSheet(
+                "background:#7c3aed;color:#fff;border:none;border-radius:3px;"
+                "font-size:9px;padding:2px 10px;")
+            btn.clicked.connect(
+                lambda _, ri=ri, cb=combo: self._render_subcandidate(ri, cb.currentIndex()))
+            h.addWidget(btn)
+            h.addStretch()
+            self._subregion_v.addWidget(row)
+            self._subregion_rows.append(row)
+
+        self._subregion_panel.setVisible(True)
+
+    def _build_basinpool_panel(self, basin_summary):
+        """(Re)build the structural-pool bar: every significant basin found,
+        ranked by population, with a VIEW button per row. Populated even
+        when there's no single dominant state (a real IDP) -- the point is
+        showing what recurs and how often, not picking one reference."""
+        for row in self._basinpool_rows:
+            self._basinpool_v.removeWidget(row); row.deleteLater()
+        self._basinpool_rows.clear()
+
+        if not basin_summary:
+            self._basinpool_panel.setVisible(False)
+            return
+
+        for bi, basin in enumerate(basin_summary):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+            tag = " ★ DOMINANT" if basin.get("is_dominant") else ""
+            lbl = QLabel(
+                f"BASIN {bi+1} &middot; {basin['population']*100:.0f}% pop &middot; "
+                f"E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}]{tag}")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setStyleSheet("color:#1d4ed8;font-size:9px;letter-spacing:0.5px;")
+            h.addWidget(lbl)
+            h.addStretch()
+            btn = QPushButton("VIEW")
+            btn.setFixedHeight(20)
+            btn.setStyleSheet(
+                "background:#1d4ed8;color:#fff;border:none;border-radius:3px;"
+                "font-size:9px;padding:2px 10px;")
+            btn.clicked.connect(lambda _, bi=bi: self._render_basin(bi))
+            h.addWidget(btn)
+            self._basinpool_v.addWidget(row)
+            self._basinpool_rows.append(row)
+
+        self._basinpool_panel.setVisible(True)
+
+    def _render_basin(self, basin_idx):
+        if basin_idx >= len(self._basin_summary):
+            return
+        basin = self._basin_summary[basin_idx]
+        pdb_str = self._build_ca_pdb_str(basin["particles"])
+        n_atoms = len(basin["particles"])
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden; }}
+  #v {{ width:100vw;height:100vh; }}
+  #info {{ position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
+    letter-spacing:1px;color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0; }}
+  #legend {{ position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
+    letter-spacing:1px;color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0; }}
+</style></head><body>
+<div id="v"></div>
+<div id="info">BASIN {basin_idx + 1} &nbsp;&middot;&nbsp; \
+{basin['population']*100:.0f}% pop &nbsp;&middot;&nbsp; \
+E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
+{n_atoms} RESIDUES</div>
+<div id="legend"><span style="color:#1d4ed8">&#9632;</span> STRUCTURAL POOL BASIN</div>
+<script>
+(function(){{
+  var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
+  var m=v.addModel(`{pdb_str}`,"pdb");
+  m.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0,style:"trace"}},
+                    sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});
+  v.zoomTo(); v.zoom(0.85); v.render();
+  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+}})();
+</script></body></html>"""
+
+        self.viewer_cand_lbl.setText(
+            f'<span style="color:#1d4ed8;font-weight:bold;">BASIN {basin_idx+1}</span> '
+            f'· {basin["population"]*100:.0f}% pop')
+        self._set_html(html)
+        self._view_stack.setCurrentIndex(0)
+        self.view_mode_btn.setVisible(True)
+        self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+
+    def _build_ca_pdb_str(self, particles, transform=None):
+        """Cα-only synthetic PDB text, indexed the same way as the region
+        (lo, hi) tuples from LandscapeWorker (both derive from ca_indices in
+        the same order), so a flagged region maps directly onto residue
+        numbers here without needing a separate atom->residue lookup."""
+        lines = []
+        for i, pidx in enumerate(self._ca_indices):
+            if pidx >= len(particles):
+                continue
+            p = particles[pidx]
+            x, y, z = p.x, p.y, p.z
+            if transform is not None:
+                R, ref_c, mob_c = transform
+                x, y, z = (np.array([x, y, z]) - mob_c) @ R.T + ref_c
+            lines.append(
+                f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.50           C")
+        return "\n".join(lines)
+
+    def _render_subcandidate(self, region_idx, cand_idx):
+        if region_idx >= len(self._sub_candidates):
+            return
+        region = self._sub_candidates[region_idx]
+        cands  = region["candidates"]
+        if not cands:
+            return
+        cand_idx = max(0, min(cand_idx, len(cands) - 1))
+        cand = cands[cand_idx]
+        self._active_subcand = (region_idx, cand_idx)
+
+        dom_pdb = self._build_ca_pdb_str(self._landscape_dominant_particles)
+        sub_pdb = self._build_ca_pdb_str(cand["particles"])
+        dom_esc = dom_pdb.replace("\\", "\\\\").replace("`", "\\`")
+        sub_esc = sub_pdb.replace("\\", "\\\\").replace("`", "\\`")
+
+        lo, hi = region["region"]
+        resi_list = list(range(lo + 1, hi + 2))
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden; }}
+  #v {{ width:100vw;height:100vh; }}
+  #info {{ position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
+    letter-spacing:1px;color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0; }}
+  #legend {{ position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
+    letter-spacing:1px;color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0; }}
+</style></head><body>
+<div id="v"></div>
+<div id="info">SUB-CANDIDATE #{cand_idx + 1}/{len(cands)} &nbsp;&middot;&nbsp; \
+REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
+&nbsp;&middot;&nbsp; {cand['source']}</div>
+<div id="legend">OVERLAY &nbsp; <span style="color:#94a3b8">&#9632;</span> DOMINANT BASIN &nbsp;\
+<span style="color:#7c3aed">&#9632;</span> SUB-CANDIDATE &nbsp;\
+<span style="color:#dc2626">&#9632;</span> FLAGGED REGION</div>
+<script>
+(function(){{
+  var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
+  var mDom=v.addModel(`{dom_esc}`,"pdb");
+  mDom.setStyle({{}},{{cartoon:{{color:"#94a3b8",thickness:0.6,opacity:0.45,style:"trace"}},
+                      sphere:{{color:"#94a3b8",radius:0.4,opacity:0.4}}}});
+  var mSub=v.addModel(`{sub_esc}`,"pdb");
+  mSub.setStyle({{}},{{cartoon:{{color:"#7c3aed",thickness:0.8,opacity:0.9,style:"trace"}},
+                      sphere:{{color:"#7c3aed",radius:0.5,opacity:0.85}}}});
+  mSub.setStyle({{resi:{resi_list}}},{{cartoon:{{color:"#dc2626",thickness:1.0,opacity:1.0,style:"trace"}},
+                      sphere:{{color:"#dc2626",radius:0.65,opacity:1.0}}}});
+  v.zoomTo(); v.zoom(0.85); v.render();
+  setInterval(function(){{ v.rotate(1,'y'); v.render(); }},50);
+}})();
+</script></body></html>"""
+
+        self.viewer_cand_lbl.setText(
+            f'<span style="color:#7c3aed;font-weight:bold;">SUB-CANDIDATE</span> '
+            f'REGION {lo+1}-{hi+1} · #{cand_idx+1}/{len(cands)}')
+        self._set_html(html)
+        self._view_stack.setCurrentIndex(0)
+        self.view_mode_btn.setVisible(True)
+        self.landscape_toggle_btn.setText("◈  LANDSCAPE")
 
     def _draw_landscape(self, data):
         """Render the conformational graph on the matplotlib canvas.
