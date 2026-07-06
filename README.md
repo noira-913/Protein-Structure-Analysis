@@ -25,6 +25,7 @@ trajectories.
   - [Disulfide Bonds](#disulfide-bonds)
   - [Sequence-Based Disorder Prediction](#sequence-based-disorder-prediction)
   - [Structural Comparison](#structural-comparison)
+  - [Backbone Knot Topology Classification](#backbone-knot-topology-classification)
 - [Architecture](#architecture)
 - [Application Workflow](#application-workflow)
 - [Installation](#installation)
@@ -310,6 +311,52 @@ difference test, a per-residue confidence score in [0, 100]) is shown
 alongside the RMSD, giving a sense of how much weight to put on
 disagreements with the AlphaFold prediction in low-confidence regions.
 
+### Backbone Knot Topology Classification
+
+Two proteins can share nearly identical secondary/tertiary structure and
+still be **topologically distinct** — one's backbone trace forms a knot,
+the other doesn't — and that distinction carries real biological weight:
+knotted proteins fold via more constrained pathways (some depend on
+molecular chaperones that unknotted homologs don't need), resist mechanical
+unfolding and proteolytic degradation differently, and knot-related
+misfolding is implicated in some disease-linked proteins. ALMA classifies
+the Cα backbone trace's knot type using the same approach used by
+established protein-topology tools (KnotProt, Topoly):
+
+1. **Stochastic closure** — an open chain has no well-defined knot type on
+   its own, so both termini are extended out to a distant point along
+   independent random directions and joined, repeated across many trials
+   with majority voting. This avoids the well-known closure-direction bias
+   that a single arbitrary closure can introduce.
+2. **KMT reduction** (Koniaris–Muthukumar–Taylor) — repeatedly replaces a
+   vertex of the closed polygon with a direct chord to its neighbors
+   whenever that chord doesn't pass through any other part of the chain,
+   shrinking a polygon of hundreds/thousands of vertices down to a
+   minimal-vertex representative of the same knot type, entirely in 3D
+   (no projection-plane bias).
+3. **2D projection + crossing detection**, recording over/under strand
+   order from projection-axis depth at each crossing.
+4. **Wirtinger presentation → Alexander polynomial** — the knot group is
+   built from the crossings and reduced via Fox calculus to an Alexander
+   matrix; the Alexander polynomial is the determinant of an (n−1)×(n−1)
+   minor, extracted via roots-of-unity sampling + inverse FFT (a naive
+   Vandermonde-solve approach was found to be numerically unstable past
+   ~15 crossings).
+5. **Classification** against a small table of known Alexander
+   polynomials — currently the unknot, trefoil (3₁), and figure-eight
+   (4₁) are named with confidence; anything else is reported as
+   "unidentified" along with its crossing number and raw polynomial
+   rather than risk a mislabeled result.
+
+This is scoped to the Alexander polynomial only. The chirality-sensitive
+**Jones polynomial** (needs a Kauffman bracket recursion) and **Khovanov
+homology** (a fully categorified chain-complex invariant) are real,
+larger follow-up efforts, not yet implemented — see
+[Known Limitations](#known-limitations). Classification runs once per
+structure in `PipelineWorker`'s background thread, right after parsing
+(a few seconds, non-blocking), and is currently surfaced via the process
+log (no dedicated visualization panel yet).
+
 ---
 
 ## Architecture
@@ -347,6 +394,8 @@ Supporting Python modules:
   metal ion parameters, water residue-name set, united-atom charge
   correction for missing hydrogens.
 - `python/iupred.py` — sequence-based disorder predictor.
+- `python/knot_analysis.py` — backbone knot topology classification
+  (Alexander polynomial).
 
 The GPU extension is a separate build artifact from the CPU extension;
 it is not wired into `setuptools`, and the GUI degrades silently to the
@@ -452,7 +501,9 @@ src/main.cpp                  Minimal pybind11 example/sanity module
 python/gui_main.py            PyQt6 desktop application
 python/amber_params.py        AMBER ff14SB atom-type / charge / ion parameter tables
 python/iupred.py              Sequence-based disorder predictor
+python/knot_analysis.py       Backbone knot topology classification (Alexander polynomial)
 tests/bridge_test.py          Python↔C++ data bridge integrity tests
+tests/knot_test.py            Knot classification validation (synthetic + real proteins)
 tests/accuracy_test.py        Real-protein force-field accuracy validation (RCSB + AlphaFold)
 data/                         Cached/example PDB structures
 IMPROVEMENTS.md               Known limitations and implementation roadmap
@@ -488,6 +539,11 @@ items:
   preserve bond lengths and angles by construction, they always sit at
   their equilibrium values and contribute negligible energy under the
   current move set.
+- **Knot classification is Alexander-polynomial-only**: chirality
+  (left/right-handed knots) is indistinguishable without the Jones
+  polynomial, and only 3 knot types (unknot, 3₁, 4₁) are named
+  explicitly — deeper knots are reported as "unidentified" with their
+  correct-but-unnamed polynomial rather than a possibly-wrong label.
 
 ## References
 
@@ -502,3 +558,7 @@ items:
 - Mészáros, B. et al. (2018). *IUPred2A: context-dependent prediction of
   protein disorder as a function of redox state and protein binding*.
   Nucleic Acids Res. 46, W329–W337.
+- Koniaris, K., Muthukumar, M. (1991). *Self-entanglement in ring
+  polymers*. J. Chem. Phys. 95, 2873.
+- Alexander, J.W. (1928). *Topological invariants of knots and links*.
+  Trans. Amer. Math. Soc. 30, 275–306.

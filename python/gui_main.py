@@ -79,6 +79,7 @@ import protein_physics
 from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES, _NUCLEOTIDE_RESNAMES
 from amber_params import missing_hydrogen_charge as _amber_missing_h_charge
 import iupred as _iupred
+import knot_analysis as _knot
 
 
 def _app_base_dir():
@@ -906,6 +907,27 @@ class PipelineWorker(QThread):
                 return
             self.metrics.emit({"n_atoms": len(atoms), "threads": self.engine.num_threads()})
             self.progress.emit(f"  {len(atoms)} atoms · {self.engine.num_threads()} threads")
+
+            # ── 매듭 위상 분류 (Backbone knot topology, P5.1) ────────────────
+            # Calpha 궤적을 폐곡선으로 만들어 매듭 유형을 분류한다. 서열/구조와
+            # 무관하게 한 번만 계산하면 되므로 MC 실행 전, 백그라운드 스레드에서
+            # 수행한다(수 초 소요 — UI를 막지 않기 위해 워커 스레드에서 실행).
+            # Classify the Calpha trace's knot topology. Purely structural (not
+            # MC-dependent), so computed once here in the background worker
+            # thread before the MC run -- this can take a few seconds and must
+            # not block the UI.
+            self.progress.emit("  Classifying backbone topology (knot analysis)…")
+            try:
+                ca_coords = np.array(list(ca_map.values()), dtype=float)
+                knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=12)
+                self.progress.emit(
+                    f"  Topology: {knot_result.name} "
+                    f"({knot_result.crossing_number} crossings, "
+                    f"{knot_result.confidence*100:.0f}% closure-vote confidence)")
+            except Exception as ex:
+                self.progress.emit(f"  Topology classification skipped: {ex}")
+                knot_result = None
+
             self.progress.emit(
                 f"  Running MC: {self.n_cand} candidates × {self.steps} steps…")
             # ── GPU 런타임 실패 시 CPU로 자동 폴백 ───────────────────────────
@@ -944,7 +966,7 @@ class PipelineWorker(QThread):
             self.metrics.emit({"best_e": min(energies), "n_cand": self.n_cand})
             extra = {"iupred_scores": iupred_scores, "ca_residues": ca_residues,
                       "heavy_map": heavy_map, "heavy_indices": heavy_indices,
-                      "heavy_keys": heavy_keys}
+                      "heavy_keys": heavy_keys, "knot_result": knot_result}
             self.finished.emit(ensemble, energies, path, ca_indices, ca_map, atoms, topo, extra)
         except Exception as ex:
             self.error.emit(str(ex))
@@ -1402,6 +1424,7 @@ class ProteinApp(QMainWindow):
         self._rmsf_pct           = 0.0
         self._iupred_scores      = []
         self._ca_residues        = []
+        self._knot_result        = None
         self._ref_ca_map         = {}
         self._current_ext_entry  = None
         self._build_ui()
@@ -1775,6 +1798,7 @@ class ProteinApp(QMainWindow):
         # After landscape: dual-panel (IUPred top + RMSF bottom).
         self._iupred_scores  = extra.get("iupred_scores", [])
         self._ca_residues    = extra.get("ca_residues", [])
+        self._knot_result    = extra.get("knot_result")
         # 전체 중원자 RMSD용 데이터 (P10) — ComparisonWorker에 그대로 전달.
         # All-heavy-atom RMSD data (P10) — forwarded as-is to ComparisonWorker.
         self._heavy_map      = extra.get("heavy_map", {})

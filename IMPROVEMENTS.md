@@ -151,6 +151,53 @@ limitation of that test harness's alignment heuristic, not the physics engine.)*
   lowest-energy candidate from the initial pipeline run, so exploring the
   landscape reveals what conformational sub-states are reachable from the most
   likely structure, not from the unrelaxed input coordinates.
+- **Backbone knot topology classification (Alexander polynomial)** — motivated
+  by a club member's own knot-theory research writeup (matching Calpha traces
+  to knot types via Alexander/Jones polynomials, Khovanov homology).
+  Structurally similar proteins can be topologically distinct, with real (if
+  niche) biological relevance: chaperone dependence, mechanical unfolding
+  resistance, disease-linked misfolding in knotted proteins. `python/knot_analysis.py`
+  implements the standard protein-topology pipeline: (1) stochastic chain
+  closure — extend both termini out to a distant point along independent
+  random directions and join them, repeated across many trials with majority
+  voting, to avoid the well-known closure-direction bias in protein knot
+  detection; (2) KMT (Koniaris-Muthukumar-Taylor) triangle-elimination
+  reduction directly in 3D, shrinking a closed polygon of hundreds/thousands of
+  vertices down to a minimal-vertex representative of the same knot type with
+  no projection-plane bias; (3) generic 2D projection + crossing detection with
+  depth-based over/under assignment; (4) Wirtinger presentation of the knot
+  group from the crossings, reduced to an Alexander matrix via Fox calculus;
+  Alexander polynomial extracted as the determinant of an (n-1)×(n-1) minor,
+  computed by evaluating at roots of unity and inverse-FFT (a naive
+  Vandermonde-solve interpolation was tried first and found numerically
+  unstable past ~15 crossings; roots-of-unity sampling turns this into an
+  ordinary, stable DFT); (5) compared against a small table of known Alexander
+  polynomials — only the unknot, trefoil (3₁), and figure-eight (4₁) are named
+  with confidence; anything else is reported as "unidentified" with its
+  crossing number and raw polynomial rather than risk mislabeling from an
+  unverified tabulated value. Scoped to the Alexander polynomial only — the
+  chirality-sensitive Jones polynomial (needs a Kauffman bracket recursion) and
+  Khovanov homology (needs a fully categorified chain complex) are real,
+  separate follow-up efforts, not attempted here. Wired into `gui_main.py`:
+  `PipelineWorker.run()` classifies the Calpha trace's topology in the
+  background thread right after parsing (a few seconds, non-blocking) and logs
+  the result; stored in the `extra` dict and on `self._knot_result` for future
+  UI surfacing (no dedicated panel/plot yet — currently visible via the
+  existing process log). Validated three ways: synthetic parametric curves
+  with known ground truth (circle/trefoil/figure-eight, all correct across 25
+  random projection/closure trials each, despite the raw crossing count
+  varying widely trial to trial — exactly the invariance a working topological
+  invariant must show); real proteins with literature-known knot status (hen
+  egg-white lysozyme 1LYZ = unknot, YibK methyltransferase 1J85 = documented
+  deep trefoil, both correct at 97-100% closure-vote confidence,
+  `tests/knot_test.py`); and an end-to-end smoke test through the actual
+  `PipelineWorker.run()` path. Known limitation: only 3 knot types are named
+  explicitly; real knotted proteins occasionally have deeper knots (5₂, 6₁,
+  6₂, 6₃ documented in the literature) that this module currently reports as
+  "unidentified knot" with the correct Alexander polynomial rather than a
+  name — extending `KNOWN_KNOTS` needs exact tabulated Alexander polynomials
+  cross-checked against a reference (e.g. KnotInfo), deferred rather than
+  risking a wrong label.
 
 ### Performance
 - **O(N) cell-list neighbor search** — replaces the earlier O(N²) all-pairs scan;
