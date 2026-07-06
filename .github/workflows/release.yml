@@ -31,36 +31,37 @@ jobs:
       # PATH — a plain PowerShell shell on windows-latest doesn't set this
       # up by itself (that's normally vcvarsall.bat's job).
       #
-      # toolset is pinned to 14.3x: windows-latest has shipped a newer default
-      # MSVC (Visual Studio "18", toolset 14.51.x) than CUDA 12.4's nvcc
-      # supports -- host_config.h's version check fails with a FATAL
-      # "unsupported Microsoft Visual Studio version" error against it (CUDA
-      # 12.4 only supports MSVC 2017-2022, i.e. up to roughly the 14.3x/14.4x
-      # toolset generation). That fatal error was never caught here because
-      # build_cuda_extension() failing didn't fail this job, and a STALE,
-      # accidentally-committed protein_physics_cuda.cp312-win_amd64.pyd left
-      # over from an old commit (long since removed) satisfied the "does a
-      # .pyd exist" check below, silently shipping a years-stale (sm_75-only)
-      # CUDA extension in every release build since -- which fails at
-      # runtime on any newer GPU/driver with "the provided PTX was compiled
-      # with an unsupported toolchain." windows-latest ships multiple MSVC
-      # toolset generations side by side specifically for this kind of
-      # compatibility need; pinning here selects one nvcc actually supports.
+      # No toolset pin here (tried pinning to 14.3 first -- see git history --
+      # but windows-latest's current image only ships ONE MSVC toolset,
+      # 14.51.x (Visual Studio "18"), with no older side-by-side install to
+      # select; ilammy/msvc-dev-cmd failed outright with "Toolset directory
+      # for version '14.3' was not found."). The actual fix is bumping the
+      # CUDA toolkit version below instead -- see that step's comment.
       - name: Set up MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
-        with:
-          toolset: 14.3
 
       # windows-latest has no GPU, but nvcc doesn't need one to COMPILE —
       # only to run the resulting kernels. Installing the toolkit here lets
       # setup.py's find_cuda() detect it and build protein_physics_cuda
       # alongside the CPU extension; alma.spec bundles whichever
       # protein_physics*.pyd files exist at build time.
+      # 12.4.1 (the previous pin) is old enough that its nvcc hard-rejects
+      # windows-latest's current default MSVC (Visual Studio "18", toolset
+      # 14.51.x) with a FATAL "unsupported Microsoft Visual Studio version"
+      # error in host_config.h -- and since windows-latest's image doesn't
+      # ship an older toolset side by side to pin to instead (see the MSVC
+      # step above), the only real fix is a newer CUDA release whose nvcc
+      # actually supports this MSVC generation. 13.2.0 is this action's own
+      # documented default and matches the exact version already verified,
+      # extensively, against this repo's actual physics_engine_cuda.cu on a
+      # real Windows+CUDA dev machine (build succeeds, calculate_potential/
+      # generate_ensemble/run_landscape_trajectory all run correctly on an
+      # RTX 4070 -- see IMPROVEMENTS.md items #14/#18).
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         id: cuda-toolkit
         with:
-          cuda: "12.4.1"
+          cuda: "13.2.0"
           method: "network"
           sub-packages: '["nvcc", "cudart"]'
           use-github-cache: true

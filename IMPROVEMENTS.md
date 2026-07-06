@@ -420,22 +420,30 @@
      / `protein_physics_cuda.cp312-win_amd64.{pyd,exp,lib}` — these were
      never supposed to be tracked and were never rebuilt since being
      committed.
-  2. Pinned `ilammy/msvc-dev-cmd@v1`'s `toolset: 14.3` in `release.yml` —
-     `windows-latest` ships multiple MSVC toolset generations side by side
-     specifically so older toolchains like CUDA 12.4 can select a compatible
-     one instead of defaulting to the newest.
+  2. First tried pinning `ilammy/msvc-dev-cmd@v1`'s `toolset: 14.3` in
+     `release.yml`, assuming `windows-latest` ships multiple MSVC toolset
+     generations side by side. **Wrong** — re-running the workflow against
+     this fix immediately failed with `Toolset directory for version '14.3'
+     was not found`: the current `windows-latest` image only has the one
+     (newest, 14.51.x) toolset installed, nothing older to select. Reverted
+     the pin and instead bumped the CUDA toolkit itself from `12.4.1` to
+     `13.2.0` (this action's own documented default, and the exact version
+     already verified, extensively, against this repo's actual
+     `physics_engine_cuda.cu` on a real Windows+CUDA dev machine — see items
+     #14/this item's own re-verification below) — new enough that nvcc
+     supports the MSVC generation `windows-latest` actually ships.
   3. Hardened the verify step: it now checks the built `.pyd`'s
      `LastWriteTimeUtc` is after the build step actually started (catches
      any future stale-file masking the same way), and runs
      `cuobjdump --list-elf` to confirm all four expected architectures
      (`sm_75`/`86`/`89`/`90`) actually compiled, not just that *some* file
      with the right name exists.
-- Status: **DONE** for the fix; **not yet re-verified end-to-end** — this
-  needs a fresh tagged release build to confirm the pinned toolset lets
-  nvcc succeed and the hardened verify step passes with all 4 architectures
-  present. The item #17 CPU-fallback safety net stays regardless, since a
-  driver/toolchain mismatch on some future user's specific machine is still
-  possible even from a correctly-built extension.
+- Status: **DONE**, re-verification in progress — the `toolset: 14.3` attempt
+  was caught by actually re-running the workflow rather than assuming it
+  worked (see part 2 above); a fresh run against the CUDA 13.2.0 fix is
+  pending as of this writing. The item #17 CPU-fallback safety net stays
+  regardless, since a driver/toolchain mismatch on some future user's
+  specific machine is still possible even from a correctly-built extension.
 
 **19. Landscape exploration always branched from the raw parsed input, never from the MC-relaxed best candidate**
 - `_start_landscape()` always passed `self._init_atoms` — the unrelaxed,
