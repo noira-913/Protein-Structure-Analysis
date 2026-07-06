@@ -737,6 +737,11 @@ class PipelineWorker(QThread):
     #  finished() signal arity doesn't need to change — same precedent as iupred_scores.)
     finished = pyqtSignal(object, object, str, object, object, object, object, object)
     error    = pyqtSignal(str)
+    # Emitted when the GPU engine fails at runtime (not just at import/device-name
+    # time) and this worker fell back to CPU to finish the current analysis. The
+    # main window listens for this to permanently downgrade to the CPU engine for
+    # the rest of the session, so later analyses don't repeat the same failure.
+    gpu_fallback = pyqtSignal(str)
 
     def __init__(self, engine, target, physics_mod, n_cand=5, steps=300):
         super().__init__()
@@ -830,10 +835,39 @@ class PipelineWorker(QThread):
             self.progress.emit(f"  {len(atoms)} atoms · {self.engine.num_threads()} threads")
             self.progress.emit(
                 f"  Running MC: {self.n_cand} candidates × {self.steps} steps…")
-            ensemble = self.engine.generate_ensemble(
-                atoms, topo, self.n_cand, self.steps, 0.6, 0.12)
-            self.progress.emit("  Computing ensemble free energies…")
-            energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
+            # ── GPU 런타임 실패 시 CPU로 자동 폴백 ───────────────────────────
+            # _try_gpu_backend()은 앱 시작 시 device_name()이 성공하는지만 확인한다
+            # (임포트/디바이스 감지 확인일 뿐). 실제 커널 실행은 완전히 다른 실패
+            # 지점이다 — 예: 배포용 빌드가 이 머신의 드라이버가 지원하지 않는
+            # 툴체인으로 컴파일된 PTX를 포함하고 있으면, 파싱까지는 멀쩡히
+            # 끝나고 나서 generate_ensemble() 호출에서 처음으로 CUDA 오류가
+            # 터진다. 이런 실패로 전체 분석을 중단시키는 대신, CPU 엔진으로
+            # 다시 시도해 이번 실행만이라도 완료시킨다.
+            # _try_gpu_backend() only confirms device_name() succeeds at startup
+            # (import/device-detection only). The actual kernel launch is a
+            # completely separate failure point -- e.g. a distributed build's
+            # CUDA extension can contain PTX compiled by a toolchain this
+            # machine's driver doesn't support, which only surfaces here, well
+            # after parsing has already succeeded cleanly. Rather than letting
+            # that crash the whole analysis, fall back to the CPU engine and
+            # finish this run with it.
+            try:
+                ensemble = self.engine.generate_ensemble(
+                    atoms, topo, self.n_cand, self.steps, 0.6, 0.12)
+                self.progress.emit("  Computing ensemble free energies…")
+                energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
+            except Exception as ex:
+                if self.physics_mod is protein_physics:
+                    raise  # already on CPU -- nothing left to fall back to
+                self.progress.emit(f"  ⚠ GPU engine failed at runtime ({ex}) — falling back to CPU")
+                self.gpu_fallback.emit(str(ex))
+                self.physics_mod = protein_physics
+                self.engine = protein_physics.PhysicsEngine()
+                self.metrics.emit({"threads": self.engine.num_threads()})
+                ensemble = self.engine.generate_ensemble(
+                    atoms, topo, self.n_cand, self.steps, 0.6, 0.12)
+                self.progress.emit("  Computing ensemble free energies… (CPU)")
+                energies = [self.engine.calculate_potential(s, topo) for s in ensemble]
             self.metrics.emit({"best_e": min(energies), "n_cand": self.n_cand})
             extra = {"iupred_scores": iupred_scores, "ca_residues": ca_residues,
                       "heavy_map": heavy_map, "heavy_indices": heavy_indices,
@@ -1042,18 +1076,22 @@ class ComparisonWorker(QThread):
 class LandscapeWorker(QThread):
     progress = pyqtSignal(str)
     result   = pyqtSignal(dict)
+    # See PipelineWorker.gpu_fallback -- same runtime-failure/CPU-retry pattern,
+    # needed here too since this is the other long-running GPU MC call.
+    gpu_fallback = pyqtSignal(str)
 
     N_SNAPSHOTS    = 120   # total trajectory length
     STEPS_PER_SNAP = 80    # MC steps between each snapshot
 
-    def __init__(self, engine, init_atoms, ca_indices, topo, T=0.6, max_angle=0.12):
+    def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12):
         super().__init__()
-        self.engine     = engine
-        self.init_atoms = init_atoms
-        self.ca_indices = ca_indices
-        self.topo       = topo
-        self.T          = T
-        self.max_angle  = max_angle
+        self.engine      = engine
+        self.init_atoms  = init_atoms
+        self.ca_indices  = ca_indices
+        self.topo        = topo
+        self.physics_mod = physics_mod if physics_mod is not None else protein_physics
+        self.T           = T
+        self.max_angle   = max_angle
 
     def _ca_vec(self, particles):
         """Flatten Cα coordinates of one snapshot into a 1-D vector."""
@@ -1082,8 +1120,18 @@ class LandscapeWorker(QThread):
         # feedback: this call blocks until all N snapshots are done rather
         # than reporting every 20 snapshots, since the loop itself now lives
         # in C++.
-        snapshots, energies = self.engine.run_landscape_trajectory(
-            self.init_atoms, self.topo, N, S, self.T, self.max_angle)
+        try:
+            snapshots, energies = self.engine.run_landscape_trajectory(
+                self.init_atoms, self.topo, N, S, self.T, self.max_angle)
+        except Exception as ex:
+            if self.physics_mod is protein_physics:
+                raise  # already on CPU -- nothing left to fall back to
+            self.progress.emit(f"  ⚠ GPU engine failed at runtime ({ex}) — falling back to CPU")
+            self.gpu_fallback.emit(str(ex))
+            self.physics_mod = protein_physics
+            self.engine = protein_physics.PhysicsEngine()
+            snapshots, energies = self.engine.run_landscape_trajectory(
+                self.init_atoms, self.topo, N, S, self.T, self.max_angle)
         energies = np.array(energies, dtype=float)
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")
@@ -1304,10 +1352,10 @@ class ProteinApp(QMainWindow):
                             "letter-spacing:6px;padding:8px 0 2px 8px;")
         sub = QLabel("Atomistic Local Motion Analyzer")
         sub.setStyleSheet("color:#64748b;font-size:10px;letter-spacing:1px;padding:0 0 2px 8px;")
-        backend_lbl = QLabel(f"⚙  {self._backend}")
-        backend_lbl.setStyleSheet("color:#94a3b8;font-size:9px;letter-spacing:1px;padding:0 0 8px 8px;")
+        self.backend_lbl = QLabel(f"⚙  {self._backend}")
+        self.backend_lbl.setStyleSheet("color:#94a3b8;font-size:9px;letter-spacing:1px;padding:0 0 8px 8px;")
         sidebar.addWidget(title); sidebar.addWidget(sub)
-        sidebar.addWidget(backend_lbl); sidebar.addWidget(_sep())
+        sidebar.addWidget(self.backend_lbl); sidebar.addWidget(_sep())
 
         inp_panel = _panel()
         inp_v = QVBoxLayout(inp_panel)
@@ -1605,7 +1653,25 @@ class ProteinApp(QMainWindow):
         self.worker.metrics.connect(self._on_metrics)
         self.worker.finished.connect(self._on_done)
         self.worker.error.connect(self._on_error)
+        self.worker.gpu_fallback.connect(self._on_gpu_fallback)
         self.worker.start()
+
+    def _on_gpu_fallback(self, reason: str):
+        """The GPU engine failed at runtime (not just at startup detection) and
+        the worker already recovered by finishing its current run on the CPU.
+        Downgrade permanently for the rest of the session so later analyses
+        don't repeat the same failure and its multi-second retry delay."""
+        if self._physics_mod is protein_physics:
+            return
+        self._log(f"  GPU engine disabled for the rest of this session after a runtime "
+                   f"failure ({reason}). Restart the app to retry the GPU backend.")
+        self._physics_mod = protein_physics
+        try:
+            self.engine = protein_physics.PhysicsEngine()
+        except Exception:
+            pass
+        self._backend = "CPU (GPU disabled after runtime failure)"
+        self.backend_lbl.setText(f"⚙  {self._backend}")
 
     def _on_metrics(self, d):
         if "n_atoms"  in d: self._mv_atoms.setText(str(d["n_atoms"]))
@@ -1969,9 +2035,10 @@ class ProteinApp(QMainWindow):
             return
 
         self._landscape_worker = LandscapeWorker(
-            ls_engine, self._init_atoms, self._ca_indices, self._topo)
+            ls_engine, self._init_atoms, self._ca_indices, self._topo, self._physics_mod)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
+        self._landscape_worker.gpu_fallback.connect(self._on_gpu_fallback)
         self._landscape_worker.start()
 
     def _on_landscape_done(self, data):

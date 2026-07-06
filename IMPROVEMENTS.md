@@ -350,6 +350,43 @@
   non-pass (CI2) is a documented offset-search limitation, not an accuracy
   failure.
 
+**17. GPU runtime failures (as opposed to startup/import failures) crashed the whole analysis instead of falling back to CPU**
+- `_try_gpu_backend()` only confirms `device_name()` succeeds at app startup —
+  that only proves the CUDA extension imports and a device is visible. It says
+  nothing about whether a kernel launch will actually succeed later. Observed
+  directly: a distributed portable build (`ALMA.exe`, built by the release
+  workflow's CUDA 12.4 toolchain) parsed a real structure successfully, then
+  failed the moment `generate_ensemble()` actually launched a kernel:
+  `CUDA error the provided PTX was compiled with an unsupported toolchain.` —
+  a toolchain/driver PTX-compatibility mismatch, not a code bug in this repo,
+  but one this repo's error handling made unrecoverable: `PipelineWorker.run()`
+  had exactly one `except Exception` wrapping the entire pipeline, so any
+  failure at any stage — including one that only manifests on the specific
+  machine running the distributed binary, well after parsing already
+  succeeded — surfaced as a raw error string and killed the whole analysis.
+- Fix: `PipelineWorker.run()` and `LandscapeWorker.run()` (the two call sites
+  that actually launch GPU kernels — the initial ensemble/energy computation
+  and the landscape-exploration Markov chain) now catch exceptions from the
+  engine calls specifically. If the failing engine wasn't already the CPU one,
+  they instantiate a fresh `protein_physics.PhysicsEngine()` and retry the
+  same computation on CPU rather than aborting, emit a clear log message
+  explaining what happened, and emit a new `gpu_fallback` signal. The main
+  window listens for that signal and permanently downgrades
+  `self._physics_mod`/`self.engine` to CPU for the rest of the session (so
+  later analyses don't repeat the same multi-second failure-then-retry), and
+  updates the sidebar's backend label to say so.
+- Status: **DONE** — verified by simulating the exact failure (a fake GPU
+  engine whose `generate_ensemble()` raises the same `RuntimeError` text seen
+  in the field) through the real `PipelineWorker.run()` code path: parsing
+  succeeds, the simulated GPU call fails, the worker logs the fallback,
+  emits `gpu_fallback`, retries on CPU, and the `finished` signal fires
+  normally — the analysis completes instead of crashing. `tests/bridge_test.py`
+  still passes (no regression to the normal all-CPU or all-GPU paths). Does
+  NOT fix the underlying PTX/toolchain mismatch itself (that's an environment
+  issue on whichever machine runs a mismatched distributed build, not
+  something fixable from this repo's build flags alone) — only prevents it
+  from crashing the app.
+
 ---
 
 ## Implementation Roadmap
@@ -396,6 +433,9 @@ P1.9  physics_engine.cpp/physics_engine_cuda.cu — cap the (still         ✓ D
       near-threshold one
 P1.10 tests/accuracy_test.py — real-protein accuracy validation vs        ✓ DONE
       AlphaFold/RCSB ground truth (15 proteins, 14/15 pass; see item #16)
+P1.11 gui_main.py — PipelineWorker/LandscapeWorker fall back to CPU on    ✓ DONE
+      a GPU runtime (not just startup) failure instead of crashing the
+      whole analysis; see item #17
 ```
 
 ---
