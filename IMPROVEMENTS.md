@@ -437,6 +437,32 @@
   driver/toolchain mismatch on some future user's specific machine is still
   possible even from a correctly-built extension.
 
+**19. Landscape exploration always branched from the raw parsed input, never from the MC-relaxed best candidate**
+- `_start_landscape()` always passed `self._init_atoms` — the unrelaxed,
+  as-parsed structure — to `LandscapeWorker`, regardless of whether a
+  pipeline run had already produced an MC ensemble with a clearly better
+  (lower-energy) candidate. Requested directly by a user after noticing a
+  layered comparison for a real protein (human preproinsulin, P01308) had a
+  huge, real disagreement in a specific region (its known intrinsically
+  disordered C-peptide linker — see the session discussion in this file's
+  history/commit log around item #16-18 for the diagnostic that localized
+  it): if even the best candidate can have multiple accessible sub-states in
+  a flexible region, exploring FROM that best candidate — not from the raw,
+  unrelaxed input — is what actually reveals which positions are reachable
+  from the most likely structure.
+- Fix: `_start_landscape()` now uses the lowest-energy candidate from
+  `self._ensemble`/`self._energies` (the same `np.argmin(energies)` pattern
+  already used elsewhere in this file for the "best candidate" concept — see
+  `_render`, the VIEW-button handlers) as the landscape trajectory's starting
+  structure, logging which candidate and energy it branched from. Falls back
+  to the raw parsed structure only if no ensemble exists yet (defensive,
+  shouldn't normally trigger since the button is disabled until a pipeline
+  run completes).
+- Status: **DONE** — verified that the best candidate is a genuinely
+  different, relaxed structure from the raw parse (nonzero coordinate
+  distance) via a headless `PipelineWorker` smoke test on 1LYZ;
+  `tests/bridge_test.py` still passes (no regression).
+
 ---
 
 ## Implementation Roadmap
@@ -491,6 +517,8 @@ P1.12 .github/workflows/release.yml + removed stale tracked cp312        ✓ DON
       12.4 vs. windows-latest's default MSVC, masked for ~1 month by an
       accidentally-committed stale .pyd; see item #18. Needs a fresh
       tagged release to re-verify end-to-end.
+P1.13 gui_main.py — landscape exploration branches from the best MC       ✓ DONE
+      candidate instead of the raw parsed input; see item #19.
 ```
 
 ---

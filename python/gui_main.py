@@ -2019,11 +2019,34 @@ class ProteinApp(QMainWindow):
             return
         if self._landscape_worker is not None and self._landscape_worker.isRunning():
             return
+
+        # ── 최적 후보에서 분지 탐색 (Branch exploration from the best candidate) ──
+        # 원본 파싱 구조가 아니라, MC 앙상블에서 가장 낮은 에너지를 가진(=가장
+        # 그럴듯한) 후보를 지형 탐색의 시작점으로 사용한다. 최적 후보라 해도
+        # 유연한 영역(예: 무질서 링커)에서는 그 자체로 여러 준안정 상태를
+        # 가질 수 있으므로, 그 후보에서부터 분지시켜 실제로 어떤 위치들이
+        # 가능한지 보여준다. 앙상블이 아직 없으면(방어적으로) 원본 파싱
+        # 구조로 폴백한다.
+        #
+        # Branch from the best (lowest-energy) MC candidate, not the raw
+        # parsed input -- that candidate is the "most likely" structure, but
+        # even it can have several accessible sub-states in flexible regions
+        # (e.g. a disordered linker). Exploring from there reveals what
+        # positions are actually reachable from that most-likely state,
+        # rather than from the unrelaxed starting coordinates. Falls back to
+        # the raw parsed structure if no ensemble exists yet (defensive).
+        start_atoms = self._init_atoms
+        branch_note = ""
+        if self._ensemble and self._energies:
+            best_idx = int(np.argmin(self._energies))
+            start_atoms = self._ensemble[best_idx]
+            branch_note = f" (branching from best candidate, {self._energies[best_idx]:.1f} kcal/mol)"
+
         self.landscape_start_btn.setEnabled(False)
         self.landscape_start_btn.setText("◈  COMPUTING…")
         self.idp_status_lbl.setText("…")
         self.idp_status_lbl.setStyleSheet("font-size:10px;font-weight:bold;color:#d97706;")
-        self._log("[LANDSCAPE] Starting Markov-chain exploration…")
+        self._log(f"[LANDSCAPE] Starting Markov-chain exploration{branch_note}…")
 
         # Fresh engine instance to avoid thread contention with ComparisonWorker
         try:
@@ -2035,7 +2058,7 @@ class ProteinApp(QMainWindow):
             return
 
         self._landscape_worker = LandscapeWorker(
-            ls_engine, self._init_atoms, self._ca_indices, self._topo, self._physics_mod)
+            ls_engine, start_atoms, self._ca_indices, self._topo, self._physics_mod)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
         self._landscape_worker.gpu_fallback.connect(self._on_gpu_fallback)
