@@ -678,6 +678,42 @@ ION_PARAMS: dict[str, tuple[float, float, float]] = {
 #   SOL  — GROMACS water
 _WATER_RESNAMES: frozenset[str] = frozenset({"HOH", "WAT", "H2O", "TIP", "TIP3", "SOL"})
 
+# ── 핵산 잔기 (Nucleic acid residues) ─────────────────────────────────────────
+# DNA/RNA 잔기는 PDB 파일에서 표준 ATOM 레코드로 기록되는 경우가 많아
+# (HETATM 레코드가 아님), 그냥 넘어가면 표준 아미노산인 것처럼 파싱된다.
+# bond_templates()는 아미노산 20종만 알고 있으므로 이런 잔기는 공유 결합이
+# 하나도 등록되지 않고, 실제 ~1.5 Å 공유 결합(당-인산 백본)이 전부 비결합
+# 접촉으로 채점되어 수백만~수십억 kcal/mol의 허구적 척력 에너지가 발생한다
+# (item #13/#15/#18과 동일한 버그 부류 — 이번엔 파싱 공백이 아니라 핵산이
+# 원인). 실제 사례: SWISS-MODEL이 Sso7d(P39476)의 최적 템플릿으로 단백질-DNA
+# 복합체 결정구조(1bnz)를 골라, 결합된 DNA 이중나선을 결과 좌표 파일에 그대로
+# 남겨둔 경우 (calculate_potential() = 26,803,516.4 kcal/mol로 관측됨).
+# 이 도구는 단백질 구조 분석기이며 핵산 힘장 파라미터를 지원하지 않으므로,
+# 핵산 잔기는 물처럼 조용히 건너뛴다.
+#
+# Nucleic acid residues are frequently recorded as standard ATOM records in
+# PDB files (not HETATM), so without this check they'd be parsed as if they
+# were standard amino acids. bond_templates() only knows the 20 amino acids,
+# so no covalent bonds get registered for them, and every real ~1.5 Å
+# covalent bond (sugar-phosphate backbone) gets scored as a non-bonded
+# contact -- producing a spurious multi-million-to-billion kcal/mol
+# repulsive energy (the same bug class as items #13/#15/#18, just triggered
+# by nucleic acids instead of a parsing gap). Observed directly: SWISS-MODEL
+# picked a protein-DNA co-crystal (1bnz) as Sso7d's (P39476) best template
+# and left the bound DNA duplex in the output coordinate file, producing
+# calculate_potential() = 26,803,516.4 kcal/mol for what should have been a
+# ~64-residue protein-only reference structure. This tool has no nucleic
+# acid force field support, so these residues are silently skipped, the same
+# way water is.
+#   DA/DC/DG/DT/DI  — DNA nucleotides (deoxy-adenine/cytosine/guanine/
+#                      thymine/inosine)
+#   A/C/G/U/I       — RNA nucleotides (single-letter; unambiguous in this
+#                      context since standard amino acids always use 3-letter
+#                      codes)
+_NUCLEOTIDE_RESNAMES: frozenset[str] = frozenset({
+    "DA", "DC", "DG", "DT", "DI", "A", "C", "G", "U", "I",
+})
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_atom_params(resname: str, atomname: str) -> tuple[float, float, float]:

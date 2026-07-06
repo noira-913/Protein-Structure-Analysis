@@ -76,7 +76,7 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import protein_physics
-from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES
+from amber_params import get_atom_params as _amber_get_params, ION_PARAMS, _WATER_RESNAMES, _NUCLEOTIDE_RESNAMES
 import iupred as _iupred
 
 
@@ -349,6 +349,21 @@ def _parse_pdb(path, log, physics_mod):
         # implicit-solvent 모델에서 명시적 물은 불필요하고 계산 비용만 증가시킴.
         # Drop water molecules — counterproductive with our implicit-solvent model.
         if het_flag != " " and resname in _WATER_RESNAMES:
+            continue
+
+        # ── 핵산 잔기 제거 ────────────────────────────────────────────────────
+        # DNA/RNA는 표준 ATOM 레코드로 기록되는 경우가 많아 het_flag만으로는
+        # 걸러지지 않는다. amber_params._NUCLEOTIDE_RESNAMES의 주석 참고 —
+        # 실제로 SWISS-MODEL이 단백질-DNA 복합체를 템플릿으로 골라 결합된 DNA를
+        # 결과 파일에 남겨둔 사례에서 발견됨 (calculate_potential()이
+        # 수천만 kcal/mol로 폭주).
+        # Drop nucleic acid residues — often standard ATOM records, not HETATM,
+        # so the water check above doesn't catch them. See the comment on
+        # amber_params._NUCLEOTIDE_RESNAMES — found via a real case where
+        # SWISS-MODEL picked a protein-DNA co-crystal as its best template and
+        # left the bound DNA in the output file (calculate_potential() blew up
+        # to tens of millions of kcal/mol).
+        if resname in _NUCLEOTIDE_RESNAMES:
             continue
 
         # ── 좌표 유효성 검사 ──────────────────────────────────────────────────

@@ -492,6 +492,44 @@
   distance) via a headless `PipelineWorker` smoke test on 1LYZ;
   `tests/bridge_test.py` still passes (no regression).
 
+**20. Nucleic acid residues in a reference structure get parsed as if they were unrecognized protein residues, causing the same billions-of-kcal/mol blowup as items #13/#15/#18 — just from a different source**
+- Found via a real user session: comparing MC candidates for Sso7d (a DNA-
+  binding archaeal protein, UniProt P39476) against its SWISS-MODEL homology
+  reference showed `calculate_potential() = 26,803,516.4 kcal/mol` for the
+  reference structure — the layered 3D view showed why: a tan double helix
+  (DNA) tangled through the blue protein candidate. SWISS-MODEL had picked a
+  protein-DNA co-crystal (PDB template `1bnz`, `gmqe=0.758` — the best-
+  scoring template for this query) and, as that template naturally
+  includes the DNA duplex Sso7d was crystallized bound to, left that DNA
+  (chains B/C, residues `DA`/`DC`/`DG`/`DT`) in the output coordinate file
+  alongside the modeled protein chain and some water.
+- Root cause: `_parse_pdb`'s water filter only fires when
+  `het_flag != " "` (i.e. a HETATM record), but nucleic acid residues in
+  this file were recorded as standard **ATOM** records (994 ATOM + 99
+  HETATM, the HETATM count matching just the waters) — so they sailed
+  straight past that check and were parsed as if they were ordinary protein
+  residues. `BondTopology`'s `bond_templates()` only knows the 20 standard
+  amino acids, so none of the DNA's real covalent bonds (~1.5 Å
+  sugar-phosphate backbone) got registered or excluded — every one of them
+  got scored as a non-bonded contact instead, at exactly the same
+  `HARD_SCALE`/`HARD_CAP`-driven magnitude as items #13/#15/#18's clash
+  blowups, just triggered by nucleic acids sneaking through the parser
+  rather than a missing terminal/protonation-variant bond patch.
+- Fix: added `amber_params._NUCLEOTIDE_RESNAMES` (`DA`/`DC`/`DG`/`DT`/`DI`
+  for DNA, `A`/`C`/`G`/`U`/`I` for RNA — unambiguous here since standard
+  amino acids always use 3-letter PDB codes, never single letters) and
+  skip any residue matching it in `_parse_pdb`, the same way water residues
+  are already skipped. This tool has no nucleic acid force field support,
+  so silently dropping them (rather than trying to parameterize them) is
+  the correct behavior — same policy as water.
+- Status: **DONE** — re-parsing the actual SWISS-MODEL file that triggered
+  this (`SM_P39476.pdb`, fetched fresh from `swissmodel.expasy.org`) now
+  gives 640 protein-only heavy atoms (was 1093 including the DNA duplex and
+  waters), 64 Cα residues (exactly matching Sso7d's known 64-residue
+  sequence), and `calculate_potential() = 569.6` kcal/mol (8.9 kcal/mol/atom
+  — squarely in the "thousands, not millions" range every other test
+  protein in this file lands in). `tests/bridge_test.py` still passes.
+
 ---
 
 ## Implementation Roadmap
@@ -548,6 +586,11 @@ P1.12 .github/workflows/release.yml + removed stale tracked cp312        ✓ DON
       tagged release to re-verify end-to-end.
 P1.13 gui_main.py — landscape exploration branches from the best MC       ✓ DONE
       candidate instead of the raw parsed input; see item #19.
+P1.14 amber_params.py/gui_main.py — skip nucleic acid residues in         ✓ DONE
+      _parse_pdb (were sneaking through as unrecognized "protein"
+      residues, causing another billions-of-kcal/mol blowup for
+      reference structures that include co-crystallized DNA/RNA); see
+      item #20.
 ```
 
 ---
