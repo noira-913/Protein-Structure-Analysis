@@ -340,7 +340,13 @@ def _parse_pdb(path, log, physics_mod):
     # HETATM residues get isolated large indices (≥100 000) — no adjacency to ATOM residues.
     residue_id_map: dict[tuple, int] = {}
 
-    for atom in st.get_atoms():
+    # 첫 번째 MODEL만 사용 — NMR 앙상블(다중 모델) 파일을 st.get_atoms()로 순회하면
+    # 모든 모델의 원자가 합쳐져 구조가 수십 배로 중복된다 (_ca_map_from_pdb 등 다른
+    # 파서 헬퍼들과 동일한 규칙).
+    # First MODEL only — st.get_atoms() would otherwise walk every model in an NMR
+    # ensemble file, duplicating the whole structure ~N-fold (same rule already
+    # applied in _ca_map_from_pdb/_heavy_map_from_pdb/_ca_residues_from_pdb).
+    for atom in st[0].get_atoms():
         res      = atom.get_parent()
         # BioPython 잔기 플래그: ' '=표준AA, 'H_xxx'=HETATM, 'W'=물
         # BioPython residue flag: ' '=standard AA, 'H_xxx'=HETATM, 'W'=water
@@ -1560,8 +1566,24 @@ class LandscapeWorker(QThread):
         # ORDERED: otherwise (single dominant basin, or other basins present
         #          but not actually energetically competitive)
         kT  = 0.592          # kcal/mol at 300 K
-        COMPETITIVE_KT = 20  # generous thermal-reach cutoff for a real altnerate basin
-        sig = [c for c in communities if len(c) >= 0.05 * N]
+        # 20kT를 76잔기(유비퀴틴) 기준으로 놓고 sqrt(n_res)로 스케일한다 — 에너지는
+        # 원자 수에 비례해 늘어나지만, 정상적인 열 요동으로 인한 "퍼짐"은 서로
+        # 약하게 상관된 자유도의 합이므로 sqrt(n_res)로 커진다(중심극한정리형
+        # 논리). 고정 상수 하나로는 76잔기 유비퀴틴에서 맞던 컷오프가 140잔기
+        # 알파-시누클레인(실제 IDP, 1XQ8)에서는 너무 빡빡해 진짜 경쟁 분지
+        # (기저상태 대비 +13.8 kcal/mol, 인구 22%)까지 걸러내 버렸다.
+        # Scale 20kT (calibrated against 76-residue ubiquitin) by sqrt(n_res) --
+        # energy grows with atom count, but the *spread* from ordinary thermal
+        # jitter is a sum over weakly-correlated degrees of freedom, so it grows
+        # as sqrt(n_res) (central-limit-type argument), not linearly and not at
+        # all. A single flat constant, tuned against 76-residue ubiquitin, was
+        # too tight for the 140-residue real IDP case (1XQ8): it excluded a
+        # genuinely real, well-populated (22%) alternate basin sitting only
+        # 13.8 kcal/mol above the global minimum.
+        n_res = max(1, len(self.ca_indices))
+        COMPETITIVE_KT = 20 * (n_res / 76) ** 0.5
+        SIG_FLOOR = 0.05    # "유의미한 분지"로 치는 최소 인구 비율 / min population fraction to count as a significant basin
+        sig = [c for c in communities if len(c) >= SIG_FLOOR * N]
 
         # "지배적" 분지 = 유의미한 분지 중 가장 인구가 많은 것 (에너지가 가장
         # 낮은 단일 스냅샷이 속한 분지가 아니라). 안정 단백질에서는 보통 둘이
@@ -1580,11 +1602,85 @@ class LandscapeWorker(QThread):
         # anchor either way.
         best_comm = max(sig, key=len) if sig else max(communities, key=len)
         funnel    = len(best_comm) / N
-        best_e    = min(float(energies[i]) for i in best_comm)
+
+        # 경쟁 분지는 "지배적 분지"가 아니라 전역 최저 에너지 대비 열적으로
+        # 도달 가능한지로 판정해야 한다. 지배적 분지 자체의 최솟값을 기준으로
+        # 삼으면 비대칭 버그가 생긴다: 지배적 분지보다 에너지가 낮은 분지는
+        # (얼마나 낮든) 항상 통과해 버려서 실제로는 서로 수백 kcal/mol 떨어진
+        # 분지들까지 "경쟁"으로 잘못 집계됐다 (1UBQ 보정 실행에서 확인:
+        # e_spread가 96~223으로 나왔는데, 정의상 20kT(~11.84) 이내여야 함).
+        #
+        # Competitive basins must be judged against the true global minimum,
+        # not the dominant basin's own minimum. Using the dominant basin's min
+        # as the reference is asymmetric: any basin with LOWER energy than the
+        # dominant one always passes, no matter how much lower -- which let
+        # basins hundreds of kcal/mol apart get counted as "competitive"
+        # (confirmed via the 1UBQ calibration run: e_spread came out as
+        # 96-223, when by definition it should be bounded by ~20kT ≈ 11.84).
+        #
+        # 전체 스냅샷(잡음점 포함)이 아니라 유의미한 분지(sig)들의 최솟값 중
+        # 최소를 기준으로 삼는다 — 어느 분지에도 속하지 못한 잡음/과도 상태
+        # 스냅샷 하나가 우연히 아주 낮은 에너지를 찍었다면, 그 하나 때문에
+        # 기준점 자체가 비현실적으로 낮아져 진짜 분지들이 전부 "경쟁 불가"로
+        # 밀려날 수 있다.
+        # Anchor to the lowest minimum among significant basins only, not all
+        # pooled snapshots (which include DBSCAN noise/transient points). A
+        # single transient snapshot that never formed a persistent basin can
+        # dip below any real basin's minimum by chance, which would drag the
+        # reference point down and make every real basin look "too far" away.
+        global_best_e = min(min(float(energies[i]) for i in c) for c in sig)
+
+        # 에너지 갭 기준만으로는 놓치는 경우가 있다 — 인구가 많은 분지라도
+        # 짧은 샘플링에서 우연히 최저점을 못 찍었을 수 있다(1XQ8 보정에서
+        # 확인: 33% 인구 분지의 최솟값이 전역 최솟값보다 502 kcal/mol이나
+        # 높았다). 그래서 인구 비율 기준을 OR로 추가한다: 지배적 분지 인구의
+        # 25% 이상을 차지하면 그 자체로 "경쟁"으로 인정한다. kT 기반 자유
+        # 에너지 공식(-kT·ln(비율))은 시도해봤지만 kT=0.592가 너무 작아
+        # sig 필터(≥5% 인구)를 통과한 분지는 사실상 전부 자동으로 통과해
+        # 버려 아무 것도 걸러내지 못했다 — 그래서 비율을 직접 비교한다.
+        #
+        # The energy-gap criterion alone misses real cases: a heavily-
+        # populated basin can simply not have sampled its lowest point yet
+        # under short branches (confirmed on 1XQ8: a 33%-populated basin's own
+        # minimum sat 502 kcal/mol above the true global minimum). So OR in a
+        # population-ratio criterion. (A kT-scaled free-energy formula,
+        # -kT*ln(ratio), was tried first and rejected: kT=0.592 is so small
+        # that any basin passing the 5%-of-N "sig" filter already trivially
+        # satisfies it, making it a no-op filter.)
+        #
+        # A flat ratio of the dominant basin's raw population ("needs >=25% of
+        # what the dominant has") was tried next and also rejected: it
+        # degenerates whenever the dominant itself is only modestly ahead
+        # (common in exactly the flat, borderline-disordered landscapes this
+        # is meant to catch) -- e.g. dominant=17% * 25% = 4.25%, which sits
+        # *below* the 5% SIG_FLOOR already required to be "significant" at
+        # all, making the test a no-op in the other direction (everything that
+        # survived `sig` passes automatically). Confirmed on real data: 1UBQ
+        # and 1LYZ (both genuinely ordered) both flipped to POSSIBLY DISORDERED
+        # with 8/9 and 4/5 basins respectively counted "competitive".
+        #
+        # 지배적 분지의 원래 인구 비율(예: 25%)로 고정하면 지배적 분지 자체의
+        # 인구가 낮을 때(평탄하고 무질서에 가까운 지형에서 흔함) 문턱이
+        # SIG_FLOOR보다도 낮아져 아무 것도 걸러내지 못한다. 대신 지배적 분지가
+        # "잡음 문턱(SIG_FLOOR) 위로 얼마나 튀어나와 있는지" 그 초과분의
+        # 비율로 판단한다 — 지배적 분지가 문턱에 가까울수록(평탄한 지형) 다른
+        # 분지에 요구하는 인구도 함께 낮아지고, 지배적 분지가 뚜렷할수록
+        # (뾰족한 지형) 요구치도 함께 높아진다.
+        # Instead, scale relative to how far the dominant basin sits *above*
+        # SIG_FLOOR (its "excess"), not its raw population -- this is what
+        # actually adapts to the shape of the landscape: when the dominant is
+        # only barely above the noise floor (a flat, disorder-leaning
+        # landscape), the bar for a competitor drops right along with it; when
+        # the dominant is sharply peaked, the bar rises correspondingly.
+        POP_RATIO_THRESHOLD = 0.4
+        pop_dominant   = len(best_comm) / N
+        pop_threshold  = SIG_FLOOR + POP_RATIO_THRESHOLD * (pop_dominant - SIG_FLOOR)
 
         competitive = [c for c in sig
-                       if min(float(energies[i]) for i in c) - best_e
-                       < COMPETITIVE_KT * kT]
+                       if c is not best_comm
+                       and (min(float(energies[i]) for i in c) - global_best_e
+                            < COMPETITIVE_KT * kT
+                            or (len(c) / N) >= pop_threshold)]
 
         e_spread = 0.0
         if len(competitive) > 1:
