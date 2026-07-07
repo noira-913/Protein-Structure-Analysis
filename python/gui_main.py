@@ -66,7 +66,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QSplitter, QGridLayout, QScrollArea, QStackedWidget,
     QComboBox,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRunnable, QThreadPool
 from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -1325,6 +1325,60 @@ class ComparisonWorker(QThread):
         self.progress.emit(f"  [CMP] Done — {len(results)} sources")
         self.result.emit(results)
 
+class _LandscapeBranchRunnable(QRunnable):
+    """Runs one landscape MC branch on its own fresh PhysicsEngine instance.
+
+    Not safe to share a single engine instance across concurrently-running
+    branches -- the CPU engine keeps one mutable member (a single mt19937
+    RNG) that every MC step reads and writes, so two branches racing on the
+    same instance would corrupt each other's random stream. Constructing an
+    engine is cheap (trivial on CPU; the CUDA ctor just checks device count),
+    so each branch gets its own rather than sharing one.
+
+    Writes its result into `results[bi]` as (snapshots, energies, error):
+    - success: (snaps, ens, None)
+    - GPU call failed, fell back to CPU successfully: (snaps, ens, <the GPU
+      exception>) -- snaps/ens are populated from the CPU retry, but the
+      original exception is kept so the caller knows a fallback happened.
+    - fatal (already on CPU, or the CPU retry also failed): (None, None, ex)
+
+    Each `results[bi]` slot is written by exactly one runnable, so no lock is
+    needed -- the caller only reads the list after `QThreadPool.waitForDone()`.
+    """
+    def __init__(self, bi, seed, topo, n_snapshots, steps_per_snap, T, max_angle,
+                 physics_mod, results):
+        super().__init__()
+        self.bi = bi
+        self.seed = seed
+        self.topo = topo
+        self.n_snapshots = n_snapshots
+        self.steps_per_snap = steps_per_snap
+        self.T = T
+        self.max_angle = max_angle
+        self.physics_mod = physics_mod
+        self.results = results
+
+    def run(self):
+        try:
+            engine = self.physics_mod.PhysicsEngine()
+            snaps, ens = engine.run_landscape_trajectory(
+                self.seed, self.topo, self.n_snapshots, self.steps_per_snap,
+                self.T, self.max_angle)
+            self.results[self.bi] = (snaps, ens, None)
+        except Exception as ex:
+            if self.physics_mod is protein_physics:
+                self.results[self.bi] = (None, None, ex)
+                return
+            try:
+                cpu_engine = protein_physics.PhysicsEngine()
+                snaps, ens = cpu_engine.run_landscape_trajectory(
+                    self.seed, self.topo, self.n_snapshots, self.steps_per_snap,
+                    self.T, self.max_angle)
+                self.results[self.bi] = (snaps, ens, ex)
+            except Exception as ex2:
+                self.results[self.bi] = (None, None, ex2)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  LandscapeWorker — MC trajectory → conformational graph
 # ═══════════════════════════════════════════════════════════════════
@@ -1335,8 +1389,48 @@ class LandscapeWorker(QThread):
     # needed here too since this is the other long-running GPU MC call.
     gpu_fallback = pyqtSignal(str)
 
-    N_SNAPSHOTS    = 120   # total trajectory length
-    STEPS_PER_SNAP = 80    # MC steps between each snapshot
+    # 표본 깊이 보정 (2026-07-07): 전용 계측 스크립트(scratchpad/autocorr_probe.py)로
+    # 에너지 궤적의 실제 적분 자기상관시간(τ)을 직접 측정한 결과 τ≈500 스텝
+    # (1UBQ 76잔기, 1XQ8 140잔기 모두 거의 동일 — 이 범위에서는 단백질
+    # 크기와 거의 무관해 보임). 기존 값(40 스냅샷×80스텝=분지당 3200스텝)은
+    # N_eff = steps/(2τ) ≈ 3.2 — 즉 분지 하나가 저장한 40개 스냅샷 중
+    # 실질적으로 독립적인 정보는 3개 남짓이었다. 이번 세션 내내 관찰된
+    # 라벨 불안정성(같은 단백질을 다시 돌리면 ORDERED/POSSIBLY DISORDERED가
+    # 뒤바뀜)의 근본 원인이 바로 이것 — 자세한 경위는 IMPROVEMENTS.md 항목
+    # #2 참고.
+    #
+    # 1차 목표로 분지당 N_eff≈30-40 (기존 대비 약 10배)까지만 올린다 — 장기
+    # 목표치(N_eff≈150-300, 30-50배)는 이번 단계에서 검증하기엔 너무 크다.
+    # STEPS_PER_SNAP은 τ의 2-3배 정도로 잡아 저장되는 스냅샷 하나하나가
+    # 실제로 더 많은 독립 정보를 담도록 하고(기존 80은 τ의 1/6 수준이라
+    # 이웃 스냅샷끼리 거의 중복이었다), N_SNAPSHOTS는 분지 수와 무관하게
+    # "분지당" 목표 스냅샷 수로 재정의한다(이전에는 분지 수로 나눠 분지가
+    # 늘수록 분지당 깊이가 오히려 얕아지는 구조였다).
+    #
+    # Sampling-depth correction (2026-07-07): a dedicated instrumentation
+    # script (scratchpad/autocorr_probe.py) measured the *real* integrated
+    # autocorrelation time (tau) of the energy trace directly, by calling
+    # run_landscape_trajectory() with steps_per_snapshot=1. Result: tau≈500
+    # steps on both 1UBQ (76 res) and 1XQ8 (140 res) -- apparently close to
+    # size-independent in this range. The old values (40 snapshots x 80
+    # steps = 3200 raw steps/branch) gave N_eff = steps/(2*tau) ≈ 3.2 --
+    # each branch's 40 "saved snapshots" carried only ~3 genuinely
+    # independent samples. This is the root, now-quantified cause of the
+    # label instability (ORDERED <-> POSSIBLY DISORDERED on repeat runs of
+    # the same protein) observed all session -- see IMPROVEMENTS.md item #2
+    # for the full investigation.
+    #
+    # First-pass target: N_eff ~= 30-40 per branch (~10x the old ~3.2), not
+    # the full long-run target (N_eff ~= 150-300, a 30-50x step increase --
+    # too large a first jump to validate safely). STEPS_PER_SNAP is set to
+    # roughly 2-3x tau so each saved snapshot actually carries more
+    # independent information (the old 80 was ~tau/6, so neighboring saved
+    # snapshots were mostly duplicates). N_SNAPSHOTS is now a per-branch
+    # target, not a total split across branches (the old formula divided a
+    # fixed total by branch count, so *more* branches meant *less* depth per
+    # branch -- backwards for what multi-branch exploration is for).
+    N_SNAPSHOTS    = 30     # snapshots per branch (was: total across all branches)
+    STEPS_PER_SNAP = 1200   # MC steps between each snapshot (was: 80; ~2.4x measured tau≈500)
 
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
                  extra_seeds=None, backbone_ncac=None):
@@ -1374,7 +1468,7 @@ class LandscapeWorker(QThread):
         S = self.STEPS_PER_SNAP
         seeds = [self.init_atoms] + self.extra_seeds
         n_branches = len(seeds)
-        N_per = max(20, self.N_SNAPSHOTS // n_branches) if n_branches > 1 else self.N_SNAPSHOTS
+        N_per = self.N_SNAPSHOTS  # per-branch target -- see class-level comment above
 
         # ── 다중 분지 탐색 (Multi-branch exploration) ────────────────────
         # 시드 하나(최적 후보)에서만 뻗으면, 안정 단백질에서는 문제없다
@@ -1391,41 +1485,68 @@ class LandscapeWorker(QThread):
         # doesn't represent the real population. Branching from several
         # top candidates and pooling all of them gives a population-
         # weighted picture that isn't biased toward one starting point.
-        all_snapshots, all_energies, branch_lengths = [], [], []
+        # 분지 병렬 실행 (Branch parallelization, 2026-07-07): 분지들은 서로
+        # 완전히 독립적인데도 지금까지는 순차 for 루프로 하나씩 돌았다.
+        # 위의 표본 깊이 증가(분지당 스텝 수 약 11배)를 순차 실행 그대로
+        # 두면 왕복 시간이 감당하기 어려울 만큼 늘어난다. run_landscape_trajectory
+        # 호출은 이미 GIL을 놓으므로(physics_engine.cpp의 py::call_guard) 실제
+        # 동시 실행이 가능하다 — QThreadPool/QRunnable로 각 분지를 동시에
+        # 돌린다. CPU 엔진은 mt19937 gen 하나를 인스턴스 멤버로 공유하므로
+        # (physics_engine.cpp) 같은 엔진 인스턴스를 여러 스레드가 동시에 쓰면
+        # 안전하지 않다 — 분지마다 새 PhysicsEngine 인스턴스를 만든다
+        # (ComparisonWorker가 이미 쓰던 "스레드 경합 방지용 새 엔진 인스턴스"
+        # 관례와 동일). self.engine 자체는 건드리지 않고 그대로 두는데,
+        # run() 뒷부분의 _dedicated_subsearch가 이 병렬 구간 이후 순차적으로
+        # self.engine을 재사용하기 때문이다.
+        #
+        # Branches are fully independent, but used to run one after another in
+        # a sequential for-loop. Combined with the ~11x per-branch step
+        # increase above, sequential execution would make round-trip time
+        # unworkable. run_landscape_trajectory already releases the GIL
+        # (py::call_guard in physics_engine.cpp), so real concurrent execution
+        # is possible -- run each branch via QThreadPool/QRunnable instead.
+        # The CPU engine has one shared mutable member (mt19937 gen in
+        # physics_engine.cpp), so one engine instance isn't safe to use from
+        # multiple threads at once -- give each branch its own fresh
+        # PhysicsEngine (mirrors the existing convention at ComparisonWorker:
+        # "fresh engine instance to avoid thread contention"). self.engine
+        # itself is left untouched here, since _dedicated_subsearch reuses it
+        # sequentially later, after this parallel section completes.
+        physics_mod_snapshot = self.physics_mod
+        branch_results = [None] * n_branches
+        pool = QThreadPool()
+        pool.setMaxThreadCount(max(1, n_branches))
         for bi, seed in enumerate(seeds):
             if n_branches > 1:
                 self.progress.emit(
                     f"  [LANDSCAPE] Branch {bi+1}/{n_branches}: "
-                    f"running {N_per}×{S}-step chain…")
+                    f"running {N_per}×{S}-step chain (parallel)…")
             else:
                 self.progress.emit(
                     f"  [LANDSCAPE] Running {N_per}×{S}-step Markov chain…")
+            pool.start(_LandscapeBranchRunnable(
+                bi, seed, self.topo, N_per, S, self.T, self.max_angle,
+                physics_mod_snapshot, branch_results))
+        pool.waitForDone()
 
-            # run_landscape_trajectory() advances the whole N×S-step chain in a
-            # single C++/CUDA call instead of looping here and calling
-            # generate_ensemble()+calculate_potential() N times — each of those
-            # Python-level iterations used to re-marshal the full particle array
-            # across the Python<->C++ boundary (and, on the GPU backend,
-            # reallocate device buffers from scratch) every single snapshot.
-            # See IMPROVEMENTS.md item #12. The trade-off is coarser progress
-            # feedback: this call blocks until all N snapshots are done rather
-            # than reporting every 20 snapshots, since the loop itself now lives
-            # in C++.
-            try:
-                snaps, ens = self.engine.run_landscape_trajectory(
-                    seed, self.topo, N_per, S, self.T, self.max_angle)
-            except Exception as ex:
-                if self.physics_mod is protein_physics:
-                    raise  # already on CPU -- nothing left to fall back to
-                self.progress.emit(f"  ⚠ GPU engine failed at runtime ({ex}) — falling back to CPU")
-                self.gpu_fallback.emit(str(ex))
-                self.physics_mod = protein_physics
-                self.engine = protein_physics.PhysicsEngine()
-                snaps, ens = self.engine.run_landscape_trajectory(
-                    seed, self.topo, N_per, S, self.T, self.max_angle)
+        all_snapshots, all_energies, branch_lengths = [], [], []
+        gpu_fallback_error = None
+        for bi in range(n_branches):
+            snaps, ens, err = branch_results[bi]
+            if snaps is None:
+                raise err  # fatal -- matches the original single-branch-failure-aborts-run behavior
+            if physics_mod_snapshot is not protein_physics and err is not None:
+                gpu_fallback_error = err  # this branch's GPU call failed and fell back to CPU
             all_snapshots.extend(snaps)
             all_energies.extend(ens)
             branch_lengths.append(len(snaps))
+
+        if gpu_fallback_error is not None:
+            self.progress.emit(
+                f"  ⚠ GPU engine failed at runtime ({gpu_fallback_error}) — falling back to CPU")
+            self.gpu_fallback.emit(str(gpu_fallback_error))
+            self.physics_mod = protein_physics
+            self.engine = protein_physics.PhysicsEngine()
 
         snapshots = all_snapshots
         energies  = np.array(all_energies, dtype=float)
@@ -1452,6 +1573,71 @@ class LandscapeWorker(QThread):
             layout = np.column_stack([layout.reshape(-1, 1),
                                       np.zeros((N, 1))])
         var_exp = pca.explained_variance_ratio_.tolist()
+
+        # ── 수렴 진단: 다중 분지 Ȓ (Gelman-Rubin R-hat) ──────────────────
+        # 분류 결과(POSSIBLY DISORDERED 등)가 실행마다 뒤집히는 문제를
+        # 실증적으로 확인했다(같은 단백질을 반복 실행 → 다른 라벨) — 유비퀴틴
+        # funnel이 0.07~0.24로 널뛰고, 극도로 안정적인 라이소자임조차 4번의
+        # 반복 실행 중 2번은 POSSIBLY DISORDERED로 잘못 나왔다. 매번 여러 번
+        # 재실행해서 눈으로 확인하는 대신, 이미 돌리고 있는 3개의 독립 분지를
+        # 그대로 활용해 한 번의 실행 안에서 수렴 여부를 정량적으로 판단한다.
+        #
+        # 처음에는 풀링된 에너지 궤적으로 Ȓ을 계산했지만, 라이소자임 4회
+        # 반복 실행 검증에서 무의미했다: 4번 모두 잘못 분류됐는데, 그중
+        # Ȓ=1.01(관례상 "수렴")로 나온 실행도 나머지와 똑같이 틀렸다. 에너지
+        # 궤적의 Ȓ은 분지들이 "에너지 분포"에 동의하는지만 보는데, 실제
+        # 분류는 PCA 구조 공간(`layout`)에서의 DBSCAN 군집화가 결정한다 —
+        # 관련은 있지만 다른 양이다. 그래서 대신 DBSCAN이 실제로 군집화하는
+        # 좌표인 PC1(`layout[:, 0]`)에서 Ȓ을 계산한다 — 에너지보다 실제
+        # 분류 결과와 훨씬 더 직접적으로 연결된 양이다.
+        #
+        # 표준 Gelman-Rubin 진단: 분지 간 분산(B)이 분지 내 분산(W)보다 훨씬
+        # 크면(Ȓ이 1보다 훨씬 크면) 분지들이 서로 다른 분포로 수렴했다는
+        # 뜻 — 즉 아직 다 섞이지 않은 것이다. Ȓ≈1.0이면 잘 수렴한 것.
+        # 관례적 기준: Ȓ < 1.1 정도면 수렴, 그 이상이면 의심.
+        #
+        # Convergence diagnostic: multi-chain R-hat (Gelman-Rubin). We've
+        # empirically confirmed the classification label flips between runs
+        # of the *same* protein (ubiquitin's funnel swung 0.07-0.24; even
+        # lysozyme, about as rigid a control as exists, read POSSIBLY
+        # DISORDERED in 2 of 4 repeat runs). Rather than requiring manual
+        # repeat-runs to notice this, reuse the 3 branches this function
+        # already computes to get a per-run convergence signal for free.
+        #
+        # First tried on the pooled *energy* trace, but that was uninformative
+        # on the 4-run lysozyme validation: all 4 runs misclassified, and the
+        # one with R-hat=1.01 (conventionally "converged") was exactly as
+        # wrong as the rest. Energy-trace R-hat only checks whether branches
+        # agree on the energy *distribution*, but the classification is
+        # actually decided by DBSCAN clustering in PCA structural space
+        # (`layout`) -- a related but distinct quantity. So compute R-hat on
+        # PC1 (`layout[:, 0]`) instead -- the coordinate DBSCAN actually
+        # clusters on, and far more directly tied to the classification
+        # outcome than energy is.
+        #
+        # Standard Gelman-Rubin: if between-chain variance (B) dominates
+        # within-chain variance (W) -- R-hat well above 1 -- the branches
+        # have settled into different pictures of the landscape and haven't
+        # mixed yet. R-hat near 1.0 means they agree. Conventional rule of
+        # thumb: R-hat < 1.1 is considered converged.
+        r_hat = None
+        if len(branch_lengths) >= 2 and min(branch_lengths) >= 2:
+            n_chain = min(branch_lengths)
+            pc1 = layout[:, 0]
+            chains = []
+            offset = 0
+            for length in branch_lengths:
+                chains.append(pc1[offset:offset + n_chain])
+                offset += length
+            chains = np.array(chains)  # shape (m branches, n_chain samples)
+            m = chains.shape[0]
+            chain_means = chains.mean(axis=1)
+            grand_mean  = chain_means.mean()
+            B = n_chain / (m - 1) * np.sum((chain_means - grand_mean) ** 2)
+            W = float(np.mean([np.var(c, ddof=1) for c in chains]))
+            if W > 1e-9:
+                var_hat = (n_chain - 1) / n_chain * W + B / n_chain
+                r_hat = float(np.sqrt(var_hat / W))
 
         # ── 밀도 기반 군집화 → 준안정 분지 (Density Clustering → Metastable Basins) ──
         # Density-based clustering — clusters are metastable basins.
@@ -1603,6 +1789,15 @@ class LandscapeWorker(QThread):
         best_comm = max(sig, key=len) if sig else max(communities, key=len)
         funnel    = len(best_comm) / N
 
+        # 지배적 분지의 대표 구조 — 분류 단계의 구조적 변위 필터(아래)와
+        # 이후 동적 후보 탐색 단계 둘 다에서 쓰므로 여기서 한 번만 계산한다.
+        # Dominant basin's representative structure -- computed once here
+        # since both the classification-stage structural filter (below) and
+        # the later dynamic sub-candidate picking step need it.
+        dom_idx = min(best_comm, key=lambda i: float(energies[i]))
+        dominant_particles = snapshots[dom_idx]
+        dom_vec = self._ca_vec(dominant_particles).reshape(-1, 3)
+
         # 경쟁 분지는 "지배적 분지"가 아니라 전역 최저 에너지 대비 열적으로
         # 도달 가능한지로 판정해야 한다. 지배적 분지 자체의 최솟값을 기준으로
         # 삼으면 비대칭 버그가 생긴다: 지배적 분지보다 에너지가 낮은 분지는
@@ -1682,22 +1877,69 @@ class LandscapeWorker(QThread):
                             < COMPETITIVE_KT * kT
                             or (len(c) / N) >= pop_threshold)]
 
+        # 인구/에너지로 "경쟁"인 분지라도 실제 구조 변위가 작으면(곁사슬
+        # 회전이체, 말단 곁가지의 정상적인 흔들림) 무질서가 아니다 — 이번
+        # 세션에서 실측한 실제 사례들이 뚜렷하게 갈린다: 사소한 국소 유연성
+        # (라이소자임 N-말단 약 0.9-2.6 A, 유비퀴틴 C-말단 꼬리 약 2.2-3.7 A)과
+        # 진짜 대규모 무질서(1XQ8, 실제 IDP: 약 10.5-25.9 A) 사이에 뚜렷한
+        # 간격이 있다. 라이소자임(이황화 결합 4개, RMSF~0%)이 반복 실행마다
+        # 일관되게 POSSIBLY DISORDERED로 나온 원인이 바로 이것이었다 —
+        # 문헌으로 확인한 결과 실제로 존재하는 N-말단 유연성이지만
+        # ("N-terminus of HEWL is very flexible", HEWL 결정화 논문
+        # PMC4498469), 단백질 전체가 무질서하다는 뜻은 아니다. 아래 필터는
+        # 이미 sub-candidate 루프에서 쓰는 것과 동일한 Kabsch 정렬 + 최대
+        # 변위 계산을 재사용한다(SS-diff는 제외 — 실측 데이터에서 사소한
+        # 사례와 진짜 IDP 사례 둘 다 SS-diff가 작아 구분에 도움이 안 됐다).
+        #
+        # A basin can be statistically "competitive" (population/energy) yet
+        # not be real disorder -- e.g. a sidechain rotamer flip or normal
+        # terminal wobble. Real examples measured this session split
+        # cleanly: minor local flexibility (1LYZ N-terminus ~0.9-2.6 A,
+        # ubiquitin's real C-terminal tail ~2.2-3.7 A) vs. genuine large-scale
+        # disorder (1XQ8, real IDP: ~10.5-25.9 A) -- a wide gap between them.
+        # This is exactly why lysozyme (4 disulfides, ~0% RMSF) consistently
+        # read POSSIBLY DISORDERED on repeat runs: real N-terminal
+        # flexibility ("the N-terminus of HEWL is very flexible", confirmed
+        # via the HEWL crystallization literature, PMC4498469), but not
+        # evidence the whole protein is disordered. Reuses the same
+        # Kabsch-align + max-displacement calculation already used in the
+        # sub-candidate loop below (SS-diff omitted -- in the real examples
+        # measured, SS-diff was small in *both* the minor and genuine-IDP
+        # cases, so it doesn't discriminate here).
+        STRUCTURAL_DISP_THRESHOLD = 5.0  # Å -- calibrated from the small set
+        # of real cases above (~4 A ceiling on minor flexibility, ~10 A floor
+        # on the one genuine-IDP case measured); may need revisiting with
+        # more real test cases.
+        competitive_structural = []
+        for c in competitive:
+            rep_idx = min(c, key=lambda i: float(energies[i]))
+            if rep_idx == dom_idx:
+                continue
+            rep_vec = self._ca_vec(snapshots[rep_idx]).reshape(-1, 3)
+            if rep_vec.shape != dom_vec.shape:
+                continue
+            rep_vec_aligned = _kabsch_align_points(dom_vec, rep_vec)
+            disp = np.linalg.norm(rep_vec_aligned - dom_vec, axis=1)
+            if float(disp.max()) >= STRUCTURAL_DISP_THRESHOLD:
+                competitive_structural.append(c)
+
         e_spread = 0.0
-        if len(competitive) > 1:
-            mins = [min(float(energies[i]) for i in c) for c in competitive]
+        if len(competitive_structural) > 1:
+            mins = [min(float(energies[i]) for i in c) for c in competitive_structural]
             e_spread = float(max(mins) - min(mins))
 
-        if len(competitive) >= 3 and e_spread < 5 * kT:
+        if len(competitive_structural) >= 3 and e_spread < 5 * kT:
             idp_label, idp_color = "IDP", "#dc2626"
-        elif len(competitive) >= 2 and funnel < 0.7:
+        elif len(competitive_structural) >= 2 and funnel < 0.7:
             idp_label, idp_color = "POSSIBLY DISORDERED", "#d97706"
         else:
             idp_label, idp_color = "ORDERED", "#16a34a"
 
+        r_hat_str = f"{r_hat:.2f}" if r_hat is not None else "N/A"
         self.progress.emit(
             f"  [LANDSCAPE] Done · {len(sig)} significant basins "
-            f"({len(competitive)} competitive) · "
-            f"funnel={funnel:.2f} · {idp_label}")
+            f"({len(competitive)} competitive, {len(competitive_structural)} structural) · "
+            f"funnel={funnel:.2f} · R-hat={r_hat_str} · {idp_label}")
 
         # ── 동적 후보 탐색 (Dynamic sub-candidate picking) ────────────────
         # 경쟁 분지가 있다는 것은 어느 특정 구간(예: 유비퀴틴의 유연한
@@ -1721,8 +1963,8 @@ class LandscapeWorker(QThread):
         # large region makes a dedicated re-run expensive, so lean on what
         # was already sampled instead.
         sub_candidates = []
-        dom_idx = min(best_comm, key=lambda i: float(energies[i]))
-        dominant_particles = snapshots[dom_idx]
+        # dom_idx/dominant_particles/dom_vec already computed above, before
+        # classification.
 
         # ── 2차 구조 근사 (Secondary-structure abstraction) ───────────────
         # 원자 좌표 대신 잔기별 나선/가닥/코일 범주로 분지를 비교한다 —
@@ -1740,7 +1982,6 @@ class LandscapeWorker(QThread):
             ss_dominant = _secondary_structure_string(dominant_particles, n_idx, ca_idx, c_idx)
 
         if len(competitive) >= 2:
-            dom_vec = self._ca_vec(dominant_particles).reshape(-1, 3)
             for c in competitive:
                 rep_idx = min(c, key=lambda i: float(energies[i]))
                 if rep_idx == dom_idx:
@@ -1850,6 +2091,7 @@ class LandscapeWorker(QThread):
             "n_sig":        len(sig),
             "funnel":       float(funnel),
             "e_spread":     float(e_spread),
+            "r_hat":        r_hat,
             "idp_label":    idp_label,
             "idp_color":    idp_color,
             "dominant_particles": dominant_particles,

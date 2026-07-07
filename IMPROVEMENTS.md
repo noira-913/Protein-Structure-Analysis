@@ -186,6 +186,210 @@ the one pre-existing parsing bug the same test run exposed:
   point; the next real fix here is sampling depth, tracked as a follow-up, not
   yet started.
 
+  **Convergence diagnostic, proof of concept: multi-chain R-hat (Gelman-
+  Rubin).** Rather than requiring a manual repeat-run spot-check to notice a
+  run like the 1LYZ case above, `LandscapeWorker.run()` now computes a
+  per-run R-hat for free by reusing the 3 branches it already runs: split the
+  pooled energy trace back into its 3 per-branch chains (truncated to the
+  shortest branch's length), compare between-chain variance to within-chain
+  variance (standard Gelman-Rubin `R-hat = sqrt(((n-1)/n * W + B/n) / W)`).
+  R-hat near 1.0 means the branches agree on the distribution; well above 1
+  (conventionally >1.1) means they've settled into different pictures and
+  haven't mixed — exactly the failure mode already demonstrated empirically.
+  Surfaced in the progress log line and in the emitted result dict (`r_hat`
+  key, `None` if fewer than 2 branches or a degenerate zero-variance chain).
+  Validated by re-running the same 1LYZ repeat-run check this diagnostic was
+  designed to catch, to confirm R-hat actually reads high on the runs already
+  known to be unconverged.
+
+  **Validation result: inconclusive/not yet useful as implemented.** 4 fresh
+  1LYZ runs all misclassified as POSSIBLY DISORDERED (RMSF confirms all 4
+  should read ORDERED). R-hat values: 1.28, 1.25, **1.01**, 1.22. The run with
+  R-hat=1.01 — by the conventional <1.1 rule of thumb, "converged" — was
+  exactly as wrong as the other three. Likely reason: R-hat computed on the
+  pooled *energy* trace measures whether branches agree on the overall energy
+  distribution, but the classification is actually driven by DBSCAN cluster
+  populations in PC-projected space, which is a related but distinct quantity
+  — two branches can have statistically similar energy distributions (low
+  R-hat) while still assigning snapshots to different clusters, since
+  clustering with only ~40 points per branch is noisy in a way a marginal
+  energy R-hat doesn't see. Next step tried: compute R-hat on the PC1
+  projection (the coordinate DBSCAN actually clusters on) instead of raw
+  energy, since that's more directly tied to what actually varies between
+  mislabeled runs.
+
+  **Second attempt (PC1-based R-hat) also inconclusive — and mildly against
+  the hypothesis.** Moved the R-hat computation to after the PCA `layout` is
+  built and reran it on `layout[:, 0]` instead of energy. 4 fresh 1LYZ runs:
+  R-hat = 1.48 (wrong: POSSIBLY DISORDERED), 1.32 (wrong), 3.32 (wrong), 2.29
+  (**correct**: ORDERED). The one run that actually got the right answer had
+  the *highest* R-hat in the batch -- the opposite of what the diagnostic
+  should show if it tracked convergence quality relevant to the
+  classification. Combined across both variants (8 total runs, energy-based
+  and PC1-based), neither shows the expected pattern (low R-hat correlating
+  with a correct/converged label). With only 4 samples per variant this could
+  still be noise, but two independent attempts both failing to show the
+  hoped-for direction is itself informative.
+
+  **Conclusion: stop iterating on R-hat variants; this line of investigation
+  is not converging.** A single scalar convergence summary (whether on energy
+  or PC1) doesn't appear to reliably predict classification correctness at
+  this sample size, and it isn't obvious a third choice of observable would
+  do better. The r_hat field is kept in the codebase (informational,
+  harmless) but should not be treated as a trustworthiness signal. This
+  reinforces rather than replaces the original diagnosis: the actual fix
+  needed is more MC sampling depth (more steps/branches, or an
+  enhanced-sampling method), not a better diagnostic layered on top of
+  under-sampled chains — a diagnostic can't distinguish "converged" from
+  "not converged" when neither branch has actually converged yet. The
+  within-branch block-stability check (see below) was deferred rather than
+  tried next, given this pattern.
+
+  **Deferred to a later pass: within-branch block stability.** A second,
+  complementary diagnostic was scoped but not implemented yet: split each
+  individual branch's trajectory in half and compare early-half vs. late-half
+  population/energy estimates. This catches a branch that's still drifting
+  (hasn't equilibrated within itself) even in the edge case where all 3
+  branches happen to agree with each other by coincidence -- a failure mode
+  R-hat alone wouldn't catch, since R-hat only measures *agreement between*
+  chains, not whether any one of them has stopped moving. Given neither R-hat
+  variant showed a usable signal, this is now lower-priority than simply
+  increasing sampling depth directly and re-measuring label stability.
+
+  **Broader roster confirms this isn't size-specific.** Filled the one real
+  gap in the calibration roster (large + stable — genuine large IDPs mostly
+  have no single deposited structure at all, so that quadrant stays
+  uncovered) with 1YPI (triosephosphate isomerase, 494 residues, already
+  vetted in `tests/accuracy_test.py`'s own protein list). 4 runs: funnel
+  0.21/0.10/0.17/0.10, RMSF a clean 0.0% every time, but the discrete label
+  still split 2/4 ORDERED vs. POSSIBLY DISORDERED — and R-hat (1.84, 2.55,
+  2.38, 2.11) tracked correctness no better here than on 1LYZ, the third
+  independent case where it didn't. Notably, funnel scores here were no
+  higher than on the much smaller 129-residue lysozyme, despite this being a
+  substantially larger, equally rigid, classic stable fold — real evidence
+  that the fixed 40-snapshot-per-branch budget becomes proportionally more
+  inadequate as protein size grows (bigger conformational space, same fixed
+  sample count), supporting a sampling depth that scales with protein size
+  rather than one flat constant for every protein, going into the sampling-
+  depth optimization work this item's conclusion points to.
+
+  **Sampling depth increased (small/fast proteins first) — validated as a
+  success on 1UBQ and 1LYZ.** Rather than guessing a step-count multiplier,
+  measured the real integrated autocorrelation time (τ) of the MC energy
+  trace directly with a one-off instrumented probe
+  (`scratchpad/autocorr_probe.py`, calls `run_landscape_trajectory()` with
+  `steps_per_snapshot=1` -- no engine changes needed, the API already
+  supports arbitrary thinning). Result: **τ ≈ 500 steps on both 1UBQ (76 res)
+  and 1XQ8 (140 res)** -- apparently close to size-independent in this range
+  (not yet checked at 1YPI's 494-residue scale). The old production settings
+  (`LandscapeWorker.N_SNAPSHOTS=120` total ÷ 3 branches = 40 snapshots × 80
+  steps = 3200 raw steps/branch) gave `N_eff = steps/(2τ) ≈ 3.2` effective
+  independent samples per branch -- each branch's 40 "saved snapshots" were
+  carrying only ~3 genuinely independent draws. This is the root, now-
+  quantified cause of the label instability documented above.
+
+  First-pass fix, deliberately targeting ~10x the old N_eff (not the full
+  30-50x long-run target -- too large a first jump to validate safely):
+  `N_SNAPSHOTS` redefined as a **per-branch** target (was previously divided
+  by branch count, so *more* branches meant *less* depth per branch --
+  backwards) and raised to 30; `STEPS_PER_SNAP` raised from 80 to 1200
+  (~2.4×τ, so each saved snapshot now carries meaningfully more independent
+  information instead of being a near-duplicate of its neighbor). Net: ~36,000
+  raw steps/branch, ~11x the old depth, targeting `N_eff ≈ 30-40`/branch.
+
+  To keep this affordable, the 3 branches (already fully statistically
+  independent) now run **concurrently** instead of in the old sequential
+  `for` loop, via `QThreadPool`/`QRunnable` (new `_LandscapeBranchRunnable`
+  class, `python/gui_main.py`) -- the first use of any concurrency primitive
+  in this codebase beyond the top-level `QThread` workers. Confirmed via
+  codebase research before implementing: `run_landscape_trajectory` already
+  releases the GIL (`py::call_guard<py::gil_scoped_release>()`,
+  `physics_engine.cpp`), so real concurrent execution is possible, but the
+  CPU engine has one shared mutable member (`std::mt19937 gen`) touched every
+  MC step -- unsafe to share one engine instance across concurrent branches.
+  Each branch now gets its own fresh `PhysicsEngine()` instance (cheap to
+  construct), following the same convention the codebase already used
+  elsewhere ("fresh engine instance to avoid thread contention" at
+  `ComparisonWorker`). `self.engine` itself is left untouched during the
+  parallel section since `_dedicated_subsearch` reuses it sequentially
+  afterward.
+
+  **Validation, 1UBQ (4 runs total: 1 sanity + 3 repeats):** ORDERED every
+  single time, funnel tightly clustered at 0.61-0.67 -- a dramatic contrast
+  to the old scattered 0.07-0.24 range. Runtime ~160-200s (up from ~40-90s,
+  but nowhere near the naive ~11x the step increase alone would imply --
+  parallelization is doing real work).
+
+  **Validation, 1LYZ (3 repeats):** landed on POSSIBLY DISORDERED all 3
+  times, funnel consistently ~0.30-0.32 with 3 basins splitting the
+  trajectory almost exactly 30/30/30 every run -- worse-looking than before
+  at face value (old runs were ~50/50 ORDERED/DISORDERED by chance), but
+  qualitatively different: **reproducible, not noisy**. Investigated before
+  concluding it was a regression: the flagged region (residues ~1-5, near
+  the N-terminus) matches literature-documented real HEWL flexibility --
+  "the N-terminus of HEWL is very flexible, and can be stabilized through
+  interactions with polyoxotungstate molecules," and even the most rigid
+  crystal form has "approximately one third of the side chains [existing]
+  in more than one conformation" (Hen Egg-White Lysozyme Crystallisation...,
+  PMC4498469). Conclusion: this is very likely the deeper sampling correctly
+  resolving a *real* local flexibility that the old noisy/shallow sampling
+  couldn't reliably surface (the old scattered results look more like random
+  noise than consistent detection of anything) -- not a new bug. What
+  remains is the same open question already flagged for ubiquitin's real
+  C-terminal tail finding: whether "POSSIBLY DISORDERED" is the right
+  top-line label for a protein that's overwhelmingly rigid (4 disulfides, low
+  B-factors everywhere else) but has one small, real, genuinely flexible
+  region -- a labeling-semantics question, not a sampling or clustering bug.
+
+  **Status: first-pass sampling-depth increase counted as a success at this
+  scale.** Both test proteins now produce *reproducible, physically
+  defensible* results (1UBQ: real single dominant fold; 1LYZ: real
+  N-terminal flexibility, correctly and consistently detected) instead of
+  noisy, unstable ones.
+
+  **Labeling-semantics fix: gate the top-line classification on structural
+  displacement magnitude, not just population/energy competitiveness.**
+  Closed the open question above the same day. A basin can be statistically
+  "competitive" (population/energy) yet not represent real disorder -- a
+  sidechain rotamer flip or normal terminal wobble is not the same thing as
+  genuine large-scale conformational heterogeneity. Real examples measured
+  this session split cleanly on displacement magnitude (Kabsch-aligned max
+  Cα displacement between a competitive basin's representative and the
+  dominant basin's representative, reusing the existing
+  `_kabsch_align_points` helper): minor local flexibility (1LYZ N-terminus
+  ~0.9-4.4 Å across runs, ubiquitin's real C-terminal tail ~2.2-5.2 Å) vs.
+  genuine large-scale disorder (1XQ8, real IDP: ~10.5-25.9 Å) -- a wide,
+  consistent gap between the two groups. SS-diff fraction was checked and
+  rejected as the discriminator (small in *both* groups, doesn't separate
+  them). Implemented `STRUCTURAL_DISP_THRESHOLD = 5.0` Å (picked as roughly
+  the midpoint of the observed gap; calibrated from a small number of real
+  cases, same caveat as every other constant tuned this session) as an
+  additional filter: only basins whose representative differs from the
+  dominant one by at least this much count toward `IDP`/`POSSIBLY DISORDERED`
+  (`competitive_structural`, computed right after `competitive`, reusing the
+  dominant-basin representative now hoisted earlier in `run()` for this
+  purpose). The raw, unfiltered `competitive` list is left untouched
+  everywhere else (sub-candidate/region-flagging, `basin_summary`), so real
+  minor flexibility is still correctly *surfaced* in the UI/logs -- only the
+  top-line label stopped treating it as evidence of disorder. Progress log
+  now shows both counts, e.g. "2 competitive, 0 structural", for visibility
+  into which basins actually drove the label.
+
+  **Re-validated on 1UBQ and 1LYZ (3 repeats each) with the gate active:
+  6/6 correct.** 1UBQ: 3/3 ORDERED (funnel 0.32-0.97 across runs, 0-1 of 2
+  competitive basins crossing the structural threshold). 1LYZ: **3/3 now
+  correctly ORDERED** (previously 0/3 with the depth increase alone) --
+  every run shows displacements of 1.8-4.4 Å, consistently under the 5 Å
+  threshold, while the flagged N-terminal region (e.g. "region 5-129",
+  "region 1-1") is still visible in the sub-candidate output for anyone
+  inspecting details.
+
+  **Small-scale phase of the sampling-depth/classification investigation is
+  now closed.** Explicitly not yet done, tracked as follow-ups: validating/
+  tuning at the 1YPI (494-residue) scale, GPU-path-specific timing, adaptive
+  per-protein depth, and the deferred within-branch block-stability
+  diagnostic.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
@@ -203,6 +407,23 @@ ligands are affected.
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
 a low-ε bilayer-region model; no such model exists yet. Low priority — no membrane
 protein test cases in current use.
+
+**6. Possible false-positive knot detection on larger backbones — observed, not
+yet investigated**
+While running the 1YPI (triosephosphate isomerase, 494 residues) calibration
+data for item #2, the knot classifier called it a trefoil (3₁, 6 crossings)
+at only 58-92% closure-vote confidence across 4 runs. TIM-barrel folds are a
+classic, textbook *unknotted* topology in the structural biology literature —
+this doesn't match. For comparison, the validated cases in "Completed Work" →
+Analysis (1LYZ = unknot, 1J85 = documented deep trefoil) both hit 97-100%
+confidence. Low confidence + a topologically-surprising call on a larger,
+more complex backbone suggests a possible issue in the stochastic closure or
+KMT reduction step specifically at bigger residue counts, rather than a newly
+discovered real shallow knot in a famously unknotted fold — but this is an
+observation from data collected for an unrelated investigation, not yet
+followed up. Needs: rerun with more closure trials for confidence, and check
+whether the same false positive appears on other large unknotted test cases
+before concluding it's a real bug.
 
 *(Also: `tests/accuracy_test.py`'s auto-offset alignment can't handle a PDB entry
 whose crystal numbering doesn't correspond linearly to full-length UniProt numbering
