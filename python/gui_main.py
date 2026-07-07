@@ -2100,6 +2100,14 @@ class ProteinApp(QMainWindow):
         landscape_splitter.addWidget(landscape_graph_col)
         landscape_splitter.setStretchFactor(0, 2)
         landscape_splitter.setStretchFactor(1, 3)
+        # setStretchFactor only governs how *extra* space is distributed on
+        # resize, not the initial split -- a bare QSplitter can collapse the
+        # 3D viewer to 0 width on first show, since QWebEngineView reports a
+        # tiny/zero size hint (confirmed: landscape_web measured 0x838 right
+        # after the page was first shown). A minimum width plus an explicit
+        # initial setSizes() keeps it visible from the start.
+        self.landscape_web.setMinimumWidth(300)
+        landscape_splitter.setSizes([600, 900])
         lp_outer.addWidget(landscape_splitter)
 
         self._view_stack.addWidget(landscape_page)   # index 1
