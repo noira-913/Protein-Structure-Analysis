@@ -1379,6 +1379,179 @@ class _LandscapeBranchRunnable(QRunnable):
                 self.results[self.bi] = (None, None, ex2)
 
 
+class _ReplicaExchangeBranchRunnable(QRunnable):
+    """Runs one landscape MC branch as a parallel-tempering (replica exchange)
+    ensemble instead of a single fixed-temperature chain.
+
+    Same output contract as _LandscapeBranchRunnable: writes (snapshots,
+    energies, error) into results[bi]. Everything downstream (pooling into
+    all_snapshots/all_energies, PCA/DBSCAN classification) is unchanged --
+    only how this one branch's samples are generated differs.
+
+    Why PT and not plain MC or simulated annealing: the sampling-depth
+    investigation (IMPROVEMENTS.md item #2) found the MC chain's integrated
+    autocorrelation time never converges (it grows with trace length,
+    indicating the chain is still slowly relaxing at any affordable step
+    budget, not merely under-sampled). Simulated annealing was tested as a
+    burn-in accelerant and empirically made things worse (lower, noisier
+    funnel scores) -- and using it for actual production sampling would
+    bias the walk toward the single lowest-energy state, corrupting the
+    population-weighted basin estimates this classifier depends on. Replica
+    exchange fixes the mixing problem without that bias: each temperature
+    "slot" runs its own canonical-ensemble chain, and periodic swap moves
+    between neighboring slots are themselves Metropolis-accepted with a
+    criterion chosen specifically to preserve each slot's own stationary
+    distribution -- so slot 0 (the physical target temperature) is still a
+    valid sample from the same ensemble the plain single-temperature chain
+    was already trying to sample, just better-mixed.
+
+    Swap acceptance: physics_engine.cpp's own Metropolis step accepts moves
+    with probability exp(-dE/T), and T is already in the same energy units
+    as dE (kcal/mol; T=0.6 ~= kT at 300K, not literal Kelvin through a
+    Boltzmann-constant conversion) -- see the "Monte Carlo Sampling" comment
+    block there. That means the standard replica-swap formula between
+    neighboring slots a, b (energies E_a, E_b, temperatures T_a, T_b)
+    applies directly with no unit conversion:
+
+        p_swap = min(1, exp((E_a - E_b) * (1/T_a - 1/T_b)))
+
+    derived from requiring detailed balance against each slot's own
+    pi(E) ~ exp(-E/T) -- no k_B factor needed since the engine's own
+    per-step acceptance already uses this exact convention.
+
+    Segmented execution: run_landscape_trajectory runs its entire chain in
+    one C++ call with no checkpoint, so a swap needs the chain broken into
+    short segments with a barrier between them. Reuses the block-chaining
+    technique already proven this session (autocorr_probe.py, the
+    annealing test, and _dedicated_subsearch's existing sequential-reuse
+    pattern): call run_landscape_trajectory(state, topo,
+    n_snapshots=PT_SWAP_INTERVAL, steps_per_snap, T_k, max_angle) per
+    replica per segment, take snaps[-1] as the next segment's initial
+    state, and repeat. Only slot 0's snapshots/energies from each segment
+    are pooled into the branch's returned trajectory -- higher-temperature
+    slots exist only to help slot 0 mix faster, never feed classification.
+
+    Each replica keeps its own persistent PhysicsEngine across all segments
+    (only ever touched by whichever thread is running that replica's
+    current segment -- safe because QThreadPool.waitForDone() between
+    segments is a full barrier, so handing the same engine object to a
+    different pooled thread next segment has proper happens-before
+    ordering, same safety argument as _LandscapeBranchRunnable's "one
+    engine, one thread at a time" rule, just not literally the same OS
+    thread for the whole run).
+    """
+    def __init__(self, bi, seed, topo, n_snapshots, steps_per_snap, T, max_angle,
+                 physics_mod, results, n_replicas, ladder_ratio, swap_interval,
+                 rng_seed):
+        super().__init__()
+        self.bi = bi
+        self.seed = seed
+        self.topo = topo
+        self.n_snapshots = n_snapshots
+        self.steps_per_snap = steps_per_snap
+        self.T = T
+        self.max_angle = max_angle
+        self.physics_mod = physics_mod
+        self.results = results
+        self.n_replicas = n_replicas
+        self.ladder_ratio = ladder_ratio
+        self.swap_interval = swap_interval
+        self.rng_seed = rng_seed
+
+    def run(self):
+        try:
+            snaps, ens = self._run_pt(self.physics_mod)
+            self.results[self.bi] = (snaps, ens, None)
+        except Exception as ex:
+            if self.physics_mod is protein_physics:
+                self.results[self.bi] = (None, None, ex)
+                return
+            try:
+                snaps, ens = self._run_pt(protein_physics)
+                self.results[self.bi] = (snaps, ens, ex)
+            except Exception as ex2:
+                self.results[self.bi] = (None, None, ex2)
+
+    def _run_pt(self, physics_mod):
+        rng = np.random.default_rng(self.rng_seed)
+        ladder = [self.T * (self.ladder_ratio ** k) for k in range(self.n_replicas)]
+        engines = [physics_mod.PhysicsEngine() for _ in range(self.n_replicas)]
+        states = [self.seed for _ in range(self.n_replicas)]
+        energies = [None] * self.n_replicas
+
+        n_segments = max(1, self.n_snapshots // self.swap_interval)
+        pooled_snaps, pooled_energies = [], []
+
+        for seg in range(n_segments):
+            seg_results = [None] * self.n_replicas
+            pool = QThreadPool()
+            pool.setMaxThreadCount(max(1, self.n_replicas))
+            for k in range(self.n_replicas):
+                pool.start(_ReplicaSegmentRunnable(
+                    k, engines[k], states[k], self.topo, self.swap_interval,
+                    self.steps_per_snap, ladder[k], self.max_angle, seg_results))
+            pool.waitForDone()
+
+            for k in range(self.n_replicas):
+                seg_snaps, seg_ens = seg_results[k]
+                states[k] = seg_snaps[-1]
+                energies[k] = seg_ens[-1]
+                if k == 0:
+                    pooled_snaps.extend(seg_snaps)
+                    pooled_energies.extend(seg_ens)
+
+            # Alternating-pair swap scheme: (0,1),(2,3),... on even segments,
+            # (1,2),(3,4),... on odd -- standard PT bookkeeping so every
+            # neighbor pair gets attempted over time without needing a
+            # simultaneous all-pairs resolution.
+            offset = seg % 2
+            for a in range(offset, self.n_replicas - 1, 2):
+                b = a + 1
+                dE = energies[a] - energies[b]
+                d_beta = (1.0 / ladder[a]) - (1.0 / ladder[b])
+                exponent = dE * d_beta
+                p_swap = 1.0 if exponent >= 0 else np.exp(exponent)
+                if rng.random() < p_swap:
+                    states[a], states[b] = states[b], states[a]
+                    energies[a], energies[b] = energies[b], energies[a]
+
+        return pooled_snaps, pooled_energies
+
+
+class _ReplicaSegmentRunnable(QRunnable):
+    """Runs one replica's single segment within one PT swap interval.
+
+    Writes (snapshots, energies) into results[k]. Note QThreadPool does not
+    propagate a worker thread's Python exception back to the caller -- if
+    run_landscape_trajectory raises here, results[k] is simply left at its
+    None sentinel. The caller (_ReplicaExchangeBranchRunnable._run_pt)
+    unpacking that None then raises its own TypeError, which the outer
+    _ReplicaExchangeBranchRunnable.run() try/except does catch (triggering
+    the same GPU-fallback-retry-or-mark-fatal path as _LandscapeBranchRunnable)
+    -- so a segment failure is not silently swallowed or hung, but the
+    original exception's detail is lost in favor of the secondary TypeError.
+    Acceptable for now since this path is not yet the production default.
+    """
+    def __init__(self, k, engine, state, topo, n_snapshots, steps_per_snap,
+                 T, max_angle, results):
+        super().__init__()
+        self.k = k
+        self.engine = engine
+        self.state = state
+        self.topo = topo
+        self.n_snapshots = n_snapshots
+        self.steps_per_snap = steps_per_snap
+        self.T = T
+        self.max_angle = max_angle
+        self.results = results
+
+    def run(self):
+        snaps, ens = self.engine.run_landscape_trajectory(
+            self.state, self.topo, self.n_snapshots, self.steps_per_snap,
+            self.T, self.max_angle)
+        self.results[self.k] = (snaps, ens)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  LandscapeWorker — MC trajectory → conformational graph
 # ═══════════════════════════════════════════════════════════════════
@@ -1429,8 +1602,150 @@ class LandscapeWorker(QThread):
     # target, not a total split across branches (the old formula divided a
     # fixed total by branch count, so *more* branches meant *less* depth per
     # branch -- backwards for what multi-branch exploration is for).
-    N_SNAPSHOTS    = 30     # snapshots per branch (was: total across all branches)
-    STEPS_PER_SNAP = 1200   # MC steps between each snapshot (was: 80; ~2.4x measured tau≈500)
+    N_SNAPSHOTS    = 15     # snapshots per branch (was: total across all branches)
+    STEPS_PER_SNAP = 600    # MC steps between each snapshot (was: 80; ~2.4x measured tau≈500)
+    # 2026-07-09 재조정: 위 두 값은 원래 30×1200이었으나, GPU 속도 비교 조사 중
+    # (아래 "런타임 최적화" 참고) 정확도 저하 없이 예산을 더 줄일 수 있는지
+    # 직접 측정했다. 1UBQ/1LYZ/1YPI/1XQ8(진짜 IDP) 네 단백질 모두에서 예산을
+    # 절반(스냅샷 수·스텝 수 각각 절반, 총 스텝 ~4배 감소)으로 줄여도 12/12
+    # 반복 실행이 정답을 유지했고 funnel 점수도 같은 범위였다 — IMPROVEMENTS.md
+    # 항목 #2 "런타임 최적화" 절 참고. 원래 30×1200 값은 이제 절반이 된 이
+    # 상수들의 2배로 남겨두지 않고, 검증된 값 자체로 갱신한다.
+    #
+    # 2026-07-09 re-tuning: these two were originally 30×1200, halved after a
+    # GPU-speedup investigation (see "Runtime optimization" below) directly
+    # measured whether the budget could be cut further without losing
+    # accuracy. Tested on all 4 available ground-truth proteins (1UBQ, 1LYZ,
+    # 1YPI, and 1XQ8 -- a real IDP): halving both n_snapshots and steps (a
+    # ~4x total step reduction) still gave 12/12 correct repeat-run labels
+    # with funnel scores in the same range as the un-halved budget -- see
+    # IMPROVEMENTS.md item #2's "Runtime-optimization follow-up" for the
+    # full table. These are the validated values themselves, not a multiplier
+    # applied on top of the original 30×1200 anchor.
+
+    # 크기별 표본 깊이 보정 (2026-07-08): 위 상수들은 76-140잔기 범위에서만 검증됐다.
+    # 1YPI(494잔기, 강체 TIM-배럴, RMSF 0%)로 재확인한 결과 funnel 점수가 129잔기
+    # 리소자임과 다를 바 없이 낮았고(0.10-0.21) ORDERED/POSSIBLY DISORDERED가
+    # 2/4로 갈렸다 — 단백질이 커질수록(PCA 특징 차원 = 3×n_ca가 ~6.5배 증가) DBSCAN이
+    # 군집화할 표본 수는 그대로라 실제 우물이 여러 조각으로 쪼개지는 것으로 보인다.
+    #
+    # 애초에 τ(자기상관시간)를 다시 측정해 STEPS_PER_SNAP을 τ에 맞춰 늘리려 했으나,
+    # 전용 계측(scratchpad/autocorr_probe.py)에서 τ 추정치가 궤적을 늘릴수록 계속
+    # 커졌다(2천 스텝→508, 2만 스텝→3995, 10만 스텝→26228 — 한 번도 수렴하지 않음).
+    # 1UBQ 10만 스텝 궤적의 전반부/후반부 평균 에너지도 -1.54σ만큼 단조 하강해,
+    # T=0.6에서 사슬이 감당 가능한 예산 안에서는 정상 상태(stationary)에 도달하지
+    # 못한다는 뜻이다 — 잘 정의된 τ가 없으므로 "STEPS_PER_SNAP ∝ τ" 공식 자체가
+    # 성립하지 않는다(이전 세션의 τ≈500 측정도 같은 이유로 과소측정이었을 가능성이
+    # 높다). 이는 IUPred R-hat 조사(에너지 기반·PC1 기반 모두 분류 정확도를 예측하지
+    # 못하고 폐기됨, IMPROVEMENTS.md 항목 #2 참고)와 같은 패턴 — 단일 스칼라
+    # 혼합(mixing) 진단이 이 분류기에서는 반복적으로 신뢰할 수 없는 것으로 드러났다.
+    #
+    # 따라서 실용적 접근으로 전환: N_SNAPSHOTS만 단백질 크기에 맞춰 늘려(군집화
+    # 밀도 문제를 직접 겨냥 — τ 측정 실패와 무관하게 유효한 메커니즘) DBSCAN이
+    # 더 많은 표본으로 군집을 나누게 하고, STEPS_PER_SNAP은 이론적 τ 공식 없이
+    # 실행시간 예산으로만 제한한다. 검증은 이론적 N_eff 목표가 아니라 반복 실행
+    # 라벨 안정성(landscape_stability_test.py)만으로 판단한다.
+    #
+    # Size-adaptive sampling depth (2026-07-08): the constants above were only
+    # validated at 76-140 residues. Re-checking with 1YPI (494 res, a rigid TIM-
+    # barrel, RMSF 0%) showed funnel scores no better than 129-res lysozyme
+    # (0.10-0.21) and a 2/4 ORDERED/POSSIBLY-DISORDERED split -- as protein size
+    # grows (PCA feature dim = 3*n_ca grows ~6.5x), the pooled sample count DBSCAN
+    # clusters over stays fixed, so a real single basin looks fragmented.
+    #
+    # The original plan was to re-measure the autocorrelation time (tau) and
+    # scale STEPS_PER_SNAP to match it. A dedicated probe (scratchpad/
+    # autocorr_probe.py) found tau keeps growing with trace length instead of
+    # converging (2k steps -> 508, 20k steps -> 3995, 100k steps -> 26228) and
+    # the 100k-step 1UBQ trace's first-half/second-half mean energy drifted by
+    # -1.54 std devs -- the chain at T=0.6 hasn't reached a stationary
+    # distribution within any affordable budget, so there's no well-defined tau
+    # to build a "STEPS_PER_SNAP ~ tau" formula on (the earlier tau~500 estimate
+    # was likely undermeasured for the same reason). This matches a pattern
+    # already seen with the R-hat convergence diagnostic (both energy- and
+    # PC1-based variants failed to predict classification correctness and were
+    # abandoned -- see IMPROVEMENTS.md item #2): single-scalar mixing
+    # diagnostics have repeatedly proven unreliable for this classifier.
+    #
+    # Pragmatic pivot: only grow N_SNAPSHOTS with protein size (targets the
+    # clustering-density problem directly, independent of the failed tau
+    # measurement) and bound STEPS_PER_SNAP by a runtime budget instead of a
+    # mixing-time formula. Validated empirically via repeat-run label stability
+    # (tests/landscape_stability_test.py) rather than a theoretical N_eff target.
+    ANCHOR_N_RES       = 76      # ubiquitin -- matches the COMPETITIVE_KT anchor below
+    N_SNAPSHOTS_CAP    = 30      # 2026-07-09: halved alongside N_SNAPSHOTS (was 60 = 2x30)
+    STEPS_PER_SNAP_MIN = 300     # 2026-07-09: halved alongside STEPS_PER_SNAP (was 600)
+    WORK_BUDGET_MULT   = 3.0     # allow ~3x the anchor's total MC-step work
+
+    @classmethod
+    def _adaptive_depth(cls, n_res):
+        """Per-branch (n_snapshots, steps_per_snap) scaled for protein size.
+
+        n_snapshots grows with sqrt(n_res/ANCHOR_N_RES) so DBSCAN still has enough
+        pooled points to resolve real basins as the PCA feature space grows with
+        size. steps_per_snap is held at the validated anchor value and only
+        trimmed if the total work (n_snapshots * steps_per_snap * n_res, since
+        per-step cost is ~O(n_res)) would exceed WORK_BUDGET_MULT times the
+        anchor's work -- see class-level comment above for why this isn't tau-
+        derived.
+        """
+        r = max(n_res, 1) / cls.ANCHOR_N_RES
+        n_snap = int(round(cls.N_SNAPSHOTS * r ** 0.5))
+        n_snap = max(cls.N_SNAPSHOTS, min(n_snap, cls.N_SNAPSHOTS_CAP))
+
+        steps = cls.STEPS_PER_SNAP
+        work_max = cls.WORK_BUDGET_MULT * (cls.N_SNAPSHOTS * cls.STEPS_PER_SNAP * cls.ANCHOR_N_RES)
+        work = n_snap * steps * n_res
+        if work > work_max:
+            steps = max(cls.STEPS_PER_SNAP_MIN, int(work_max / (n_snap * n_res)))
+        return n_snap, steps
+
+    # 병렬 템퍼링 (Replica exchange / parallel tempering, 2026-07-09) — 실험적,
+    # 기본값 꺼짐. 표본 깊이 조사에서 발견한 비정상성(τ가 궤적 길이에 따라
+    # 계속 커지고 절대 수렴하지 않음, 즉 사슬이 어떤 예산으로도 완전히
+    # 평형에 도달하지 못함)을 실제로 해결하기 위한 시도 — 예산을 줄이는
+    # 것(위 N_SNAPSHOTS/STEPS_PER_SNAP)은 증상을 우회했을 뿐, 원인은 그대로다.
+    # 담금질(simulated annealing)은 번인 가속용으로 시험했으나 도움이 안 됐고
+    # (오히려 funnel 점수가 더 낮고 불안정해짐), 실제 생산 샘플링에 쓰면
+    # 최저 에너지 상태로 편향돼 개체군 가중 basin 추정을 왜곡한다 — 병렬
+    # 템퍼링은 각 온도 슬롯이 자기 고유의 정준 앙상블을 유지하도록 교환
+    # 수용 기준 자체가 설계되어 있어 이 편향이 없다. 4개 검증 단백질
+    # (1UBQ/1LYZ/1YPI/1XQ8)로 검증한 결과는 엇갈렸다 — 1LYZ(역사적으로 가장
+    # 불안정했던 사례)에서는 funnel 점수가 실제로 더 높고 좁아졌지만(0.75-1.00
+    # vs 평범한 MC의 0.30-0.63), 나머지 세 단백질(1UBQ/1XQ8/1YPI)에서는
+    # 뚜렷한 개선이 없었고 특히 1YPI(애초에 이 조사를 시작한 대상)에서는
+    # funnel 점수가 오히려 더 불안정해졌다 — 모든 경우에서 1.4-2.5배의
+    # 실행 시간 비용이 들었다. 라벨 자체는 15/15 반복 실행 모두 정확했으나
+    # (한 번도 틀리지 않음), 이 정도의 엇갈린 근거로는 기본값으로 켤 이유가
+    # 되지 않는다 — IMPROVEMENTS.md 항목 #2 참고. 기본 False 유지, 향후
+    # 사다리 간격·교환 주기 등을 다시 튜닝해볼 수 있는 옵트인 기능으로 남김.
+    #
+    # Replica exchange / parallel tempering (2026-07-09) -- an attempt to
+    # actually fix the non-stationarity found during the sampling-depth
+    # investigation (tau keeps growing with trace length and never
+    # converges -- the chain never fully equilibrates at any affordable
+    # budget), rather than just working around it (the N_SNAPSHOTS/
+    # STEPS_PER_SNAP budget cut above sidesteps the symptom, not the cause).
+    # Simulated annealing was tried as a burn-in accelerant and didn't help
+    # (lower, noisier funnel scores); using it for actual production
+    # sampling would bias the walk toward the minimum-energy state and
+    # corrupt population-weighted basin estimates. Replica exchange avoids
+    # that bias by design -- see _ReplicaExchangeBranchRunnable's docstring
+    # for the full swap-acceptance derivation. Validated against all 4
+    # ground-truth proteins: mixed result. 1LYZ (historically the most
+    # flip-flop-prone case) showed a real, tighter/higher funnel range
+    # (0.75-1.00 vs plain MC's 0.30-0.63); 1UBQ/1XQ8/1YPI showed no clear
+    # improvement, and 1YPI specifically (the original motivating case for
+    # this whole investigation) got a *noisier* funnel, not tighter --
+    # each case cost 1.4-2.5x more wall time regardless. Labels stayed
+    # correct in all 15/15 PT runs (never broke anything), but this
+    # evidence doesn't support switching the default on -- kept False,
+    # available as an opt-in for future retuning (the ladder/swap-interval
+    # constants below are untuned starting guesses, not validated optima).
+    USE_REPLICA_EXCHANGE = False
+    PT_N_REPLICAS      = 4       # temperature ladder size, starting guess
+    PT_LADDER_RATIO    = 1.6     # T_k = T0 * ratio**k; ~20-40% neighbor swap accept is the target
+    PT_SWAP_INTERVAL   = 5       # snapshots per segment between swap attempts
 
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
                  extra_seeds=None, backbone_ncac=None):
@@ -1465,10 +1780,10 @@ class LandscapeWorker(QThread):
         from sklearn.decomposition import PCA
         from sklearn.cluster import DBSCAN
 
-        S = self.STEPS_PER_SNAP
         seeds = [self.init_atoms] + self.extra_seeds
         n_branches = len(seeds)
-        N_per = self.N_SNAPSHOTS  # per-branch target -- see class-level comment above
+        n_res = len(self.ca_indices)
+        N_per, S = self._adaptive_depth(n_res)  # per-branch target -- see class-level comment above
 
         # ── 다중 분지 탐색 (Multi-branch exploration) ────────────────────
         # 시드 하나(최적 후보)에서만 뻗으면, 안정 단백질에서는 문제없다
@@ -1516,17 +1831,25 @@ class LandscapeWorker(QThread):
         branch_results = [None] * n_branches
         pool = QThreadPool()
         pool.setMaxThreadCount(max(1, n_branches))
+        pt_note = " [replica exchange]" if self.USE_REPLICA_EXCHANGE else ""
         for bi, seed in enumerate(seeds):
             if n_branches > 1:
                 self.progress.emit(
                     f"  [LANDSCAPE] Branch {bi+1}/{n_branches}: "
-                    f"running {N_per}×{S}-step chain (parallel)…")
+                    f"running {N_per}×{S}-step chain (n_res={n_res}, parallel){pt_note}…")
             else:
                 self.progress.emit(
-                    f"  [LANDSCAPE] Running {N_per}×{S}-step Markov chain…")
-            pool.start(_LandscapeBranchRunnable(
-                bi, seed, self.topo, N_per, S, self.T, self.max_angle,
-                physics_mod_snapshot, branch_results))
+                    f"  [LANDSCAPE] Running {N_per}×{S}-step Markov chain (n_res={n_res}){pt_note}…")
+            if self.USE_REPLICA_EXCHANGE:
+                pool.start(_ReplicaExchangeBranchRunnable(
+                    bi, seed, self.topo, N_per, S, self.T, self.max_angle,
+                    physics_mod_snapshot, branch_results,
+                    self.PT_N_REPLICAS, self.PT_LADDER_RATIO, self.PT_SWAP_INTERVAL,
+                    rng_seed=bi))
+            else:
+                pool.start(_LandscapeBranchRunnable(
+                    bi, seed, self.topo, N_per, S, self.T, self.max_angle,
+                    physics_mod_snapshot, branch_results))
         pool.waitForDone()
 
         all_snapshots, all_energies, branch_lengths = [], [], []

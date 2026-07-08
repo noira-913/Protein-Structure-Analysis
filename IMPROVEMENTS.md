@@ -390,6 +390,232 @@ the one pre-existing parsing bug the same test run exposed:
   per-protein depth, and the deferred within-branch block-stability
   diagnostic.
 
+  **Large-scale (1YPI, 494 res) follow-up — size-adaptive sampling depth,
+  closed as a success.** Picked up the deferred 1YPI-scale item directly.
+  The original plan was to re-measure the autocorrelation time (τ) at 494
+  residues and derive `STEPS_PER_SNAP` from it, the same way the small-scale
+  fix above was derived. A dedicated probe (`scratchpad/autocorr_probe.py`,
+  same `steps_per_snapshot=1` fine-thinning technique as the original τ
+  measurement) instead found **τ does not converge** — it grows with trace
+  length instead of settling (2k steps → τ≈508, 20k steps → τ≈3995, 100k
+  steps → τ≈26228, all reported with the Sokal auto-window still capped,
+  i.e. even the largest trace didn't see the ACF decay below noise). A
+  100k-step 1UBQ trace's first-half vs second-half mean energy also
+  drifted by -1.54 standard deviations — direct evidence the MC chain at
+  T=0.6 hasn't reached a stationary distribution within any affordable
+  step budget, so there is no well-defined τ to build a
+  `STEPS_PER_SNAP ∝ τ^p` formula on. This means the earlier τ≈500 estimate
+  (which drove the small-scale fix above) was itself very likely an
+  underestimate from a too-short probe run, not a true converged mixing
+  time — though that fix still empirically worked (6/6 correct on
+  1UBQ/1LYZ), so the depth increase it produced was directionally right
+  even if the τ number motivating its exact magnitude wasn't reliable.
+  This is the same failure pattern already seen twice with the R-hat
+  convergence diagnostic (both energy- and PC1-based variants failed to
+  track classification correctness and were abandoned, above): a
+  single-scalar mixing/convergence statistic keeps proving unreliable for
+  this specific sampler, on both counts now attempted (R-hat and τ).
+
+  **Two alternatives considered and rejected at this decision point:**
+  - *Investigate the non-stationarity/drift itself as a separate, higher-
+    priority research question* (e.g. whether plain Metropolis MC needs
+    replacing with simulated annealing or replica exchange to actually
+    reach equilibrium at T=0.6) — rejected for now, not because it's
+    wrong, but because it's a substantially larger, open-ended effort than
+    the immediate 1YPI-scale goal, and the existing structural-displacement
+    gate + empirical repeat-run validation already gives a working, tested
+    answer without resolving it first. Left as a standing question rather
+    than closed — the non-stationarity finding itself is real and doesn't
+    go away just because the depth-scaling fix worked around it.
+  - *Proceed with the original τ-derived formula anyway, using the flawed
+    short-trace τ≈500 as a rough anchor* (i.e. keep going as if the small-
+    scale fix's number were reliable, matching what that earlier session
+    effectively did) — rejected as building the next fix on a measurement
+    already caught being wrong, when a measurement-independent mechanism
+    (grow `N_SNAPSHOTS` for clustering density) was available and testable
+    on its own merits instead.
+
+  **Pragmatic pivot (decided over the flawed-τ formula): only grow
+  `N_SNAPSHOTS` with size; bound `STEPS_PER_SNAP` by a runtime budget
+  instead of a mixing-time formula.** `N_SNAPSHOTS` scaling is untouched by
+  the τ failure — it targets a different, independently-valid mechanism
+  (DBSCAN clustering density: PCA feature dimension = 3·n_ca grows ~6.5×
+  from 76→494 residues while the pooled sample count stayed flat, so a
+  real single basin fragments in the higher-dimensional space regardless
+  of chain mixing). Implemented in `LandscapeWorker._adaptive_depth()`
+  (`python/gui_main.py`): `n_snapshots = round(30 * sqrt(n_res/76))`,
+  clamped to `[30, 60]`; `steps_per_snap` held at the validated 1200
+  baseline unless total work (`n_snapshots * steps_per_snap * n_res`,
+  since per-step cost is ~O(n_res)) exceeds 3× the anchor's work budget,
+  in which case `steps_per_snap` shrinks first (down to a floor of 600) to
+  protect the snapshot count, which is the actual target of this fix. Net
+  effect at 1YPI: 60 snapshots × 600 steps/branch — the same total
+  36,000-step-per-branch budget as the unscaled anchor (so no runtime
+  regression versus the old flat scheme), but double the pooled points
+  fed to DBSCAN across the 3 concurrent branches (90→180).
+
+  **Validation: new `tests/landscape_stability_test.py` (repeat-run label
+  stability, no automated classifier test existed before this).** Runs
+  `LandscapeWorker` directly (synchronous `run()` call, no QThread event
+  loop) across 3 concurrent branches per protein, matching real GUI usage.
+  Result: **1UBQ 3/3 ORDERED, 1LYZ 3/3 ORDERED, 1YPI 4/4 ORDERED** — the
+  target fix (1YPI previously split 2/4 ORDERED/POSSIBLY-DISORDERED under
+  the flat-depth scheme). 1YPI funnel scores stayed low (0.133-0.144,
+  similar to the pre-fix 0.10-0.21 range) but the *discrete label* is now
+  reproducible, which is the actual acceptance criterion — consistent with
+  the existing pattern where the structural-displacement gate, not funnel
+  magnitude alone, drives the top-line label. Runtime: 1YPI averaged
+  ~1033s/run (696-1366s across repeats) via the concurrent 3-branch
+  dispatch — acceptable, and identical in raw step count to what the old
+  flat scheme already spent per branch at this size.
+
+  **Status: large-protein-scale phase of the sampling-depth investigation
+  is now closed as a success**, on the same "reproducible across repeats"
+  bar as the small-scale phase. Explicitly not yet done, tracked as
+  follow-ups: GPU-path-specific timing at this scale (validation above
+  used the CPU engine only); a genuine large single-chain IDP test case
+  (still no known suitable deposited structure, same gap noted in the
+  small-scale broader-roster check above); and the deferred within-branch
+  block-stability diagnostic, now doubly de-prioritized given both R-hat
+  and τ have failed as convergence signals for this sampler.
+
+  **Possible future add-on, not started: investigate the MC chain's
+  non-stationarity/drift directly.** One of two alternatives rejected at
+  the pragmatic-pivot decision point above — deferred as a substantially
+  larger, open-ended effort rather than dropped as wrong. The 100k-step
+  1UBQ probe found the chain still drifting (-1.54σ first-half vs
+  second-half mean energy) at T=0.6 with no sign of reaching a stationary
+  distribution within any affordable step budget; the current fix works
+  around this (structural-displacement gate + empirical repeat-run
+  validation) without resolving it. Worth exploring later: simulated
+  annealing or replica exchange in place of plain Metropolis MC, which
+  could address the root cause rather than the symptom.
+
+  **Runtime-optimization follow-up (2026-07-09): what was tried, what was
+  rejected, what was adopted.** Prompted by a GPU-speedup question, this
+  investigated why `run_landscape_trajectory` isn't faster on this
+  machine's real hardware (RTX 4070, CUDA 13.2), and whether the
+  non-stationarity finding above could be worked around cheaply.
+
+  - **GPU rebuild + benchmark: modest 1.48–1.68× speedup, not an order of
+    magnitude.** The CUDA extension wasn't present at session start and
+    was rebuilt (`python setup.py build_ext --inplace`, confirmed against
+    real hardware). Measured on 1UBQ (76 res) and 1LYZ (129 res) at
+    production adaptive-depth settings: CPU 398/205 steps/s vs GPU
+    589/345 steps/s. Modest because the bottleneck is structural (see
+    next finding), not a build/config issue.
+  - **OpenMP was silently disabled by the build — fixed, then found not
+    to matter.** The build log read "OpenMP undetected -> single-thread
+    CPU build." Root-caused directly: `setup.py`'s `has_openmp()` compiles
+    a test file with a bare `cl.exe` that has no `INCLUDE`/`LIB` set
+    unless invoked inside a VS Developer environment
+    (`vcvars64.bat`) — confirmed by reproducing the exact compile error
+    ("`omp.h`: no include path set") and then reproducing a clean
+    "OpenMP detected" build by loading the VS environment first. Re-
+    benchmarked 1LYZ with OpenMP now genuinely enabled (32 logical
+    cores available): **no measurable change** (201 vs 205 steps/s
+    before). Root cause: torsion-angle Metropolis MC is sequential
+    *within* a chain (step N+1 depends on step N's accept/reject), so
+    OpenMP can only parallelize the non-bonded energy sum for one step's
+    moved atoms (~N/2 atoms) — at these system sizes (600-3800 atoms,
+    further thinned by the O(N) cell list) there isn't enough per-step
+    parallel work to amortize 32-way thread synchronization overhead.
+    Very likely the same underlying reason the GPU speedup above was
+    modest rather than dramatic: same sequential-chain bottleneck, just
+    on different hardware.
+  - **Simulated annealing (as a burn-in accelerant): tested, rejected —
+    didn't help, and conceptually risky for this use case anyway.**
+    Tested on 1UBQ: an annealed burn-in (4000 steps, T 1.5->0.6) followed
+    by a 4x-reduced production budget gave 3/3 ORDERED but a *lower and
+    more variable* funnel (0.40-0.73) than the identical reduced budget
+    with no annealing at all (0.82-1.00), and cost more wall time (33s vs
+    25s avg). Conceptual reason this was always a narrow tool at best:
+    plain SA (used for the *production* sampling, not just burn-in)
+    deliberately biases the walk toward the single lowest-energy state,
+    which is the wrong ensemble for population-weighted basin
+    classification — only real replica exchange (which preserves each
+    replica's own canonical ensemble) avoids that bias, and that was
+    *not* what was tested here.
+  - **The one deliberate, validated win: cutting the sampling budget
+    ~4x holds up on every ground-truth case available, not just the easy
+    one.** Tested reduced budget (~half of both `n_snapshots` and
+    `steps_per_snap`, i.e. ~4x fewer total steps) against full production
+    budget on all 4 available ground-truth proteins:
+
+    | Protein | Ground truth | Full → reduced label | Funnel (full vs reduced) | Time (full → reduced) |
+    |---|---|---|---|---|
+    | 1UBQ (76 res) | ORDERED | ORDERED, ORDERED | — vs 0.82-1.00 | — |
+    | 1LYZ (129 res) | ORDERED | ORDERED, ORDERED | 0.31-0.33 vs 0.32-0.53 | 230s → 60.6s |
+    | 1YPI (494 res) | ORDERED | ORDERED, ORDERED | 0.13-0.14 vs 0.12-0.21 | 1033s → 244s |
+    | 1XQ8 (140 res) | real IDP | POSSIBLY DISORDERED, POSSIBLY DISORDERED | 0.33-0.34 vs 0.32-0.35 | 508s → 120s |
+
+    12/12 repeat runs correct across all four sizes and both
+    classification directions (ordered *and* the one real-disorder case
+    available), at ~4x less wall time, funnel scores in the same range
+    either way (not degraded). This closes the one gap the earlier
+    sampling-depth validation had — 1XQ8 (the real IDP) had never
+    actually been re-tested against the current adaptive-depth code
+    before this check.
+
+  **Decision: adopt the ~4x reduced budget as the new production
+  default** (halving `BASE_N_SNAPSHOTS`/`BASE_STEPS_PER_SNAP` and their
+  dependent clamps in `LandscapeWorker`) — real, already-validated
+  speedup with no algorithm change. **Separately, proceed with a full
+  design for replica exchange (parallel tempering)** as the actual fix
+  for the underlying non-stationarity problem, scoped as its own larger
+  follow-up rather than bundled with the budget-cut adoption. Confirmed
+  during design: the C++ engine's Metropolis acceptance is `exp(-ΔE/T)`
+  with `T` already in kcal/mol (`physics_engine.cpp:64,68`), so the
+  standard swap-acceptance formula `p_swap = min(1, exp((E_i-E_j) *
+  (1/T_i - 1/T_j)))` applies directly with no unit conversion. Full
+  architecture (segmented execution reusing the block-chaining technique
+  already proven by the annealing test above, kept orthogonal to the
+  existing 3-branch population-coverage structure, new tunables:
+  replica count, temperature ladder, swap interval) is scoped in the
+  session plan; implementation not yet started as of this entry.
+
+  **Reduced budget adopted.** `LandscapeWorker.N_SNAPSHOTS`/`STEPS_PER_SNAP`
+  halved (30→15, 1200→600) and dependent clamps (`N_SNAPSHOTS_CAP`
+  60→30, `STEPS_PER_SNAP_MIN` 600→300) re-derived to match. Re-ran the
+  full `tests/landscape_stability_test.py` suite (now covering all 4
+  ground-truth proteins, 1XQ8 newly added) against the new defaults:
+  **13/13 repeat runs correct** (1UBQ 3/3, 1LYZ 3/3, 1YPI 4/4, 1XQ8 3/3),
+  confirming the change as adopted, not just measured once.
+
+  **Replica exchange (parallel tempering): implemented
+  (`_ReplicaExchangeBranchRunnable`/`_ReplicaSegmentRunnable`,
+  `LandscapeWorker.USE_REPLICA_EXCHANGE` toggle, default off) and
+  validated against all 4 ground-truth proteins — mixed result, kept
+  disabled.** Segmented execution (block-chaining the same way as the
+  annealing test), inner `QThreadPool` per branch, alternating-pair swap
+  scheme with the confirmed `p_swap = min(1, exp((E_i-E_j)*(1/T_i-1/T_j)))`
+  formula (starting ladder: 4 replicas, ratio 1.6, swap every 5
+  snapshots — untuned starting guesses). Compared PT against the
+  already-adopted reduced budget on all 4 cases, same slot-0 sample
+  budget each time:
+
+  | Protein | Plain funnel / time | PT funnel / time | Verdict |
+  |---|---|---|---|
+  | 1UBQ (76 res) | 0.667-1.000 / 26.6s | 0.778-1.000 / 50.7s | no clear win, ~1.9x cost |
+  | 1LYZ (129 res) | 0.300-0.633 / 86.0s | 0.750-1.000 / 117.2s | real win, ~1.4x cost |
+  | 1XQ8 (140 res, IDP) | 0.333-0.383 / 72.7s | 0.350-0.450 / 178.9s | marginal, ~2.5x cost |
+  | 1YPI (494 res) | 0.144-0.189 / 236.1s | 0.122-0.278 / 450.5s | worse (wider/noisier), ~1.9x cost |
+
+  15/15 PT runs stayed correctly labeled (never broke anything), but
+  only 1LYZ showed a genuine accuracy/consistency benefit (tighter,
+  higher funnel range vs. plain MC's 0.30-0.63 — real signal on the
+  historically hardest, most flip-flop-prone case in this whole
+  investigation). The other 3 cases showed no clear win for a real
+  1.4-2.5x wall-time cost, and on 1YPI specifically — the original
+  motivating case for the whole large-scale investigation — PT actually
+  made the funnel score *noisier*, not tighter. This is the "neither
+  shows up" outcome the design explicitly flagged as a real possibility,
+  materializing on 3 of 4 cases rather than being ruled out. **Decision:
+  keep `USE_REPLICA_EXCHANGE = False`** — implemented and available as an
+  opt-in for future tuning (untuned ladder/swap-interval constants could
+  plausibly change this picture), but not adopted as the production
+  default given the mixed evidence.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
