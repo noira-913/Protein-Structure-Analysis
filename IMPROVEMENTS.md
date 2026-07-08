@@ -616,6 +616,133 @@ the one pre-existing parsing bug the same test run exposed:
   plausibly change this picture), but not adopted as the production
   default given the mixed evidence.
 
+  **Follow-up: found and fixed a real bug in the PT implementation
+  (segment-scoped step-size reset), retested — did not change the
+  overall verdict, and surfaced a new accuracy risk.** Root cause:
+  `run_landscape_trajectory` (`physics_engine.cpp`) has its own online
+  step-size tuning (`cur_max`, rescaled every 200 steps toward a
+  28-52% acceptance target) that is call-scoped -- it resets to the base
+  `max_angle` and is discarded at the end of every call. The plain-MC
+  path calls this once per branch (full trajectory to adapt); PT's
+  segmented execution called it once per short swap-interval segment
+  (~3000 steps), so `cur_max` restarted from scratch every segment,
+  getting only ~15 tuning windows before being thrown away -- plausibly
+  hurting 1YPI's much larger conformational space the most, which lined
+  up with 1YPI being the one case that got *worse* under PT.
+
+  Fixed by adding a new C++ method, `run_landscape_segment`
+  (`physics_engine.cpp`, next to `run_landscape_trajectory`) that also
+  returns the final tuned `cur_max`, so `_ReplicaExchangeBranchRunnable`
+  (`python/gui_main.py`) can thread it forward as the next segment's
+  `max_angle` (and swap it alongside state/energy on an accepted
+  replica swap, since the tuned step size belongs to the physical
+  configuration, not the temperature slot). Duplicated the ~220-line
+  function body rather than extracting a shared helper, matching this
+  file's own stated precedent for `run_landscape_trajectory` vs.
+  `generate_ensemble` (duplicate to avoid touching an already-verified
+  hot path) -- CPU only; `physics_engine_cuda.cu` has the identical
+  reset bug, left unfixed as a deferred follow-up since all PT
+  validation has been CPU-only throughout.
+
+  **Retest result: helped 1YPI a little, but removed 1LYZ's one clear
+  win, and introduced a real ~40% misclassification rate on 1XQ8.**
+
+  | Protein | Old (buggy) PT | Fixed PT | Plain MC (reference) |
+  |---|---|---|---|
+  | 1YPI (494 res) | funnel 0.122-0.278 / 450.5s avg | funnel 0.133-0.244 / 397.2s avg (narrower, faster, but still worse than plain) | funnel 0.144-0.189 / 236.1s |
+  | 1LYZ (129 res) | funnel 0.750-1.000 (real win) | funnel 0.233-0.483 (win gone -- back to plain-MC-like) | funnel 0.300-0.633 |
+  | 1XQ8 (140 res, IDP) | 3/3 correct POSSIBLY DISORDERED | **2/5 wrong (ORDERED)** across two repeat batches | 3/3 correct |
+
+  The 1YPI improvement is real but partial (narrower funnel range, ~12%
+  faster) and doesn't close the gap to plain MC. More importantly,
+  1LYZ's funnel dropped right back down once `cur_max` was allowed to
+  settle and stop resetting -- suggesting the *bug itself* (aggressive,
+  repeated step-size reinitialization) was accidentally providing
+  exploration diversity that helped 1LYZ, an ironic result: "fixing" a
+  bug that looked purely like wasted-effort busywork actually removed
+  an accidental benefit in one case, while not clearly helping the
+  motivating case (1YPI) enough to matter. The 1XQ8 result is the
+  clearest signal: a real, reproduced (not one-off) ~40% wrong-label
+  rate on the one case that checks the classifier still detects genuine
+  disorder, appearing only after the fix -- both the buggy PT and plain
+  MC got this case right every time.
+
+  **Final decision: `USE_REPLICA_EXCHANGE` stays `False`.** The
+  step-size-reset fix is correct engineering (kept in the code -- there's
+  no reason to revert a genuine bug fix) but does not change the
+  practical verdict on replica exchange as implemented: it does not
+  reliably outperform the already-shipped budget cut on any case, and
+  now has a demonstrated accuracy risk on the real-disorder case. Not
+  recommended for further tuning along this exact design without a
+  more fundamental rethink (e.g. cost-normalized comparison, a properly
+  tuned temperature ladder, or a different enhanced-sampling method
+  entirely) rather than incremental fixes to the current architecture.
+
+  **Compute-time follow-up: GPU auto-selection + size-dependent branch
+  count — real, unconditional speedup, no accuracy tradeoff (unlike
+  PT).** With PT closed out as not worth pursuing further, returned to
+  the original compute-time question. Two findings:
+
+  - **GPU was opt-in only** (a "Yes/No" modal at GUI startup,
+    `ProteinApp.__init__`) despite being validated to within 0.06% of
+    CPU (see "Completed Work" -> Performance) and already having a
+    runtime fallback to CPU on failure (`gpu_fallback` signal) -- a pure
+    speed win gated behind a click every session for no remaining
+    reason. Changed to auto-select GPU when detected.
+  - **GPU branch concurrency is far cheaper than expected, but only at
+    small-to-medium protein sizes.** Directly measured (not assumed):
+    running N `_LandscapeBranchRunnable`s concurrently via `QThreadPool`
+    on GPU, wall time barely grows with branch count at 1LYZ's scale
+    (129 res): 1 branch 59.8s, 3 branches 66.1s (~1.11x), 6 branches
+    79.7s (~1.33x) -- per-branch amortized cost actually *improves*
+    (59.8s -> 22.0s -> 13.3s) as more branches queue up. Root cause
+    (confirmed by reading `physics_engine_cuda.cu`): no `cudaStream_t`
+    is ever created, everything shares the implicit default stream: at
+    this atom count each kernel is small enough that CPU-side
+    launch-dispatch overhead dominates over actual kernel execution
+    time, and that overhead pipelines across threads even without real
+    simultaneous kernel execution on the device.
+
+  **First attempt (flat 6 branches on GPU, rejected): regressed 1YPI.**
+  Naively fixed `GPU_BRANCH_COUNT = 6` unconditionally. Validated
+  end-to-end (real `PipelineWorker`-generated ensemble -> real
+  `_start_landscape`-style top-K selection -> real `LandscapeWorker`
+  run) on all 4 ground-truth proteins: 1UBQ/1LYZ/1XQ8 all correct and
+  at least as fast as the CPU 3-branch baseline (1LYZ notably faster:
+  71.8s -> 64.8s with *double* the branches), but **1YPI (494 res) got
+  34% slower** (194.5s -> 260.1s), despite being correctly labeled every
+  time. Root cause: the "nearly free" concurrency measured at 76-140 res
+  is a launch-dispatch-overhead artifact, not real device-level
+  parallelism -- at 494 res (~4x the atoms), each kernel is large enough
+  to genuinely occupy the GPU's compute resources on its own, so
+  "concurrent" branches start actually competing for the same SMs/cores
+  instead of hiding behind cheap dispatch overhead. A structural
+  crossover tied to kernel size, not thermal throttling.
+
+  **Fix: branch count scales down with protein size instead of a flat
+  constant.** `_start_landscape` (`python/gui_main.py`) now computes
+  `branch_count = max(3, min(6, round(6 / sqrt(max(n_res,140)/140))))`
+  on GPU (CPU unchanged at flat 3) -- stays at the confirmed-good max
+  (6) up to 140 res (the largest size directly validated at 6 branches),
+  then decays smoothly above it, landing at 3 (matching CPU) for 1YPI's
+  494 res by construction. The exact crossover between 140 and 494 res
+  is unmeasured -- this is a smooth, principled approximation (same
+  sqrt-decay style as `_adaptive_depth`'s size scaling), not a
+  independently validated threshold. Also bumped the initial ensemble's
+  `n_cand` from 5 to 8 (cheap -- 300 steps/candidate) so enough distinct
+  top-K candidates exist to actually fill 6 branches when selected.
+
+  **Re-validated end-to-end after the fix, all 4 ground-truth proteins,
+  real ensemble-generation -> branch-selection -> landscape-run path
+  (not the isolated pieces): 4/4 correct.** 1UBQ (76 res, 6 branches):
+  ORDERED, 40.6s. 1LYZ (129 res, 6 branches): ORDERED, 89.3s. 1XQ8
+  (140 res, 6 branches): POSSIBLY DISORDERED, 124.3s. 1YPI (494 res,
+  branch count now correctly drops to 3 via the formula): ORDERED,
+  223.1s -- back in line with the CPU 3-branch baseline (194.5s), not
+  the regressed 260.1s the flat-6 version produced. The size-dependent
+  scaling closes the regression while keeping the win on every smaller
+  case.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer

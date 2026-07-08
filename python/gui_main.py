@@ -1478,6 +1478,11 @@ class _ReplicaExchangeBranchRunnable(QRunnable):
         engines = [physics_mod.PhysicsEngine() for _ in range(self.n_replicas)]
         states = [self.seed for _ in range(self.n_replicas)]
         energies = [None] * self.n_replicas
+        # Per-replica tuned step size, threaded across segments (see
+        # run_landscape_segment's C++ docstring for why this exists --
+        # run_landscape_trajectory's online step-size tuning is call-scoped
+        # and would otherwise restart from self.max_angle every segment).
+        cur_maxes = [self.max_angle for _ in range(self.n_replicas)]
 
         n_segments = max(1, self.n_snapshots // self.swap_interval)
         pooled_snaps, pooled_energies = [], []
@@ -1489,13 +1494,14 @@ class _ReplicaExchangeBranchRunnable(QRunnable):
             for k in range(self.n_replicas):
                 pool.start(_ReplicaSegmentRunnable(
                     k, engines[k], states[k], self.topo, self.swap_interval,
-                    self.steps_per_snap, ladder[k], self.max_angle, seg_results))
+                    self.steps_per_snap, ladder[k], cur_maxes[k], seg_results))
             pool.waitForDone()
 
             for k in range(self.n_replicas):
-                seg_snaps, seg_ens = seg_results[k]
+                seg_snaps, seg_ens, seg_cur_max = seg_results[k]
                 states[k] = seg_snaps[-1]
                 energies[k] = seg_ens[-1]
+                cur_maxes[k] = seg_cur_max
                 if k == 0:
                     pooled_snaps.extend(seg_snaps)
                     pooled_energies.extend(seg_ens)
@@ -1514,6 +1520,10 @@ class _ReplicaExchangeBranchRunnable(QRunnable):
                 if rng.random() < p_swap:
                     states[a], states[b] = states[b], states[a]
                     energies[a], energies[b] = energies[b], energies[a]
+                    # The tuned step size belongs to the physical replica
+                    # (configuration) that's moving between temperature
+                    # slots, same as its configuration and energy already do.
+                    cur_maxes[a], cur_maxes[b] = cur_maxes[b], cur_maxes[a]
 
         return pooled_snaps, pooled_energies
 
@@ -1521,16 +1531,23 @@ class _ReplicaExchangeBranchRunnable(QRunnable):
 class _ReplicaSegmentRunnable(QRunnable):
     """Runs one replica's single segment within one PT swap interval.
 
-    Writes (snapshots, energies) into results[k]. Note QThreadPool does not
-    propagate a worker thread's Python exception back to the caller -- if
-    run_landscape_trajectory raises here, results[k] is simply left at its
-    None sentinel. The caller (_ReplicaExchangeBranchRunnable._run_pt)
-    unpacking that None then raises its own TypeError, which the outer
-    _ReplicaExchangeBranchRunnable.run() try/except does catch (triggering
-    the same GPU-fallback-retry-or-mark-fatal path as _LandscapeBranchRunnable)
-    -- so a segment failure is not silently swallowed or hung, but the
-    original exception's detail is lost in favor of the secondary TypeError.
-    Acceptable for now since this path is not yet the production default.
+    Calls run_landscape_segment (not run_landscape_trajectory) specifically
+    to get the final tuned cur_max back -- see that C++ method's docstring
+    for why: run_landscape_trajectory's online step-size tuning is call-
+    scoped and would otherwise restart from self.max_angle every segment
+    instead of carrying forward what it learned.
+
+    Writes (snapshots, energies, final_cur_max) into results[k]. Note
+    QThreadPool does not propagate a worker thread's Python exception back
+    to the caller -- if run_landscape_segment raises here, results[k] is
+    simply left at its None sentinel. The caller
+    (_ReplicaExchangeBranchRunnable._run_pt) unpacking that None then raises
+    its own TypeError, which the outer _ReplicaExchangeBranchRunnable.run()
+    try/except does catch (triggering the same GPU-fallback-retry-or-mark-
+    fatal path as _LandscapeBranchRunnable) -- so a segment failure is not
+    silently swallowed or hung, but the original exception's detail is lost
+    in favor of the secondary TypeError. Acceptable for now since this path
+    is not yet the production default.
     """
     def __init__(self, k, engine, state, topo, n_snapshots, steps_per_snap,
                  T, max_angle, results):
@@ -1546,10 +1563,10 @@ class _ReplicaSegmentRunnable(QRunnable):
         self.results = results
 
     def run(self):
-        snaps, ens = self.engine.run_landscape_trajectory(
+        snaps, ens, final_cur_max = self.engine.run_landscape_segment(
             self.state, self.topo, self.n_snapshots, self.steps_per_snap,
             self.T, self.max_angle)
-        self.results[self.k] = (snaps, ens)
+        self.results[self.k] = (snaps, ens, final_cur_max)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1742,6 +1759,28 @@ class LandscapeWorker(QThread):
     # evidence doesn't support switching the default on -- kept False,
     # available as an opt-in for future retuning (the ladder/swap-interval
     # constants below are untuned starting guesses, not validated optima).
+    #
+    # Follow-up (2026-07-09): found a real bug behind 1YPI's regression --
+    # run_landscape_trajectory's own online step-size tuning (cur_max) is
+    # call-scoped, resetting every call; PT called it once per short
+    # segment instead of once per full trajectory, so cur_max never got
+    # more than ~15 tuning windows before being discarded. Fixed via a new
+    # C++ method, run_landscape_segment (also returns the final cur_max so
+    # it can be threaded across segments -- see _ReplicaSegmentRunnable/
+    # _ReplicaExchangeBranchRunnable._run_pt), CPU only. Retested: 1YPI's
+    # funnel narrowed a bit (0.133-0.244 vs 0.122-0.278) and got ~12%
+    # faster, but still trails plain MC (0.144-0.189); 1LYZ's funnel
+    # dropped back to plain-MC-like (0.233-0.483, the 0.75-1.00 win is
+    # gone -- the bug's aggressive step-size reset was apparently an
+    # accidental source of useful exploration diversity there); and 1XQ8
+    # (the real IDP) came back wrong (ORDERED) on 2 of 5 repeats across two
+    # batches, a real, reproduced regression neither the buggy PT nor
+    # plain MC ever showed. Kept as a correct bug fix (no reason to revert
+    # real engineering), but it does not change the verdict: still False,
+    # and this specific design is not recommended for further incremental
+    # tuning -- a cost-normalized comparison, a properly tuned ladder, or a
+    # different enhanced-sampling method entirely would be needed to
+    # revisit this, not another fix to the current architecture.
     USE_REPLICA_EXCHANGE = False
     PT_N_REPLICAS      = 4       # temperature ladder size, starting guess
     PT_LADDER_RATIO    = 1.6     # T_k = T0 * ratio**k; ~20-40% neighbor swap accept is the target
@@ -2491,16 +2530,25 @@ class ProteinApp(QMainWindow):
         self.setWindowTitle("ALMA — Protein Structure Analysis")
         self.setMinimumSize(1300, 800)
 
+        # GPU 자동 선택 (2026-07-09): 이전에는 매 세션 "GPU 사용?" 모달을 눌러야
+        # GPU를 썼다. GPU 백엔드는 이미 CPU 대비 오차 0.06% 이내로 검증됐고
+        # (완료 작업 → 성능 참고), 실행시간 실패도 이미 CPU로 자동 폴백된다
+        # (gpu_fallback 시그널) — GPU가 있으면 조건 없이 이득만 있는 상황이라
+        # 매번 클릭을 요구할 이유가 없다. GPU 감지 시 자동 사용, 실패하면
+        # 조용히 CPU로 남는다.
+        #
+        # GPU auto-selection (2026-07-09): previously required clicking "Yes"
+        # on a modal every session to use GPU. The GPU backend is already
+        # validated to within 0.06% of CPU (see "Completed Work" -> Performance)
+        # and runtime failures already fall back to CPU automatically (the
+        # gpu_fallback signal) -- with no accuracy tradeoff and an existing
+        # safety net, there's no reason to gate a pure speed win behind a
+        # click every session. Auto-select GPU when detected; silently stays
+        # on CPU if detection fails.
         self._physics_mod = protein_physics
         cuda_mod, gpu_name = _try_gpu_backend()
         if cuda_mod is not None:
-            reply = QMessageBox.question(
-                self, "GPU Detected",
-                f"GPU found: {gpu_name}\n\nUse GPU acceleration?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._physics_mod = cuda_mod
+            self._physics_mod = cuda_mod
         self._backend = (
             f"GPU  {gpu_name}" if self._physics_mod is not protein_physics else "CPU"
         )
@@ -2917,7 +2965,17 @@ class ProteinApp(QMainWindow):
         self.landscape_start_btn.setText("◈  EXPLORE LANDSCAPE")
         self._log(f"[{target}] Analysis initiated")
 
-        self.worker = PipelineWorker(self.engine, target, self._physics_mod)
+        # n_cand 상향 (2026-07-09): 기본 5개로는 GPU에서 늘어난 분지 수(아래
+        # _start_landscape의 GPU_BRANCH_COUNT=6 참고)를 뒷받침할 후보가 부족하다.
+        # 후보 1개당 300스텝(steps 기본값)뿐이라 몇 개 늘려도 초기 파이프라인
+        # 실행 비용은 미미하다 — CPU/GPU 모두에 적용해도 무방.
+        #
+        # Bump n_cand (2026-07-09): the default 5 isn't enough to back the
+        # higher GPU branch count below (GPU_BRANCH_COUNT=6 in
+        # _start_landscape). Each extra candidate only costs 300 steps
+        # (the default `steps` arg), so raising this is cheap regardless of
+        # CPU/GPU -- applied unconditionally rather than gating it, too.
+        self.worker = PipelineWorker(self.engine, target, self._physics_mod, n_cand=8)
         self.worker.progress.connect(self._log)
         self.worker.metrics.connect(self._on_metrics)
         self.worker.finished.connect(self._on_done)
@@ -3350,12 +3408,61 @@ class ProteinApp(QMainWindow):
         # protein with no dominant state (an IDP) the single "best"
         # candidate can be close to an arbitrary sample, so branching from
         # it alone biases the result.
+        # 분지 수 (2026-07-09): 처음엔 GPU에서 무조건 6분지로 고정했으나,
+        # 1YPI(494잔기)에서 오히려 CPU 3분지보다 34% 느려지는 것을 발견했다
+        # (194.5s → 260.1s). 원인: 76-140잔기에서 "거의 공짜"였던 동시성은
+        # 사실 진짜 커널 동시 실행이 아니라 — 커널이 작아 실행 시간보다
+        # CPU 쪽 커널 실행(launch) 오버헤드가 더 크고, 그 오버헤드가
+        # 여러 스레드에 걸쳐 파이프라인되며 숨겨진 것뿐이었다(명시적
+        # cudaStream_t 없이 전부 기본 스트림을 공유 — physics_engine_cuda.cu
+        # 확인함). 494잔기(~4배 원자 수)에서는 커널 자체가 GPU 연산 자원을
+        # 실제로 점유할 만큼 커져서, "동시" 분지들이 진짜로 같은 SM/코어를
+        # 놓고 경쟁하게 된다 — 열 스로틀링이 아니라 구조적 전환점.
+        #
+        # 실측 4개 지점(76/129/140/494잔기)에 맞춰 크기에 따라 매끄럽게
+        # 줄어드는 함수로 대체: 140잔기까지는 6분지 그대로(전부 실측 확인),
+        # 그 이상은 1/sqrt(n_res/140)로 감소시켜 494잔기에서 자연히 3분지로
+        # (CPU와 동일) 수렴한다 — 정확한 "전환점"은 아직 모르므로(140~494
+        # 사이 데이터 없음) 하드 임계값 대신 완만한 함수로 안전하게 근사.
+        #
+        # Branch count (2026-07-09): originally fixed at 6 on GPU
+        # unconditionally, but found 1YPI (494 res) got 34% *slower* than
+        # the CPU 3-branch baseline (194.5s -> 260.1s). Root cause: the
+        # "nearly free" concurrency measured at 76-140 res wasn't real
+        # simultaneous kernel execution -- at that atom count each kernel is
+        # small enough that CPU-side launch-dispatch overhead dominates over
+        # actual kernel runtime, and that overhead pipelines across threads
+        # (no explicit cudaStream_t anywhere -- confirmed in
+        # physics_engine_cuda.cu -- everything shares the default stream).
+        # At 494 res (~4x the atoms), kernels are big enough to genuinely
+        # occupy the GPU's compute resources on their own, so "concurrent"
+        # branches start really competing for the same SMs/cores -- a
+        # structural crossover, not thermal throttling.
+        #
+        # Replaced the flat constant with a function matching the 4 real
+        # measured points (76/129/140 res): stays at the max (6, all
+        # confirmed good there) up to the anchor size, then decays as
+        # 1/sqrt(n_res/anchor) above it -- lands at 3 (matching CPU) for
+        # 1YPI's 494 res by construction. The exact crossover point between
+        # 140 and 494 res is unmeasured, so this is a smooth approximation,
+        # not a validated threshold -- see IMPROVEMENTS.md item #2.
+        GPU_BRANCH_MAX    = 6
+        GPU_BRANCH_ANCHOR = 140   # largest size where 6 branches is confirmed good
+        CPU_BRANCH_COUNT  = 3
+        n_res_for_branching = len(self._ca_indices) if self._ca_indices else GPU_BRANCH_ANCHOR
+        if self._physics_mod is not protein_physics:
+            ratio = max(n_res_for_branching, GPU_BRANCH_ANCHOR) / GPU_BRANCH_ANCHOR
+            branch_count = max(CPU_BRANCH_COUNT,
+                                min(GPU_BRANCH_MAX, round(GPU_BRANCH_MAX / ratio ** 0.5)))
+        else:
+            branch_count = CPU_BRANCH_COUNT
+
         start_atoms = self._init_atoms
         extra_seeds = []
         branch_note = ""
         if self._ensemble and self._energies:
             order = np.argsort(self._energies)
-            top_k = order[:min(3, len(order))]
+            top_k = order[:min(branch_count, len(order))]
             best_idx = int(top_k[0])
             start_atoms = self._ensemble[best_idx]
             extra_seeds = [self._ensemble[int(i)] for i in top_k[1:]]

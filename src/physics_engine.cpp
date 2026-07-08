@@ -2438,6 +2438,249 @@ public:
         return {snapshots, energies};
     }
 
+    // run_landscape_segment: identical to run_landscape_trajectory above, except
+    // it also returns the final tuned cur_max. Exists for replica-exchange
+    // (parallel tempering, python/gui_main.py's _ReplicaExchangeBranchRunnable):
+    // run_landscape_trajectory's online step-size tuning (cur_max, rescaled every
+    // TUNE_FREQ steps toward [TARGET_LO, TARGET_HI] acceptance) is call-scoped --
+    // it resets to max_angle and is discarded at the end of every call. PT calls
+    // the trajectory function once per short swap-interval segment rather than
+    // once for the whole run, so without this, cur_max would restart from
+    // scratch every segment instead of carrying forward what it learned -- a
+    // real bug found empirically (1YPI, the largest test protein, got a
+    // *noisier* funnel score under PT than plain MC, plausibly because its
+    // bigger conformational space needs more than ~15 tuning windows per
+    // segment to find a good step size). This function lets the Python caller
+    // thread cur_max through as the next segment's max_angle argument.
+    //
+    // Deliberately a full duplicate of run_landscape_trajectory's body, not a
+    // shared private helper that both call -- matching this file's own
+    // established precedent (see run_landscape_trajectory's own docstring
+    // above: its body is "duplicated rather than shared via a helper" relative
+    // to generate_ensemble, specifically to avoid touching an already-verified
+    // hot path). Refactoring a shared helper here would require editing
+    // run_landscape_trajectory itself, which this precedent exists to avoid.
+    //
+    // CPU only -- physics_engine_cuda.cu's run_landscape_trajectory has the
+    // identical reset behavior (S.cur_max = max_angle at the top of every
+    // call) but does not yet have a GPU equivalent of this fix; deferred.
+    std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double>
+    run_landscape_segment(
+        const std::vector<Particle>& init,
+        const BondTopology& topo,
+        int n_snapshots, int steps_per_snapshot,
+        double T = 0.6,
+        double max_angle = 0.12)
+    {
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (n_snapshots <= 0 || steps_per_snapshot <= 0)
+            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+
+        size_t N   = init.size();
+        int    nrb = (int)topo.rot_bonds.size();
+        int    ncp = (int)topo.concerted_pairs.size();
+
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
+        snapshots.reserve(n_snapshots);
+        energies.reserve(n_snapshots);
+
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        double curE = total_e(st, nl, a, &topo);
+
+        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        std::vector<bool> in_side(N, false);
+
+        double cur_max = max_angle;
+        int    acc_win = 0, tot_win = 0;
+        constexpr int    TUNE_FREQ  = 200;
+        constexpr double TARGET_LO  = 0.28, TARGET_HI = 0.52;
+        constexpr double SCALE_UP   = 1.06,  SCALE_DOWN = 0.94;
+        constexpr double ANGLE_MAX  = 0.50,  ANGLE_MIN  = 0.004;
+
+        auto cross_e = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (in_side[i] == in_side[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+
+        auto try_torsion = [&]() -> std::pair<bool,bool> {
+            int            rb_idx = pick_rb(gen);
+            const RotBond& rb     = topo.rot_bonds[rb_idx];
+            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            if (side.empty()) return {false, false};
+
+            double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
+            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            if (al < 1e-10) return {false, false};
+            ax/=al; ay/=al; az/=al;
+
+            double base_d = (rb.kind == BondKind::BACKBONE_PHI ||
+                             rb.kind == BondKind::BACKBONE_PSI)
+                            ? cur_max : cur_max * 2.5;
+            base_d *= topo.rot_bond_scale[rb_idx];
+            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : side) in_side[k] = true;
+
+            std::vector<std::array<double,3>> old_pos(side.size());
+            std::vector<double>               old_born(side.size());
+            for (size_t k = 0; k < side.size(); ++k) {
+                int idx = side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double old_cross = cross_e();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+            for (int k : side)
+                rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ax, ay, az, cosD, sinD);
+            for (int k : side) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < side.size(); ++k) {
+                    int idx = side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : side) in_side[k] = false;
+            return {accepted, true};
+        };
+
+        auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+            if (ncp == 0) return {false, false};
+            int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
+            int phi_k  = topo.concerted_pairs[cp_idx].first;
+            int psi_k  = topo.concerted_pairs[cp_idx].second;
+            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            if (phi_side.empty() || psi_side.empty()) return {false, false};
+
+            for (int k : phi_side) in_side[k] = true;
+
+            const RotBond& phi_rb = topo.rot_bonds[phi_k];
+            double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
+            double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
+            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
+            p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
+
+            std::vector<std::array<double,3>> old_pos(phi_side.size());
+            std::vector<double>               old_born(phi_side.size());
+            for (size_t k = 0; k < phi_side.size(); ++k) {
+                int idx = phi_side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+            double old_cross = cross_e();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : phi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
+
+            const RotBond& psi_rb = topo.rot_bonds[psi_k];
+            double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
+            double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
+            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            if (p2l < 1e-10) {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                }
+                for (int k : phi_side) in_side[k] = false;
+                return {false, false};
+            }
+            p2ax/=p2l; p2ay/=p2l; p2az/=p2l;
+            for (int k : psi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p2ox, p2oy, p2oz, p2ax, p2ay, p2az, cosD, -sinD);
+
+            for (int k : phi_side) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : phi_side) in_side[k] = false;
+            return {accepted, true};
+        };
+
+        for (int snap = 0; snap < n_snapshots; ++snap) {
+            for (int s = 0; s < steps_per_snapshot; ++s) {
+                if (nl.needs_rebuild(st)) {
+                    nl.build(st);
+                    a    = born_radii(st, nl);
+                    curE = total_e(st, nl, a, &topo);
+                }
+                bool do_crank = ncp > 0 && uni(gen) < 0.25;
+                auto [accepted, did_move] = do_crank ? try_crankshaft() : try_torsion();
+                if (did_move) {
+                    acc_win += accepted ? 1 : 0;
+                    if (++tot_win == TUNE_FREQ) {
+                        double rate = (double)acc_win / TUNE_FREQ;
+                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        acc_win = tot_win = 0;
+                    }
+                }
+            }
+            snapshots.push_back(st);
+            energies.push_back(calculate_potential(st, &topo));
+        }
+        return {snapshots, energies, cur_max};
+    }
+
     // lowest_energy_structure: scan an ensemble and return the conformation with the
     // minimum total potential energy.  Calls calculate_potential on every member,
     // so this is O(ncand · N²) and should only be called once after MC finishes.
@@ -2629,6 +2872,11 @@ PYBIND11_MODULE(protein_physics,m){
         .def("lowest_energy_structure",&PhysicsEngine::lowest_energy_structure,
              py::arg("ensemble"),py::call_guard<py::gil_scoped_release>())
         .def("run_landscape_trajectory",&PhysicsEngine::run_landscape_trajectory,
+             py::arg("initial_state"),py::arg("topology"),
+             py::arg("n_snapshots"),py::arg("steps_per_snapshot"),
+             py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
+             py::call_guard<py::gil_scoped_release>())
+        .def("run_landscape_segment",&PhysicsEngine::run_landscape_segment,
              py::arg("initial_state"),py::arg("topology"),
              py::arg("n_snapshots"),py::arg("steps_per_snapshot"),
              py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
