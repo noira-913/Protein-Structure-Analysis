@@ -9,8 +9,17 @@ dist/
 __pycache__/
 *.so
 *.pyd
+# nvcc builds protein_physics_cuda directly (setup.py's build_cuda_extension()
+# shells out to nvcc/cl.exe, bypassing setuptools), which can drop these
+# root-level .exp/.lib/.obj byproducts next to the .pyd.
+*.exp
+*.lib
+*.obj
 
-# Downloaded structure files (fetched at runtime, not committed)
+# Downloaded structure files (fetched at runtime, not committed) -- except a
+# curated set of test fixtures that ARE tracked (e.g. data/1XQ8.pdb, used by
+# IMPROVEMENTS.md's IDP calibration history); git keeps tracking files that
+# were already added before this rule existed, so this only affects new ones.
 *.ent
 data/*.pdb
 

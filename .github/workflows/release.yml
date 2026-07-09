@@ -19,6 +19,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
+          # Deliberately older than local dev (which runs 3.14 -- see the
+          # tracked cp314 extension filenames): PyQt6/PyInstaller wheel
+          # availability lags on newer Python releases. Keep in sync with
+          # the cp312 filter used later in this workflow if bumped.
           python-version: "3.12"
 
       - name: Install runtime + build dependencies
