@@ -761,22 +761,53 @@ Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins n
 a low-ε bilayer-region model; no such model exists yet. Low priority — no membrane
 protein test cases in current use.
 
-**6. Possible false-positive knot detection on larger backbones — observed, not
-yet investigated**
+**6. False-positive knot detection on larger backbones — root-caused and
+fixed (2026-07-09)**
 While running the 1YPI (triosephosphate isomerase, 494 residues) calibration
 data for item #2, the knot classifier called it a trefoil (3₁, 6 crossings)
 at only 58-92% closure-vote confidence across 4 runs. TIM-barrel folds are a
 classic, textbook *unknotted* topology in the structural biology literature —
 this doesn't match. For comparison, the validated cases in "Completed Work" →
 Analysis (1LYZ = unknot, 1J85 = documented deep trefoil) both hit 97-100%
-confidence. Low confidence + a topologically-surprising call on a larger,
-more complex backbone suggests a possible issue in the stochastic closure or
-KMT reduction step specifically at bigger residue counts, rather than a newly
-discovered real shallow knot in a famously unknotted fold — but this is an
-observation from data collected for an unrelated investigation, not yet
-followed up. Needs: rerun with more closure trials for confidence, and check
-whether the same false positive appears on other large unknotted test cases
-before concluding it's a real bug.
+confidence.
+
+**Root cause: 1YPI is a homodimer (2 chains, 247 residues each), and the
+classifier's call site pooled both chains' Cα coordinates together before
+ever reaching the closure/KMT algorithm.** `PipelineWorker.run()`
+(`gui_main.py`) built `ca_coords` directly from `ca_map.values()` with no
+chain-break awareness — measured directly: a real within-chain Cα-Cα
+distance of 3.86 Å vs. a **65.94 Å** artificial "bond" at the chain A→B
+boundary, a ~17x-oversized non-bond the closure/crossing-detection code had
+no way to know wasn't real backbone. This isn't a numerical robustness
+issue in the closure or KMT reduction step (the original hypothesis) — a
+knot is only a well-defined property of a *single continuous curve*, so
+concatenating two separate, non-covalently-linked chains into one "backbone"
+is topologically meaningless, not just noisy input. The low, inconsistent
+confidence (58-92%, vs. 97-100% on the genuinely single-chain controls) is
+exactly what a single artificial long segment inconsistently registering as
+a crossing under different random projections would look like.
+
+Confirmed by direct reproduction: classifying 1YPI's chain A alone (247 res,
+a real continuous backbone, no chain break) gave **unknot at 75-88%
+confidence across 4 independent seeds** — matching the textbook TIM-barrel
+topology exactly, at confidence comparable to the other validated single-chain
+cases.
+
+**Fix:** `PipelineWorker.run()` now groups `ca_map` by chain and classifies
+only the largest chain, with a log message when other chains are skipped
+("knot type isn't well-defined across separate, non-bonded chains") rather
+than silently dropping data. Re-verified against the real production code
+path (`_parse_pdb` → grouped `ca_map` → `classify_backbone_knot`) at the
+GUI's actual `n_trials=12`: unknot, 75-83% confidence, consistent across 3
+seeds.
+
+**Added 1YPI to `tests/knot_test.py`** as a third case (large-backbone
+unknotted negative control) — the gap the original investigation flagged
+("1YPI is NOT in the test suite... likely why this false positive went
+unnoticed") is now closed. `fetch_ca_trace` in that file had the identical
+chain-pooling bug (harmless before now, since both existing cases — 1LYZ,
+1J85 — are single-chain) and was fixed the same way. Full suite re-run:
+3/3 PASS (1LYZ unknot 97%, 1J85 trefoil 97%, 1YPI unknot 88%).
 
 *(Also: `tests/accuracy_test.py`'s auto-offset alignment can't handle a PDB entry
 whose crystal numbering doesn't correspond linearly to full-length UniProt numbering

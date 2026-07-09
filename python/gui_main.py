@@ -1067,9 +1067,42 @@ class PipelineWorker(QThread):
             # MC-dependent), so computed once here in the background worker
             # thread before the MC run -- this can take a few seconds and must
             # not block the UI.
+            # 다중 체인 버그 (2026-07-09): ca_map.values()를 그대로 이었더니
+            # 서로 공유결합으로 연결되지 않은 체인 경계에서 인위적인 "결합"이
+            # 생겼다 — 1YPI(이합체, 각 체인 247잔기)에서 실측: 체인 내
+            # 정상 Cα-Cα 거리 3.86Å 대비 체인 경계에서 65.94Å짜리 가짜 세그
+            # 먼트가 생겨, 텍스트북상 매듭 없음(unknot)인 TIM-배럴이 58-92%
+            # 신뢰도로 트레포일(trefoil)로 오분류됐다(IMPROVEMENTS.md 항목
+            # #6). 매듭은애초에 하나의 연속된 곡선에서만 정의되는 개념이라
+            # 여러 체인을 이은 값 자체가 위상수학적으로 무의미하다 — 임계값
+            # 조정이 아니라 체인별로 분리해 가장 큰 체인 하나만 분류하는 것이
+            # 올바른 수정이다.
+            #
+            # Multi-chain bug (2026-07-09): concatenating ca_map.values() raw
+            # created an artificial "bond" at chain boundaries between chains
+            # that aren't covalently connected -- measured directly on 1YPI
+            # (a homodimer, 247 res/chain): a real within-chain Ca-Ca distance
+            # of 3.86 A vs. a 65.94 A fake segment at the chain boundary,
+            # which got a textbook-unknotted TIM-barrel misclassified as a
+            # trefoil at only 58-92% confidence (IMPROVEMENTS.md item #6).
+            # A knot is only a well-defined property of a single continuous
+            # curve, so concatenating separate chains isn't just noisy data --
+            # it's topologically meaningless. The fix is to classify each
+            # chain separately (using only the largest/primary one here, not
+            # a threshold tweak), not paper over the boundary artifact.
             self.progress.emit("  Classifying backbone topology (knot analysis)…")
             try:
-                ca_coords = np.array(list(ca_map.values()), dtype=float)
+                ca_coords_by_chain: dict = {}
+                for (chain_id, _res_seq), coord in ca_map.items():
+                    ca_coords_by_chain.setdefault(chain_id, []).append(coord)
+                primary_chain = max(ca_coords_by_chain,
+                                     key=lambda c: len(ca_coords_by_chain[c]))
+                if len(ca_coords_by_chain) > 1:
+                    self.progress.emit(
+                        f"  Multi-chain structure ({len(ca_coords_by_chain)} chains) -- "
+                        f"classifying topology for chain {primary_chain} only "
+                        f"(knot type isn't well-defined across separate, non-bonded chains)")
+                ca_coords = np.array(ca_coords_by_chain[primary_chain], dtype=float)
                 knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=12)
                 self.progress.emit(
                     f"  Topology: {knot_result.name} "

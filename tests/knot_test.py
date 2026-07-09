@@ -10,6 +10,18 @@ the classic examples of a deeply knotted protein backbone (trefoil knot, 3_1) --
 extensively documented in the protein-knot literature (Mallam & Jackson and others)
 and listed in the KnotProt database.
 
+Large-backbone negative control: triosephosphate isomerase (PDB 1YPI), a TIM-barrel
+fold -- a classic, textbook *unknotted* topology in the structural biology literature.
+Added 2026-07-09 after IMPROVEMENTS.md item #6: 1YPI is a homodimer (2 chains, 247 res
+each), and naively concatenating both chains' Calpha coordinates created an artificial
+~66 A "bond" at the chain boundary (vs. a real ~3.9 A Ca-Ca spacing) -- a knot is only
+a well-defined property of a single continuous curve, so that concatenation isn't just
+noisy data, it's topologically meaningless. The false trefoil call this produced (58-92%
+confidence, vs. 97-100% on the two single-chain cases above) went undetected because no
+multi-chain/large-backbone control existed in this suite before now. fetch_ca_trace
+below now selects only the largest chain rather than pooling every chain in the model,
+matching the fix applied to the real call site (gui_main.py's PipelineWorker.run()).
+
 Requires internet access (fetches from files.rcsb.org).
 """
 import os
@@ -29,6 +41,7 @@ from knot_analysis import classify_backbone_knot  # noqa: E402
 CASES = [
     ("Hen egg-white lysozyme", "1LYZ", "unknot"),
     ("YibK methyltransferase (SPOUT family)", "1J85", "3_1 (trefoil)"),
+    ("Triosephosphate isomerase (TIM barrel)", "1YPI", "unknot"),
 ]
 
 
@@ -39,16 +52,24 @@ def fetch_ca_trace(pdb_id, tmp_path):
         f.write(r.content)
     parser = PDBParser(QUIET=True)
     st = parser.get_structure(pdb_id, tmp_path)
-    coords = []
+    # Group by chain and keep only the largest -- a knot is only a well-defined
+    # property of a single continuous curve, so a multi-chain structure (e.g.
+    # 1YPI, a homodimer) must never have its chains pooled together (see the
+    # module docstring above for the real bug this caused).
+    coords_by_chain: dict = {}
     for model in st:
         for chain in model:
+            chain_coords = []
             for res in chain:
                 if res.get_id()[0] != " ":
                     continue
                 if "CA" in res:
-                    coords.append(res["CA"].get_coord().copy())
+                    chain_coords.append(res["CA"].get_coord().copy())
+            if chain_coords:
+                coords_by_chain[chain.id] = chain_coords
         break
-    return np.array(coords, dtype=float)
+    primary_chain = max(coords_by_chain, key=lambda c: len(coords_by_chain[c]))
+    return np.array(coords_by_chain[primary_chain], dtype=float)
 
 
 def main():
