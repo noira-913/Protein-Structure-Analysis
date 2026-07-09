@@ -843,6 +843,85 @@ bond_templates() {
             {"O3A","PB"},{"PB","O1B"},{"PB","O2B"},{"PB","O3B"},
             {"O3B","PG"},{"PG","O1G"},{"PG","O2G"},{"PG","O3G"},
         }},
+
+        // 헴/NAD+/FAD/PLP (Heme b, NAD+, FAD, pyridoxal-5'-phosphate) — ATP와
+        // 동일한 근거: 순수 결합 연결성만, 표준 유기화학적 사실. 단 이번엔
+        // 기억에서 옮겨 적지 않고 RCSB 화학 성분 사전(Chemical Component
+        // Dictionary, files.rcsb.org/ligands/view/<CODE>.cif)의
+        // _chem_comp_bond 레코드를 직접 받아와(같은 세션, 2026-07-10) 무거운
+        // 원자(비수소) 쌍만 추출했다 — ATP 때 부분전하를 위해 찾다 실패한
+        // "검증 가능한 1차 출처"가 결합 연결성 자체에는 이미 존재한다(공식
+        // 구조 데이터이지 피팅된 파라미터가 아니므로). 각 원소 화학식의
+        // 무거운 원자 수와 대조해 검증: HEM 43/43, NAD 44/44, FAD 53/53,
+        // PLP 16/16 — 전부 일치. 결합 그래프도 각각 단일 연결 성분임을
+        // 확인(고립된 조각 없음). 전하/반데르발스는 ATP와 마찬가지로 여전히
+        // amber_params.py의 원소 기반 폴백을 거친다.
+        //
+        // Heme b / NAD+ / FAD / pyridoxal-5'-phosphate -- same rationale as
+        // ATP: pure bond connectivity, an established structural fact. This
+        // time, rather than transcribing from memory, fetched RCSB's
+        // Chemical Component Dictionary (files.rcsb.org/ligands/view/
+        // <CODE>.cif) directly and extracted the _chem_comp_bond heavy-atom
+        // (non-hydrogen) pairs (this session, 2026-07-10) -- the kind of
+        // independently verifiable primary source that was unavailable for
+        // ATP's partial charges is already available for connectivity itself
+        // (official structural data, not a fitted parameter). Verified
+        // against each ligand's chemical formula's heavy-atom count: HEM
+        // 43/43, NAD 44/44, FAD 53/53, PLP 16/16 -- all match exactly. Also
+        // confirmed each bond graph is a single connected component (no
+        // isolated fragments). Charges/VDW still go through amber_params.py's
+        // element-based fallback, same as ATP.
+        {"HEM", {
+            {"CHA","C1A"},{"CHA","C4D"},{"CHB","C4A"},{"CHB","C1B"},
+            {"CHC","C4B"},{"CHC","C1C"},{"CHD","C4C"},{"CHD","C1D"},
+            {"C1A","C2A"},{"C1A","NA"},{"C2A","C3A"},{"C2A","CAA"},
+            {"C3A","C4A"},{"C3A","CMA"},{"C4A","NA"},
+            {"CAA","CBA"},{"CBA","CGA"},{"CGA","O1A"},{"CGA","O2A"},
+            {"C1B","C2B"},{"C1B","NB"},{"C2B","C3B"},{"C2B","CMB"},
+            {"C3B","C4B"},{"C3B","CAB"},{"C4B","NB"},{"CAB","CBB"},
+            {"C1C","C2C"},{"C1C","NC"},{"C2C","C3C"},{"C2C","CMC"},
+            {"C3C","C4C"},{"C3C","CAC"},{"C4C","NC"},{"CAC","CBC"},
+            {"C1D","C2D"},{"C1D","ND"},{"C2D","C3D"},{"C2D","CMD"},
+            {"C3D","C4D"},{"C3D","CAD"},{"C4D","ND"},
+            {"CAD","CBD"},{"CBD","CGD"},{"CGD","O1D"},{"CGD","O2D"},
+            {"FE","NA"},{"FE","NB"},{"FE","NC"},{"FE","ND"},
+        }},
+        {"NAD", {
+            {"PA","O1A"},{"PA","O2A"},{"PA","O5B"},{"PA","O3"},
+            {"O5B","C5B"},{"C5B","C4B"},{"C4B","O4B"},{"C4B","C3B"},
+            {"O4B","C1B"},{"C3B","O3B"},{"C3B","C2B"},{"C2B","O2B"},{"C2B","C1B"},
+            {"C1B","N9A"},{"N9A","C8A"},{"N9A","C4A"},{"C8A","N7A"},
+            {"N7A","C5A"},{"C5A","C6A"},{"C5A","C4A"},{"C6A","N6A"},
+            {"C6A","N1A"},{"N1A","C2A"},{"C2A","N3A"},{"N3A","C4A"},
+            {"O3","PN"},{"PN","O1N"},{"PN","O2N"},{"PN","O5D"},
+            {"O5D","C5D"},{"C5D","C4D"},{"C4D","O4D"},{"C4D","C3D"},
+            {"O4D","C1D"},{"C3D","O3D"},{"C3D","C2D"},{"C2D","O2D"},{"C2D","C1D"},
+            {"C1D","N1N"},{"N1N","C2N"},{"N1N","C6N"},{"C2N","C3N"},
+            {"C3N","C7N"},{"C3N","C4N"},{"C7N","O7N"},{"C7N","N7N"},
+            {"C4N","C5N"},{"C5N","C6N"},
+        }},
+        {"FAD", {
+            {"PA","O1A"},{"PA","O2A"},{"PA","O5B"},{"PA","O3P"},
+            {"O5B","C5B"},{"C5B","C4B"},{"C4B","O4B"},{"C4B","C3B"},
+            {"O4B","C1B"},{"C3B","O3B"},{"C3B","C2B"},{"C2B","O2B"},{"C2B","C1B"},
+            {"C1B","N9A"},{"N9A","C8A"},{"N9A","C4A"},{"C8A","N7A"},
+            {"N7A","C5A"},{"C5A","C6A"},{"C5A","C4A"},{"C6A","N6A"},
+            {"C6A","N1A"},{"N1A","C2A"},{"C2A","N3A"},{"N3A","C4A"},
+            {"N1","C2"},{"N1","C10"},{"C2","O2"},{"C2","N3"},
+            {"N3","C4"},{"C4","O4"},{"C4","C4X"},{"C4X","N5"},{"C4X","C10"},
+            {"N5","C5X"},{"C5X","C6"},{"C5X","C9A"},{"C6","C7"},
+            {"C7","C7M"},{"C7","C8"},{"C8","C8M"},{"C8","C9"},
+            {"C9","C9A"},{"C9A","N10"},{"N10","C10"},
+            {"N10","C1'"},{"C1'","C2'"},{"C2'","O2'"},{"C2'","C3'"},
+            {"C3'","O3'"},{"C3'","C4'"},{"C4'","O4'"},{"C4'","C5'"},
+            {"C5'","O5'"},{"O5'","P"},{"P","O1P"},{"P","O2P"},{"P","O3P"},
+        }},
+        {"PLP", {
+            {"N1","C2"},{"N1","C6"},{"C2","C2A"},{"C2","C3"},
+            {"C3","O3"},{"C3","C4"},{"C4","C4A"},{"C4","C5"},
+            {"C4A","O4A"},{"C5","C6"},{"C5","C5A"},{"C5A","O4P"},
+            {"O4P","P"},{"P","O1P"},{"P","O2P"},{"P","O3P"},
+        }},
     };
     return t;
 }

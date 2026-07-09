@@ -972,8 +972,8 @@ Torsion moves preserve bond lengths/angles by construction, so these terms sit a
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
 indefinitely unless a future move type (e.g. bond-length perturbation) needs them.
 
-**4. Full GAFF2 force field for organic ligands/cofactors — first step done (bond
-topology for ATP), partial charges still deliberately unfixed**
+**4. Full GAFF2 force field for organic ligands/cofactors — bond connectivity
+done for ATP/heme/NAD⁺/FAD/PLP, partial charges still deliberately unfixed**
 Currently: HETATM ligands get an element-based fallback (radius/ε by element only,
 zero partial charge) rather than real small-molecule parameters. A full fix means
 shipping a GAFF2 atom-type table and either calling `antechamber` programmatically
@@ -1045,6 +1045,42 @@ fallback.** Not a quick problem to unblock with another search attempt — if pi
 again, either bring a verified source/file directly, or deliberately choose the
 "chemically-reasoned approximation, clearly labeled as such" path discussed and
 declined this round (as opposed to presenting unverified numbers as real RESP values).
+
+**Heme b / NAD⁺ / FAD / PLP bond connectivity added (2026-07-10) — same
+pattern as ATP, this time sourced from RCSB's Chemical Component Dictionary
+directly instead of memory.** ATP's connectivity was hand-transcribed from
+standard organic chemistry knowledge; for these four (larger, more complex
+heterocycles — a real chance of a subtle atom-naming slip, exactly the kind
+of risk the ATP charges decision was already cautious about), fetched
+`files.rcsb.org/ligands/view/<CODE>.cif` directly and parsed the
+`_chem_comp_bond` loop's heavy-atom (non-hydrogen) pairs programmatically —
+this record type is official structural data (not a fitted parameter), so
+it's independently verifiable in a way ATP's RESP charges never were.
+Verified two ways before trusting it: every ligand's extracted atom count
+matches its `_chem_comp.formula` heavy-atom count exactly (HEM 43/43, NAD
+44/44, FAD 53/53, PLP 16/16), and each bond graph forms a single connected
+component (no isolated fragments — a real molecule shouldn't have any).
+
+**Validated functionally necessary, same method as ATP**: extracted each
+ligand's real deposited HETATM block (HEM from 1C53, NAD from 7YW4, FAD from
+4E0H, PLP from 1G76) and compared `calculate_potential()` with vs. without
+the template (residue renamed to simulate the old no-template fallback):
+
+| Ligand | with template | without template | blowup |
+|---|---|---|---|
+| HEM (43 atoms) | 82.2 kcal/mol (1.91/atom) | 3,784,824.8 kcal/mol | 46,066x |
+| NAD (44 atoms) | 261.0 kcal/mol (5.93/atom) | 3,419,873.5 kcal/mol | 13,105x |
+| FAD (53 atoms) | 371.6 kcal/mol (7.01/atom) | 4,022,912.7 kcal/mol | 10,825x |
+| PLP (16 atoms) | 68.7 kcal/mol (4.29/atom) | 681,356.3 kcal/mol | 9,922x |
+
+Same category of confirmed-real bug as ATP: without a bond template, every
+covalently-bonded intra-ligand pair goes through the full non-bonded sum
+with no 1-2/1-3 exclusion, and the hard-core repulsion term blows up.
+`tests/bridge_test.py` re-run clean (purely additive, no existing template
+entries touched). Charges/VDW for all four still go through
+`amber_params.py`'s element-based fallback, same open gap as ATP —
+rotatable-bond classification also not added (out of scope, same boundary
+as ATP: these ligands stay static during MC torsion sampling).
 
 **5. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
