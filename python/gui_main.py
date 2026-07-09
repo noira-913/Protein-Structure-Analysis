@@ -1800,7 +1800,10 @@ class LandscapeWorker(QThread):
     # more than ~15 tuning windows before being discarded. Fixed via a new
     # C++ method, run_landscape_segment (also returns the final cur_max so
     # it can be threaded across segments -- see _ReplicaSegmentRunnable/
-    # _ReplicaExchangeBranchRunnable._run_pt), CPU only. Retested: 1YPI's
+    # _ReplicaExchangeBranchRunnable._run_pt); physics_engine_cuda.cu got
+    # the identical fix too (2026-07-09), so this works on both engines --
+    # this class's own PT orchestration needed no changes either way, it
+    # already calls run_landscape_segment polymorphically. Retested: 1YPI's
     # funnel narrowed a bit (0.133-0.244 vs 0.122-0.278) and got ~12%
     # faster, but still trails plain MC (0.144-0.189); 1LYZ's funnel
     # dropped back to plain-MC-like (0.233-0.483, the 0.75-1.00 win is

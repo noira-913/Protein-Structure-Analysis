@@ -1203,6 +1203,60 @@ public:
         return {snapshots, energies};
     }
 
+    /* run_landscape_segment: identical to run_landscape_trajectory above,
+     * except it also returns the final tuned S.cur_max -- the GPU-resident
+     * counterpart of physics_engine.cpp's method of the same name. Exists
+     * for replica-exchange (parallel tempering, python/gui_main.py's
+     * _ReplicaExchangeBranchRunnable): run_landscape_trajectory's online
+     * step-size tuning (S.cur_max, rescaled every TUNE_FREQ steps in
+     * run_mc_steps toward [TARGET_LO, TARGET_HI] acceptance) is call-scoped
+     * -- S.cur_max resets to max_angle and is discarded at the end of every
+     * call. PT calls the trajectory function once per short swap-interval
+     * segment rather than once for the whole run, so without this, cur_max
+     * would restart from scratch every segment instead of carrying forward
+     * what it learned -- the same bug found and fixed on the CPU engine
+     * (see that engine's run_landscape_segment docstring in
+     * physics_engine.cpp for the full history, including the retest
+     * results after the CPU-side fix).
+     *
+     * Deliberately a duplicate of run_landscape_trajectory's body, not a
+     * shared private helper both call -- matches physics_engine.cpp's own
+     * established precedent (duplicate to avoid touching an already-
+     * verified hot path) and this file's existing factoring already makes
+     * the duplication cheap (~20 lines via init_chain/run_mc_steps, not the
+     * ~220-line inline body the CPU engine has). */
+    std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double>
+    run_landscape_segment(
+        const std::vector<Particle>& init,
+        const HostTopology& topo,
+        int n_snapshots, int steps_per_snapshot,
+        double T = 0.6,
+        double max_angle = 0.12)
+    {
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (n_snapshots <= 0 || steps_per_snapshot <= 0)
+            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+
+        MCState S;
+        S.st      = init;
+        S.topo    = topo;
+        S.cur_max = max_angle;
+        init_chain(S);
+
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
+        snapshots.reserve(n_snapshots);
+        energies.reserve(n_snapshots);
+
+        for (int snap = 0; snap < n_snapshots; ++snap) {
+            run_mc_steps(S, steps_per_snapshot, T);
+            snapshots.push_back(S.st);
+            energies.push_back(calculate_potential(S.st, &S.topo));
+        }
+        return {snapshots, energies, S.cur_max};
+    }
+
     /* lowest_energy_structure: scan an ensemble, return the lowest-energy
      * conformation. O(ncand) calculate_potential calls (no topology, same
      * as the CPU engine's behaviour) — call only once after MC finishes. */
@@ -1304,6 +1358,23 @@ PYBIND11_MODULE(protein_physics_cuda, m)
                  HostTopology topo = extract_topology(topo_obj);
                  py::gil_scoped_release release;
                  return self.run_landscape_trajectory(
+                     init, topo, n_snapshots, steps_per_snapshot, T, max_angle);
+             },
+             py::arg("initial_state"),
+             py::arg("topology"),
+             py::arg("n_snapshots"),
+             py::arg("steps_per_snapshot"),
+             py::arg("temperature") = 0.6,
+             py::arg("max_angle")   = 0.12)
+        .def("run_landscape_segment",
+             [](PhysicsEngine& self,
+                const std::vector<Particle>& init, py::object topo_obj,
+                int n_snapshots, int steps_per_snapshot,
+                double T, double max_angle)
+                -> std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double> {
+                 HostTopology topo = extract_topology(topo_obj);
+                 py::gil_scoped_release release;
+                 return self.run_landscape_segment(
                      init, topo, n_snapshots, steps_per_snapshot, T, max_angle);
              },
              py::arg("initial_state"),

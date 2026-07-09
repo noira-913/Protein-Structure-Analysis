@@ -471,13 +471,16 @@ the one pre-existing parsing bug the same test run exposed:
 
   **Status: large-protein-scale phase of the sampling-depth investigation
   is now closed as a success**, on the same "reproducible across repeats"
-  bar as the small-scale phase. Explicitly not yet done, tracked as
-  follow-ups: GPU-path-specific timing at this scale (validation above
-  used the CPU engine only); a genuine large single-chain IDP test case
-  (still no known suitable deposited structure, same gap noted in the
-  small-scale broader-roster check above); and the deferred within-branch
-  block-stability diagnostic, now doubly de-prioritized given both R-hat
-  and τ have failed as convergence signals for this sampler.
+  bar as the small-scale phase. Explicitly not yet done at the time, tracked
+  as follow-ups: ~~GPU-path-specific timing at this scale (validation above
+  used the CPU engine only)~~ **-- since done**, see the "Compute-time
+  follow-up" entry further below (measured real GPU timing at 1YPI's scale,
+  found and fixed a 34% regression from a naive flat branch-count default);
+  a genuine large single-chain IDP test case (still no known suitable
+  deposited structure, same gap noted in the small-scale broader-roster
+  check above); and the deferred within-branch block-stability diagnostic,
+  now doubly de-prioritized given both R-hat and τ have failed as
+  convergence signals for this sampler.
 
   **Possible future add-on, not started: investigate the MC chain's
   non-stationarity/drift directly.** One of two alternatives rejected at
@@ -640,9 +643,24 @@ the one pre-existing parsing bug the same test run exposed:
   function body rather than extracting a shared helper, matching this
   file's own stated precedent for `run_landscape_trajectory` vs.
   `generate_ensemble` (duplicate to avoid touching an already-verified
-  hot path) -- CPU only; `physics_engine_cuda.cu` has the identical
-  reset bug, left unfixed as a deferred follow-up since all PT
-  validation has been CPU-only throughout.
+  hot path).
+
+  **GPU parity added (2026-07-09).** `physics_engine_cuda.cu` had the
+  identical reset bug (`S.cur_max = max_angle` at the top of every call)
+  -- fixed the same way, adding a `run_landscape_segment` there too that
+  also returns the final `S.cur_max`. Much cheaper to duplicate on this
+  side: the GPU engine's `run_landscape_trajectory` is already factored
+  into `init_chain`/`run_mc_steps` helpers, so the whole method is ~20
+  lines, not the CPU engine's ~220. Python's PT orchestration
+  (`_ReplicaExchangeBranchRunnable`) needed no changes -- it already
+  calls `engine.run_landscape_segment(...)` polymorphically regardless
+  of which physics module constructed the engine. Smoke-tested end-to-end
+  on GPU (1UBQ, `USE_REPLICA_EXCHANGE=True`): runs correctly, `cur_max`
+  threading confirmed working. Note this confirms GPU PT *runs*
+  correctly, not that its accuracy has been separately re-validated
+  against the ground-truth proteins the same way the CPU path was above
+  -- the verdict (`USE_REPLICA_EXCHANGE = False` by default) is
+  unchanged either way, since CPU PT already didn't clear the bar.
 
   **Retest result: helped 1YPI a little, but removed 1LYZ's one clear
   win, and introduced a real ~40% misclassification rate on 1XQ8.**
