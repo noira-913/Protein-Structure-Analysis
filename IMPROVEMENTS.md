@@ -766,13 +766,66 @@ Torsion moves preserve bond lengths/angles by construction, so these terms sit a
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
 indefinitely unless a future move type (e.g. bond-length perturbation) needs them.
 
-**4. Full GAFF2 force field for organic ligands/cofactors**
+**4. Full GAFF2 force field for organic ligands/cofactors — first step done (bond
+topology for ATP), partial charges still deliberately unfixed**
 Currently: HETATM ligands get an element-based fallback (radius/ε by element only,
 zero partial charge) rather than real small-molecule parameters. A full fix means
 shipping a GAFF2 atom-type table and either calling `antechamber` programmatically
 or caching parameters for common cofactors (ATP, heme, NAD⁺, FAD, PLP…). Metal ions
 already have proper tabulated parameters (`amber_params.ION_PARAMS`) — only organic
 ligands are affected.
+
+**Scoping decision (2026-07-09): no cheminformatics dependency in this codebase.**
+Checked for RDKit/OpenBabel/antechamber before starting — none present anywhere in
+source, `requirements.txt`, or the PyInstaller build (`alma.spec`/
+`build_portable_exe.bat`). Calling `antechamber` programmatically would mean bundling
+a full AmberTools installation into what's currently a self-contained, dependency-free
+portable `.exe` — a real architecture departure, not a small addition. Hand-tabulated
+parameters for a curated cofactor list (the item's own suggested alternative) fits the
+existing pattern much better (mirrors `ION_PARAMS`, which is exactly this approach for
+metal ions already).
+
+**ATP bond connectivity added (`bond_templates()`, `physics_engine.cpp`) — partial
+charges intentionally NOT added.** Started with ATP only (most tractable: moderate
+size, extremely well-studied). Two separable pieces: (a) bond connectivity — standard
+organic chemistry, an established structural fact, not a fitted parameter, so
+high-confidence to add directly; (b) partial charges/VDW radii — real fitted
+parameters (RESP charges, e.g. from Meagher, Redman & Carlson 2003, J. Comput. Chem.
+24, 1016 for the triphosphate group) that need an independently verifiable source.
+Tried to fetch/verify the standard reference (Manchester AMBER parameter database,
+the primary paper via two different hosts) — all three attempts failed (connection
+error, 403, no direct data). **Decided not to hand-transcribe charges from training
+recall and present them as verified real values** — for a physics tool, a
+plausible-looking-but-wrong number is worse than the current honest, visibly
+approximate element-based fallback. Shipped the bond-connectivity half only, which is
+independently valuable: ligand atoms previously had *zero* bonded topology at all
+(`BondTopology::build()` silently skips any residue not in `bond_templates()`), so
+covalently-bonded atoms *within* a ligand had no 1-2/1-3 exclusion from the
+non-bonded sum — the same category of hard-core-repulsion-blowup bug already fixed
+for protein termini/disulfides, just never noticed for ligands because none had a
+bond template at all yet.
+
+**Validated the fix is functionally necessary, not cosmetic**, using a real deposited
+ATP molecule (extracted from PDB entry 2P0X, the smallest ATP-containing structure by
+atom count, 31 heavy atoms — hydrogens present in that particular file were excluded
+from this test since ATP has no H-bond template yet, a separate smaller gap):
+calculated potential energy **with** the new bond template: 271.4 kcal/mol (8.76
+kcal/mol/atom, comfortably in the sane range). Re-ran the identical coordinates with
+the residue renamed to something unrecognized (simulating the old no-template
+behavior): **1,956,212 kcal/mol (63,104 kcal/mol/atom)** — a ~7,200x hard-core
+blowup, confirming this was a real, live bug for any ATP-containing structure, not a
+hypothetical one. `tests/bridge_test.py` re-run clean (purely additive change, no
+existing `bond_templates()` entries touched).
+
+Rotatable-bond classification (the separate `RotSpec` table used for MC torsion move
+selection) was **not** added for ATP — out of scope for this fix, which only targets
+non-bonded exclusion correctness. ATP atoms currently can't be moved by torsion MC
+moves (they're static during sampling), which is a reasonable, deliberate boundary,
+not an oversight.
+
+Remaining for this item: real partial charges/VDW for ATP (blocked on sourcing, see
+above — welcome a pointer to a verifiable parameter file/table), then heme/NAD⁺/FAD/
+PLP bond templates + charges following the same two-step pattern.
 
 **5. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
@@ -1002,6 +1055,25 @@ limitation of that test harness's alignment heuristic, not the physics engine.)*
   actually compiled via `cuobjdump`. Re-verified end-to-end against a real tagged
   release (`v0.5.5`/`v0.5.6`): the shipped extension now has all 4 architectures,
   first time in at least a month.
+- **Fixed HTTPS/SSL completely broken in the portable `dist/ALMA.exe`** —
+  every RCSB/AlphaFold/SWISS-MODEL fetch failed with "Can't connect to HTTPS
+  URL because the SSL module is not available," while the identical code
+  worked fine from the unfrozen source. Root-caused by building the actual
+  portable exe and testing it (not just re-running source-level scripts):
+  PyInstaller's automatic dependency walker detects `_ssl.pyd` (it shows up
+  in the build's own dependency graph) but does **not** detect or bundle
+  `libssl-*.dll`/`libcrypto-*.dll`, the OpenSSL DLLs `_ssl.pyd` actually
+  links against — confirmed by grepping the build's xref/warning output for
+  both filenames and finding zero mentions. A known category of gap with
+  `python-build-standalone`-style DLL layouts (this project's `.venv` is
+  `uv`-managed), since PyInstaller's binary scanner is more commonly
+  exercised against a standard python.org installer's layout. Fixed in
+  `alma.spec` by bundling both DLLs explicitly (glob-matched from
+  `sys.base_prefix/DLLs`, not a hardcoded filename, so a future OpenSSL
+  version bump doesn't silently reintroduce this). Re-verified end-to-end
+  against the real rebuilt exe: fetched the exact UniProt ID (P05067) that
+  failed before the fix — AlphaFold API query now succeeds and proceeds
+  into parsing (6209 bonds, 9 disulfides, 6091 atoms), no SSL error.
 
 ---
 

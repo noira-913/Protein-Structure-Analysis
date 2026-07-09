@@ -792,6 +792,57 @@ bond_templates() {
                   {"CE1","CZ"},{"CZ","OH"},{"OH","HH"},
                   {"CZ","CE2"},{"CE2","HE2"},{"CE2","CD2"},{"CD2","HD2"},
                   {"CD2","CG"} }},                                             // ring / 고리 닫힘
+
+        // ATP (아데노신 삼인산 / Adenosine triphosphate) — IMPROVEMENTS.md 항목
+        // #4 (GAFF2 리간드 힘장) 첫 단계. 여기 있는 건 순수한 결합 연결성뿐이다
+        // (표준 유기화학 — 어떤 원자가 어떤 원자와 공유결합하는지는 실험/합성
+        // 문헌에서 확립된 사실이지 최적화로 얻는 값이 아니다). 실제 힘장 값
+        // (부분 전하·반데르발스 반경/ε)은 검증 가능한 출처를 못 찾아 의도적으로
+        // 보류했다 — 표준 RESP 전하 표(예: Meagher, Redman & Carlson 2003,
+        // J. Comput. Chem. 24, 1016의 삼인산기 파라미터)를 이 세션 안에서
+        // 다시 확인할 방법이 없었고, 검증 못 한 숫자를 "실제 값"인 것처럼
+        // 적어 넣는 것은 원소 기호 기반 폴백(현재 상태, 정직하게 부정확함을
+        // 알 수 있음)보다 더 위험하다고 판단했다. 이 결합 표만으로도 실질적
+        // 개선이 있다: ATP 내부의 실제 공유결합 원자쌍이 이제 비결합 합에서
+        // 제외되어, 전에는 없었던 "리간드 내부 하드코어 반발 폭주" 위험이
+        // 사라진다(단백질 말단/이황화 결합에서 이미 겪었던 것과 같은 종류의
+        // 버그). 전하/반데르발스는 여전히 amber_params.py의 원소 기반 폴백을
+        // 거친다 — 부분 전하 0, 반경은 원소 기호로 추정.
+        //
+        // ATP (adenosine triphosphate) -- first step on IMPROVEMENTS.md item
+        // #4 (GAFF2 ligand force field). What's here is pure bond
+        // connectivity only (standard organic chemistry -- which atoms are
+        // covalently bonded to which is an established structural fact, not
+        // a fitted parameter). Real force-field values (partial charges,
+        // VDW radius/epsilon) are deliberately NOT included yet -- no
+        // independently verifiable source for the standard RESP charge
+        // table (e.g. Meagher, Redman & Carlson 2003, J. Comput. Chem. 24,
+        // 1016's triphosphate parameters) could be confirmed within this
+        // session, and writing down unverified numbers as if they were real
+        // values would be riskier than the current element-based fallback
+        // (which is honestly, visibly approximate). This bond table alone
+        // is still a real improvement: ATP's actual covalently-bonded atom
+        // pairs are now excluded from the non-bonded sum, removing a
+        // previously-unguarded risk of intra-ligand hard-core-repulsion
+        // blowup (the same category of bug already fixed for protein
+        // termini/disulfides). Charges/VDW still go through
+        // amber_params.py's element-symbol fallback -- zero partial charge,
+        // element-guessed radius.
+        {"ATP", {
+            // 아데닌 염기 (Adenine base): 6원 고리 + 5원 고리 융합 퓨린계
+            {"N1","C2"},{"C2","N3"},{"N3","C4"},{"C4","C5"},{"C5","C6"},{"C6","N1"},
+            {"C4","N9"},{"N9","C8"},{"C8","N7"},{"N7","C5"},        // 5-ring closure / 5원 고리 닫힘
+            {"C6","N6"},                                             // exocyclic amino / 곁사슬 아미노기
+            {"N9","C1'"},                                            // glycosidic bond / 글리코시드 결합
+            // 리보스 (Ribose, 5원 furanose 고리 + 2'/3'-OH)
+            {"C1'","C2'"},{"C2'","C3'"},{"C3'","C4'"},{"C4'","O4'"},{"O4'","C1'"},
+            {"C2'","O2'"},{"C3'","O3'"},{"C4'","C5'"},
+            // 삼인산기 사슬 (Triphosphate chain: alpha-beta-gamma)
+            {"C5'","O5'"},{"O5'","PA"},
+            {"PA","O1A"},{"PA","O2A"},{"PA","O3A"},
+            {"O3A","PB"},{"PB","O1B"},{"PB","O2B"},{"PB","O3B"},
+            {"O3B","PG"},{"PG","O1G"},{"PG","O2G"},{"PG","O3G"},
+        }},
     };
     return t;
 }

@@ -12,6 +12,7 @@
 
 import glob
 import os
+import sys
 
 repo_root = os.path.abspath(SPECPATH)
 
@@ -24,10 +25,33 @@ extension_binaries = [
     for path in glob.glob(os.path.join(repo_root, pattern))
 ]
 
+# OpenSSL DLLs (2026-07-09): PyInstaller's automatic dependency walker finds
+# _ssl.pyd (it shows up in the build's own xref graph) but does NOT detect or
+# bundle libssl-3-x64.dll / libcrypto-3-x64.dll, the two OpenSSL DLLs _ssl.pyd
+# actually links against -- confirmed missing from both the xref graph and
+# warn-alma.txt after a real build. Without them, ssl.py's `import _ssl`
+# fails at runtime inside the frozen exe with "Can't connect to HTTPS URL
+# because the SSL module is not available" -- breaking every RCSB/AlphaFold/
+# SWISS-MODEL fetch (requests/urllib3 both need ssl for HTTPS), even though
+# the exact same code works from the unfrozen venv. A known category of gap
+# with python-build-standalone-style DLL layouts (this project's .venv is
+# built via `uv venv`, which uses python-build-standalone) -- PyInstaller's
+# binary scanner is more commonly exercised against a standard python.org
+# installer's layout. Fix: bundle them explicitly rather than relying on
+# auto-detection, glob-matched (not a hardcoded exact filename) so a future
+# OpenSSL version bump (e.g. libssl-3 -> libssl-4) doesn't silently break
+# this again.
+ssl_dll_dir = os.path.join(sys.base_prefix, "DLLs")
+ssl_binaries = [
+    (path, ".")
+    for pattern in ("libssl-*.dll", "libcrypto-*.dll")
+    for path in glob.glob(os.path.join(ssl_dll_dir, pattern))
+]
+
 a = Analysis(
     ["python/gui_main.py"],
     pathex=[repo_root, os.path.join(repo_root, "python")],
-    binaries=extension_binaries,
+    binaries=extension_binaries + ssl_binaries,
     datas=[],
     hiddenimports=["amber_params", "iupred"],
     hookspath=[],
