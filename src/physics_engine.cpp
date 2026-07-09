@@ -1058,6 +1058,45 @@ public:
     // than single torsion moves for large proteins.
     std::vector<std::pair<int,int>>  concerted_pairs;
 
+    // ── 곁사슬 협동 이동 쌍 (Concerted sidechain-pair moves, IMPROVEMENTS.md
+    // 항목 #2의 MC 혼합 병목 진단 결과에 대한 대응) ──────────────────────────
+    //
+    // 위 concerted_pairs(φ/ψ 크랭크샤프트)는 백본 위에서만 작동하고, 두 결합이
+    // 계층적으로 중첩되어(ψ가 φ의 하류) 안전하다. 실측 진단 결과(run_mc_diagnostic,
+    // 1UBQ vs 1YPI): 단일 비틀림 이동은 크기와 무관하게 이중면체각 장벽이
+    // 병목이지만, 크랭크샤프트는 1YPI(494잔기, 조밀하게 밀집)에서 거부된 대형
+    // 이동의 90.8%가 입체 장애(하드코어 반발) 때문 — 중앙값 46,213 kcal/mol의
+    // 심각한 원자 겹침. 기존 2-자유도 협동 이동으로는 밀집된 큰 단백질에서
+    // 곁사슬이 이웃을 피해 돌아갈 공간이 부족하다는 뜻이다.
+    //
+    // 해법: 서로 무관한(disjoint rot_bond_sides) 두 곁사슬 회전 결합이 3차원
+    // 공간에서 가까이 있으면(피벗 원자 거리 < cutoff), 하나가 이웃 쪽으로
+    // 비집고 들어가려 할 때 다른 하나가 동시에 비켜줄 기회를 준다 — 두 번의
+    // 독립적인 단일 결합 이동이 우연히 순서대로 일어나길 기다리는 것보다
+    // 훨씬 효율적. identify_concerted_sidechain_pairs()에서 파싱 시점에 한 번만
+    // 계산(좌표가 필요하므로 build() 자체에는 넣지 않음 — build()는 좌표 없이
+    // 순수 위상만 다루도록 유지).
+    //
+    // The backbone crankshaft pairs above only work on the backbone, and are
+    // safe because the two bonds are hierarchically nested (ψ downstream of φ).
+    // Direct measurement (run_mc_diagnostic, 1UBQ vs 1YPI) found: single-bond
+    // torsion moves are dihedral-barrier-limited regardless of size, but
+    // crankshaft moves on 1YPI (494 res, densely packed) are 90.8% steric-
+    // dominant among rejected large moves -- median 46,213 kcal/mol, genuine
+    // deep overlaps. The existing 2-DOF concerted move doesn't have enough
+    // room on a densely packed large protein for a sidechain to route around
+    // its neighbours.
+    //
+    // Fix: two independent (disjoint rot_bond_sides) sidechain rotatable bonds
+    // that are spatially close (pivot-atom distance < cutoff) get the chance
+    // to move simultaneously in one proposal -- so if one sidechain's swing
+    // would clash with a neighbour, that neighbour can move out of the way in
+    // the same step, instead of needing two separate, uncorrelated single-bond
+    // moves to happen in the right order by chance. Computed once at parse
+    // time in identify_concerted_sidechain_pairs() (needs coordinates, so
+    // deliberately not part of build() itself, which stays coordinate-free).
+    std::vector<std::pair<int,int>>  concerted_sidechain_pairs;
+
     // ── 이황화 결합 쌍 및 구속 (Disulfide bond pairs + restraints, P2.3) ────────
     //
     // ── 이황화 결합 생화학 (Disulfide bond biochemistry) ─────────────────────────
@@ -1417,6 +1456,82 @@ public:
                 auto it = psi_at_ca.find(ca_idx);
                 if (it != psi_at_ca.end())
                     concerted_pairs.push_back({pk, it->second});
+            }
+        }
+    }
+
+    // ── identify_concerted_sidechain_pairs() ────────────────────────────────
+    //
+    // build()가 좌표 없이 순수 위상만으로 concerted_pairs(백본 크랭크샤프트)를
+    // 구성하는 것과 달리, 이 함수는 실제 좌표가 필요하므로 별도 함수로 분리했다
+    // (build() 자체는 건드리지 않음 — 이미 검증된 함수 보호). Python에서
+    // topo.build(...) 직후, 초기 원자 좌표가 준비된 시점에 한 번만 호출한다.
+    //
+    // 후보 쌍 조건:
+    //   1. 둘 다 BondKind::SIDECHAIN (백본 φ/ψ는 이미 concerted_pairs가 처리).
+    //   2. rot_bond_sides가 서로 겹치지 않음(disjoint) — 같은 잔기의 χ1/χ2처럼
+    //      한쪽이 다른 쪽의 상류/하류에 있는 경우를 배제한다. 잔기 ID를 따로
+    //      저장하지 않아도 이 조건만으로 "완전히 독립적으로 움직이는가"를
+    //      정확히 포착한다 — 잔기 동일성보다 더 일반적이고 정확한 기준.
+    //   3. 피벗 원자(j) 간 거리가 cutoff 이내 — 곁사슬이 서로 닿을 만큼 가까운지
+    //      확인하는 값싼 근사(정확한 최근접-원자 거리보다 저렴; 검증 결과 너무
+    //      거칠면 나중에 개선).
+    //
+    // O(n_rotbonds²) 1회 비용(파싱 시점, MC 스텝마다가 아님). 매우 크거나
+    // 조밀한 단백질에서 쌍 개수가 지나치게 커지지 않도록 상한을 둔다.
+    //
+    // Unlike build() (pure topology, no coordinates), this needs real atom
+    // positions, so it's a separate function -- build() itself is left
+    // untouched to protect an already-verified function. Called once from
+    // Python right after topo.build(...), once initial atom coordinates are
+    // available.
+    //
+    // Candidate pair conditions:
+    //   1. Both BondKind::SIDECHAIN (backbone φ/ψ is already covered by
+    //      concerted_pairs above).
+    //   2. Disjoint rot_bond_sides -- excludes cases like the same residue's
+    //      χ1/χ2 where one bond is upstream/downstream of the other. This
+    //      condition alone correctly captures "do these two move completely
+    //      independently" without needing a separately-stored residue ID --
+    //      more general and more accurate than a same-residue check.
+    //   3. Pivot atom (j) distance within cutoff -- a cheap proxy for "close
+    //      enough for their sidechains to actually reach each other" (cheaper
+    //      than an exact closest-atom-pair distance; revisit if validation
+    //      shows this proxy is too coarse).
+    //
+    // O(n_rotbonds²) one-time cost at parse time, not per MC step. Capped to
+    // avoid an unbounded pair count on very large/dense proteins.
+    void identify_concerted_sidechain_pairs(const std::vector<Particle>& init_coords,
+                                             double cutoff = 6.0) {
+        concerted_sidechain_pairs.clear();
+        constexpr size_t MAX_PAIRS = 4000;  // safety valve for very large/dense proteins
+        const double cutoff2 = cutoff * cutoff;
+        const int nrb = (int)rot_bonds.size();
+
+        auto sides_disjoint = [&](int a, int b) -> bool {
+            // rot_bond_sides entries are typically small (a handful to a few
+            // dozen atoms); linear-scan intersection check is fine here since
+            // this whole function only runs once at parse time.
+            const auto& sa = rot_bond_sides[a];
+            const auto& sb = rot_bond_sides[b];
+            const auto& small  = (sa.size() <= sb.size()) ? sa : sb;
+            const auto& big    = (sa.size() <= sb.size()) ? sb : sa;
+            for (int idx : small)
+                if (std::find(big.begin(), big.end(), idx) != big.end())
+                    return false;
+            return true;
+        };
+
+        for (int a = 0; a < nrb && concerted_sidechain_pairs.size() < MAX_PAIRS; ++a) {
+            if (rot_bonds[a].kind != BondKind::SIDECHAIN) continue;
+            const Particle& pa = init_coords[rot_bonds[a].j];
+            for (int b = a + 1; b < nrb && concerted_sidechain_pairs.size() < MAX_PAIRS; ++b) {
+                if (rot_bonds[b].kind != BondKind::SIDECHAIN) continue;
+                const Particle& pb = init_coords[rot_bonds[b].j];
+                double dx = pa.x - pb.x, dy = pa.y - pb.y, dz = pa.z - pb.z;
+                if (dx*dx + dy*dy + dz*dz > cutoff2) continue;
+                if (!sides_disjoint(a, b)) continue;
+                concerted_sidechain_pairs.push_back({a, b});
             }
         }
     }
@@ -1908,6 +2023,41 @@ private:
         if(r<r_cut){
             double x=std::pow(r_cut/r,12.0)-1.0;
             E+=std::min(HARD_SCALE*x*x, HARD_CAP);
+        }
+        return E;
+    }
+
+    // pair_e_diag: diagnostic-only variant of pair_e() above, for the MC
+    // rejection-cause investigation (IMPROVEMENTS.md item #2 -- is the real
+    // mixing bottleneck a torsional barrier or a correlated steric clash?).
+    // pair_e() fuses electrostatics+GB+LJ+hard-core into one returned number
+    // with no way to see the hard-core (steric) contribution separately --
+    // this variant returns the identical total (same edh+egb+elj+hard-core
+    // sum, byte-for-byte the same formula) but also writes just the
+    // hard-core sub-term into hardcore_out, so the caller can tell "was
+    // this move blocked by real atomic overlap" apart from "was it blocked
+    // by ordinary electrostatics/LJ/GB energetics." Duplicated rather than
+    // adding an out-parameter to pair_e() itself, to avoid touching an
+    // already-verified hot path called from every other energy computation
+    // in this file -- same precedent as run_landscape_segment vs.
+    // run_landscape_trajectory elsewhere in this file.
+    static inline double pair_e_diag(const Particle& pi,const Particle& pj,double ai,double aj,
+                                      double& hardcore_out) noexcept {
+        double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
+        double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
+        double qp=pi.charge*pj.charge;
+        double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
+        double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
+        double egb=GB_COEF*qp/fgb;
+        double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
+        double elj=4.0*eps*(s6*s6-s6);
+        double E=edh+egb+elj;
+        double r_cut=sig*HARD_CUTOFF_FRAC;
+        hardcore_out = 0.0;
+        if(r<r_cut){
+            double x=std::pow(r_cut/r,12.0)-1.0;
+            hardcore_out = std::min(HARD_SCALE*x*x, HARD_CAP);
+            E+=hardcore_out;
         }
         return E;
     }
@@ -2459,6 +2609,150 @@ public:
             return {accepted, true};
         };
 
+        // ── try_concerted_sidechain (2026-07-09, IMPROVEMENTS.md item #2) ────
+        // Direct measurement (run_mc_diagnostic) found the crankshaft move
+        // above is 90.8% steric-dominant among rejected large moves on 1YPI
+        // (494 res, densely packed) vs. 8.1% on 1UBQ (76 res) -- the existing
+        // 2-DOF concerted move doesn't have enough room to route a sidechain
+        // around its neighbours on a large, tightly packed structure. This
+        // move gives two independent (disjoint rot_bond_sides), spatially
+        // close sidechain bonds (topo.concerted_sidechain_pairs, computed once
+        // at parse time in identify_concerted_sidechain_pairs()) the chance to
+        // move *simultaneously* -- so if one sidechain's swing would clash
+        // with its neighbour, that neighbour can move out of the way in the
+        // same proposal, rather than requiring two separate, uncorrelated
+        // single-bond moves to happen in the right order by chance.
+        //
+        // Detailed balance: the two deltas are drawn independently from the
+        // same symmetric distribution every other move in this file already
+        // uses, and pair/move selection is state-independent (a fixed,
+        // precomputed candidate list, chosen uniformly) -- so q(x->y) =
+        // f(δ_A)f(δ_B) = f(-δ_A)f(-δ_B) = q(y->x) exactly, and plain
+        // Metropolis acceptance is correct with no importance-weighting
+        // needed, same proof structure as try_torsion/try_crankshaft above.
+        //
+        // side_group (0=unmoved, 1=group A, 2=group B) is local to this move
+        // only -- try_torsion/try_crankshaft above are untouched and keep
+        // using the existing boolean in_side. dihedral_e_boundary/ss_e_side
+        // only need "any atom moved vs. any atom fixed" (group identity
+        // doesn't matter to them), so the existing in_side -- with both
+        // groups' atoms marked true -- is reused as-is for those two calls.
+        // Only the pairwise non-bonded sum needs to distinguish A from B: the
+        // existing cross_e()'s `in_side[i]==in_side[j]` skip would (if fed a
+        // union of both groups under one boolean) incorrectly skip the A-B
+        // cross term entirely -- exactly the interaction this move exists to
+        // capture (do the two proposed sidechain moves clash with each
+        // other) -- hence the separate cross_e_concerted() below.
+        std::vector<int> side_group(N, 0);
+        auto cross_e_concerted = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (side_group[i] == side_group[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+        const int ncsp = (int)topo.concerted_sidechain_pairs.size();
+        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+
+        auto try_concerted_sidechain = [&]() -> std::pair<bool,bool> {
+            if (ncsp == 0) return {false, false};
+            int   pair_idx = (ncsp > 1) ? pick_csp(gen) : 0;
+            int   bond_a   = topo.concerted_sidechain_pairs[pair_idx].first;
+            int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
+            const RotBond& rb_a = topo.rot_bonds[bond_a];
+            const RotBond& rb_b = topo.rot_bonds[bond_b];
+            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            if (side_a.empty() || side_b.empty()) return {false, false};
+
+            double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
+            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            if (alA < 1e-10) return {false, false};
+            axA/=alA; ayA/=alA; azA/=alA;
+            double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
+            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            if (alB < 1e-10) return {false, false};
+            axB/=alB; ayB/=alB; azB/=alB;
+
+            // Both bonds are BondKind::SIDECHAIN by construction (see
+            // identify_concerted_sidechain_pairs) -- same sidechain-style
+            // 2.5x lever-arm scaling as try_torsion's non-backbone branch.
+            double deltaA = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
+            double deltaB = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
+            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
+            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+
+            for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
+            for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
+
+            std::vector<int> all_idx;
+            all_idx.reserve(side_a.size() + side_b.size());
+            all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
+            all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
+            std::vector<std::array<double,3>> old_pos(all_idx.size());
+            std::vector<double>               old_born(all_idx.size());
+            for (size_t k = 0; k < all_idx.size(); ++k) {
+                int idx = all_idx[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double old_cross = cross_e_concerted();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double oxA = st[rb_a.i].x, oyA = st[rb_a.i].y, ozA = st[rb_a.i].z;
+            for (int k : side_a)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxA, oyA, ozA, axA, ayA, azA, cosA, sinA);
+            double oxB = st[rb_b.i].x, oyB = st[rb_b.i].y, ozB = st[rb_b.i].z;
+            for (int k : side_b)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxB, oyB, ozB, axB, ayB, azB, cosB, sinB);
+            for (int k : all_idx) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e_concerted();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < all_idx.size(); ++k) {
+                    int idx = all_idx[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : all_idx) { in_side[k] = false; side_group[k] = 0; }
+            return {accepted, true};
+        };
+
+        // 이동 종류 선택 확률 (Move-type selection probabilities): concerted
+        // sidechain 15% (있을 때만) -> 남은 확률의 25%가 crankshaft -> 나머지가
+        // torsion. 실효 확률(concerted 후보가 있을 때): concerted 15%,
+        // crankshaft (1-0.15)*0.25=21.25%, torsion 63.75%. 후보가 없는 단백질은
+        // 기존과 완전히 동일하게 동작(순차 확인이라 자동으로 하위 분기로 감).
+        //
+        // Effective probabilities when concerted-sidechain candidates exist:
+        // concerted 15%, crankshaft (1-0.15)*0.25=21.25%, torsion 63.75%.
+        // Proteins with zero candidate pairs behave exactly as before (the
+        // sequential check falls through automatically).
+        constexpr double CONCERTED_SIDECHAIN_PROB = 0.15;
+
         for (int snap = 0; snap < n_snapshots; ++snap) {
             for (int s = 0; s < steps_per_snapshot; ++s) {
                 if (nl.needs_rebuild(st)) {
@@ -2466,8 +2760,11 @@ public:
                     a    = born_radii(st, nl);
                     curE = total_e(st, nl, a, &topo);
                 }
-                bool do_crank = ncp > 0 && uni(gen) < 0.25;
-                auto [accepted, did_move] = do_crank ? try_crankshaft() : try_torsion();
+                bool do_concerted = ncsp > 0 && uni(gen) < CONCERTED_SIDECHAIN_PROB;
+                bool do_crank     = !do_concerted && ncp > 0 && uni(gen) < 0.25;
+                auto [accepted, did_move] = do_concerted ? try_concerted_sidechain()
+                                           : do_crank     ? try_crankshaft()
+                                                           : try_torsion();
                 if (did_move) {
                     acc_win += accepted ? 1 : 0;
                     if (++tot_win == TUNE_FREQ) {
@@ -2707,6 +3004,107 @@ public:
             return {accepted, true};
         };
 
+        // try_concerted_sidechain: identical to the copy in run_landscape_trajectory
+        // above (see the detailed comment there for the physical motivation and the
+        // side_group/cross_e_concerted design rationale) -- duplicated here rather
+        // than shared, matching this pair of functions' existing precedent.
+        std::vector<int> side_group(N, 0);
+        auto cross_e_concerted = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (side_group[i] == side_group[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+        const int ncsp = (int)topo.concerted_sidechain_pairs.size();
+        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+
+        auto try_concerted_sidechain = [&]() -> std::pair<bool,bool> {
+            if (ncsp == 0) return {false, false};
+            int   pair_idx = (ncsp > 1) ? pick_csp(gen) : 0;
+            int   bond_a   = topo.concerted_sidechain_pairs[pair_idx].first;
+            int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
+            const RotBond& rb_a = topo.rot_bonds[bond_a];
+            const RotBond& rb_b = topo.rot_bonds[bond_b];
+            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            if (side_a.empty() || side_b.empty()) return {false, false};
+
+            double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
+            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            if (alA < 1e-10) return {false, false};
+            axA/=alA; ayA/=alA; azA/=alA;
+            double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
+            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            if (alB < 1e-10) return {false, false};
+            axB/=alB; ayB/=alB; azB/=alB;
+
+            double deltaA = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
+            double deltaB = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
+            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
+            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+
+            for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
+            for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
+
+            std::vector<int> all_idx;
+            all_idx.reserve(side_a.size() + side_b.size());
+            all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
+            all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
+            std::vector<std::array<double,3>> old_pos(all_idx.size());
+            std::vector<double>               old_born(all_idx.size());
+            for (size_t k = 0; k < all_idx.size(); ++k) {
+                int idx = all_idx[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double old_cross = cross_e_concerted();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double oxA = st[rb_a.i].x, oyA = st[rb_a.i].y, ozA = st[rb_a.i].z;
+            for (int k : side_a)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxA, oyA, ozA, axA, ayA, azA, cosA, sinA);
+            double oxB = st[rb_b.i].x, oyB = st[rb_b.i].y, ozB = st[rb_b.i].z;
+            for (int k : side_b)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxB, oyB, ozB, axB, ayB, azB, cosB, sinB);
+            for (int k : all_idx) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e_concerted();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            bool accepted = false;
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < all_idx.size(); ++k) {
+                    int idx = all_idx[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : all_idx) { in_side[k] = false; side_group[k] = 0; }
+            return {accepted, true};
+        };
+
+        constexpr double CONCERTED_SIDECHAIN_PROB = 0.15;
+
         for (int snap = 0; snap < n_snapshots; ++snap) {
             for (int s = 0; s < steps_per_snapshot; ++s) {
                 if (nl.needs_rebuild(st)) {
@@ -2714,8 +3112,11 @@ public:
                     a    = born_radii(st, nl);
                     curE = total_e(st, nl, a, &topo);
                 }
-                bool do_crank = ncp > 0 && uni(gen) < 0.25;
-                auto [accepted, did_move] = do_crank ? try_crankshaft() : try_torsion();
+                bool do_concerted = ncsp > 0 && uni(gen) < CONCERTED_SIDECHAIN_PROB;
+                bool do_crank     = !do_concerted && ncp > 0 && uni(gen) < 0.25;
+                auto [accepted, did_move] = do_concerted ? try_concerted_sidechain()
+                                           : do_crank     ? try_crankshaft()
+                                                           : try_torsion();
                 if (did_move) {
                     acc_win += accepted ? 1 : 0;
                     if (++tot_win == TUNE_FREQ) {
@@ -2730,6 +3131,403 @@ public:
             energies.push_back(calculate_potential(st, &topo));
         }
         return {snapshots, energies, cur_max};
+    }
+
+    // run_mc_diagnostic: MC-rejection-cause investigation (IMPROVEMENTS.md item #2's
+    // remaining open question -- is the sampler's mixing bottleneck a torsional
+    // barrier or a correlated steric clash the current single-bond/single-pair move
+    // set can't route around?). Runs n_steps of the same torsion/crankshaft MC used
+    // everywhere else in this file, but for every *attempted* move (accepted or
+    // rejected) logs: move type, the proposed angle magnitude (to separate small
+    // routine in-basin jitter from large potential basin-crossing attempts during
+    // analysis), whether accepted, and the energy-component breakdown split out via
+    // pair_e_diag/cross_e_diag above (hard-core isolated from the rest of the
+    // non-bonded sum). Returned as parallel vectors, not a vector-of-structs, for
+    // easy numpy analysis on the Python side.
+    //
+    // Duplicated from the same try_torsion/try_crankshaft skeleton used by
+    // run_landscape_trajectory/run_landscape_segment above rather than sharing code
+    // with them -- identical reasoning as those two: avoid touching an
+    // already-verified hot path for a change that's purely additive logging.
+    // CPU only (an introspection tool, no GPU counterpart needed).
+    struct McDiagnosticResult {
+        std::vector<int>    move_type;       // 0 = torsion, 1 = crankshaft
+        std::vector<double> proposed_delta;   // |sampled angle|, radians, pre-scaling
+        std::vector<int>    accepted;         // 0/1 (not vector<bool> -- pybind11/numpy friendliness)
+        std::vector<double> d_hardcore;
+        std::vector<double> d_nonbonded_soft; // edh+egb+elj delta, hard-core excluded
+        std::vector<double> d_sasa;
+        std::vector<double> d_dih;
+        std::vector<double> d_ss;
+    };
+
+    McDiagnosticResult run_mc_diagnostic(
+        const std::vector<Particle>& init,
+        const BondTopology& topo,
+        int n_steps,
+        double T = 0.6,
+        double max_angle = 0.12)
+    {
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (n_steps <= 0) throw std::invalid_argument("n_steps must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+
+        size_t N   = init.size();
+        int    nrb = (int)topo.rot_bonds.size();
+        int    ncp = (int)topo.concerted_pairs.size();
+
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        double curE = total_e(st, nl, a, &topo);
+
+        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        std::vector<bool> in_side(N, false);
+
+        double cur_max = max_angle;
+        int    acc_win = 0, tot_win = 0;
+        constexpr int    TUNE_FREQ  = 200;
+        constexpr double TARGET_LO  = 0.28, TARGET_HI = 0.52;
+        constexpr double SCALE_UP   = 1.06,  SCALE_DOWN = 0.94;
+        constexpr double ANGLE_MAX  = 0.50,  ANGLE_MIN  = 0.004;
+
+        McDiagnosticResult out;
+        out.move_type.reserve(n_steps);
+        out.proposed_delta.reserve(n_steps);
+        out.accepted.reserve(n_steps);
+        out.d_hardcore.reserve(n_steps);
+        out.d_nonbonded_soft.reserve(n_steps);
+        out.d_sasa.reserve(n_steps);
+        out.d_dih.reserve(n_steps);
+        out.d_ss.reserve(n_steps);
+
+        // cross_e_diag: same pair-loop shape as cross_e() above, but also
+        // accumulates the hard-core-only sub-total via pair_e_diag.
+        auto cross_e_diag = [&](double& hardcore_sum) -> double {
+            double E = 0.0;
+            hardcore_sum = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (in_side[i] == in_side[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    double hc = 0.0;
+                    E += pair_e_diag(st[i], st[j], a[i], a[j], hc);
+                    hardcore_sum += hc;
+                }
+            return E;
+        };
+
+        auto try_torsion_diag = [&]() -> bool {
+            int            rb_idx = pick_rb(gen);
+            const RotBond& rb     = topo.rot_bonds[rb_idx];
+            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            if (side.empty()) return false;
+
+            double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
+            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            if (al < 1e-10) return false;
+            ax/=al; ay/=al; az/=al;
+
+            double base_d = (rb.kind == BondKind::BACKBONE_PHI ||
+                             rb.kind == BondKind::BACKBONE_PSI)
+                            ? cur_max : cur_max * 2.5;
+            base_d *= topo.rot_bond_scale[rb_idx];
+            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : side) in_side[k] = true;
+
+            std::vector<std::array<double,3>> old_pos(side.size());
+            std::vector<double>               old_born(side.size());
+            for (size_t k = 0; k < side.size(); ++k) {
+                int idx = side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double hc_old = 0.0;
+            double old_cross = cross_e_diag(hc_old);
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+            for (int k : side)
+                rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ax, ay, az, cosD, sinD);
+            for (int k : side) update_born((size_t)k, st, nl, a);
+
+            double hc_new = 0.0;
+            double new_cross = cross_e_diag(hc_new);
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double d_hc  = hc_new - hc_old;
+            double d_soft = (new_cross - hc_new) - (old_cross - hc_old);
+            double d_sasa_ = new_sasa - old_sasa;
+            double d_dih_  = new_dih - old_dih;
+            double d_ss_   = new_ss - old_ss;
+            double dE = (new_cross-old_cross) + d_sasa_ + d_dih_ + d_ss_;
+
+            bool accepted = false;
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < side.size(); ++k) {
+                    int idx = side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : side) in_side[k] = false;
+
+            out.move_type.push_back(0);
+            out.proposed_delta.push_back(std::fabs(delta));
+            out.accepted.push_back(accepted ? 1 : 0);
+            out.d_hardcore.push_back(d_hc);
+            out.d_nonbonded_soft.push_back(d_soft);
+            out.d_sasa.push_back(d_sasa_);
+            out.d_dih.push_back(d_dih_);
+            out.d_ss.push_back(d_ss_);
+
+            // acceptance-window tuning, identical to run_landscape_segment
+            acc_win += accepted ? 1 : 0;
+            if (++tot_win == TUNE_FREQ) {
+                double rate = (double)acc_win / TUNE_FREQ;
+                if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
+                else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                acc_win = tot_win = 0;
+            }
+            return true;
+        };
+
+        auto try_crankshaft_diag = [&]() -> bool {
+            if (ncp == 0) return false;
+            int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
+            int phi_k  = topo.concerted_pairs[cp_idx].first;
+            int psi_k  = topo.concerted_pairs[cp_idx].second;
+            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            if (phi_side.empty() || psi_side.empty()) return false;
+
+            for (int k : phi_side) in_side[k] = true;
+
+            const RotBond& phi_rb = topo.rot_bonds[phi_k];
+            double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
+            double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
+            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return false; }
+            p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
+
+            std::vector<std::array<double,3>> old_pos(phi_side.size());
+            std::vector<double>               old_born(phi_side.size());
+            for (size_t k = 0; k < phi_side.size(); ++k) {
+                int idx = phi_side[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+            double hc_old = 0.0;
+            double old_cross = cross_e_diag(hc_old);
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = std::cos(delta), sinD = std::sin(delta);
+
+            for (int k : phi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
+
+            const RotBond& psi_rb = topo.rot_bonds[psi_k];
+            double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
+            double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
+            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            if (p2l < 1e-10) {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                }
+                for (int k : phi_side) in_side[k] = false;
+                return false;
+            }
+            p2ax/=p2l; p2ay/=p2l; p2az/=p2l;
+            for (int k : psi_side)
+                rodrigues(st[k].x, st[k].y, st[k].z, p2ox, p2oy, p2oz, p2ax, p2ay, p2az, cosD, -sinD);
+
+            for (int k : phi_side) update_born((size_t)k, st, nl, a);
+
+            double hc_new = 0.0;
+            double new_cross = cross_e_diag(hc_new);
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double d_hc  = hc_new - hc_old;
+            double d_soft = (new_cross - hc_new) - (old_cross - hc_old);
+            double d_sasa_ = new_sasa - old_sasa;
+            double d_dih_  = new_dih - old_dih;
+            double d_ss_   = new_ss - old_ss;
+            double dE = (new_cross-old_cross) + d_sasa_ + d_dih_ + d_ss_;
+
+            bool accepted = false;
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+                accepted = true;
+            } else {
+                for (size_t k = 0; k < phi_side.size(); ++k) {
+                    int idx = phi_side[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : phi_side) in_side[k] = false;
+
+            out.move_type.push_back(1);
+            out.proposed_delta.push_back(std::fabs(delta));
+            out.accepted.push_back(accepted ? 1 : 0);
+            out.d_hardcore.push_back(d_hc);
+            out.d_nonbonded_soft.push_back(d_soft);
+            out.d_sasa.push_back(d_sasa_);
+            out.d_dih.push_back(d_dih_);
+            out.d_ss.push_back(d_ss_);
+
+            acc_win += accepted ? 1 : 0;
+            if (++tot_win == TUNE_FREQ) {
+                double rate = (double)acc_win / TUNE_FREQ;
+                if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
+                else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                acc_win = tot_win = 0;
+            }
+            return true;
+        };
+
+        // Plain (undiagnosed) concerted-sidechain move -- Part 6's evidence-backed fix
+        // (physics_engine.cpp run_landscape_trajectory/run_landscape_segment), included
+        // here so this diagnostic's *sampled states* reflect the same mixing the new
+        // move gives production runs -- otherwise re-running this diagnostic couldn't
+        // show whether crankshaft's steric-dominant rejection rate actually drops.
+        // Not logged into `out` (its arrays are torsion(0)/crankshaft(1) only, and
+        // this move's own d_hardcore/d_dih split isn't the question being re-tested
+        // here) -- it just advances the chain like an accepted/rejected torsion or
+        // crankshaft move would, silently, same as the existing degenerate-retry path.
+        std::vector<int> side_group(N, 0);
+        auto cross_e_concerted = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (side_group[i] == side_group[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+        const int ncsp = (int)topo.concerted_sidechain_pairs.size();
+        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+        constexpr double CONCERTED_SIDECHAIN_PROB = 0.15;
+
+        auto try_concerted_sidechain_plain = [&]() -> bool {
+            if (ncsp == 0) return false;
+            int   pair_idx = (ncsp > 1) ? pick_csp(gen) : 0;
+            int   bond_a   = topo.concerted_sidechain_pairs[pair_idx].first;
+            int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
+            const RotBond& rb_a = topo.rot_bonds[bond_a];
+            const RotBond& rb_b = topo.rot_bonds[bond_b];
+            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            if (side_a.empty() || side_b.empty()) return false;
+
+            double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
+            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            if (alA < 1e-10) return false;
+            axA/=alA; ayA/=alA; azA/=alA;
+            double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
+            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            if (alB < 1e-10) return false;
+            axB/=alB; ayB/=alB; azB/=alB;
+
+            double deltaA = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
+            double deltaB = std::uniform_real_distribution<double>(
+                -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
+            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
+            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+
+            for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
+            for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
+
+            std::vector<int> all_idx;
+            all_idx.reserve(side_a.size() + side_b.size());
+            all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
+            all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
+            std::vector<std::array<double,3>> old_pos(all_idx.size());
+            std::vector<double>               old_born(all_idx.size());
+            for (size_t k = 0; k < all_idx.size(); ++k) {
+                int idx = all_idx[k];
+                old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                old_born[k] = a[idx];
+            }
+
+            double old_cross = cross_e_concerted();
+            double old_sasa  = sasa_nonpolar(st, nl);
+            double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double oxA = st[rb_a.i].x, oyA = st[rb_a.i].y, ozA = st[rb_a.i].z;
+            for (int k : side_a)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxA, oyA, ozA, axA, ayA, azA, cosA, sinA);
+            double oxB = st[rb_b.i].x, oyB = st[rb_b.i].y, ozB = st[rb_b.i].z;
+            for (int k : side_b)
+                rodrigues(st[k].x, st[k].y, st[k].z, oxB, oyB, ozB, axB, ayB, azB, cosB, sinB);
+            for (int k : all_idx) update_born((size_t)k, st, nl, a);
+
+            double new_cross = cross_e_concerted();
+            double new_sasa  = sasa_nonpolar(st, nl);
+            double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+            double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                             : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+            double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                      + (new_dih-old_dih)   + (new_ss-old_ss);
+            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+                curE += dE;
+            } else {
+                for (size_t k = 0; k < all_idx.size(); ++k) {
+                    int idx = all_idx[k];
+                    st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                    a[idx]    = old_born[k];
+                }
+            }
+            for (int k : all_idx) { in_side[k] = false; side_group[k] = 0; }
+            return true;
+        };
+
+        for (int s = 0; s < n_steps; ++s) {
+            if (nl.needs_rebuild(st)) {
+                nl.build(st);
+                a    = born_radii(st, nl);
+                curE = total_e(st, nl, a, &topo);
+            }
+            if (ncsp > 0 && uni(gen) < CONCERTED_SIDECHAIN_PROB) {
+                if (!try_concerted_sidechain_plain()) --s;  // degenerate -- retry, don't log
+                continue;
+            }
+            bool do_crank = ncp > 0 && uni(gen) < 0.25;
+            bool did_move = do_crank ? try_crankshaft_diag() : try_torsion_diag();
+            if (!did_move) --s;  // degenerate proposal (empty side/zero-length axis) -- retry, don't log
+        }
+        return out;
     }
 
     // lowest_energy_structure: scan an ensemble and return the conformation with the
@@ -2803,6 +3601,10 @@ PYBIND11_MODULE(protein_physics,m){
         .def_readonly("rot_bond_scale",   &BondTopology::rot_bond_scale)
         .def_readonly("disulfide_pairs",  &BondTopology::disulfide_pairs)
         .def_readonly("concerted_pairs",  &BondTopology::concerted_pairs)
+        .def_readonly("concerted_sidechain_pairs", &BondTopology::concerted_sidechain_pairs)
+        .def("identify_concerted_sidechain_pairs",
+             &BondTopology::identify_concerted_sidechain_pairs,
+             py::arg("init_coords"), py::arg("cutoff") = 6.0)
         .def("add_disulfide", &BondTopology::add_disulfide,
              py::arg("atom_i"), py::arg("atom_j"))
         // ── Flat/CSR exports (rb_*, dih_*) ──────────────────────────────────
@@ -2932,5 +3734,19 @@ PYBIND11_MODULE(protein_physics,m){
              py::arg("n_snapshots"),py::arg("steps_per_snapshot"),
              py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
              py::call_guard<py::gil_scoped_release>())
+        .def("run_mc_diagnostic",
+             [](PhysicsEngine& self, const std::vector<Particle>& init,
+                const BondTopology& topo, int n_steps, double T, double max_angle) {
+                 PhysicsEngine::McDiagnosticResult r;
+                 {
+                     py::gil_scoped_release release;
+                     r = self.run_mc_diagnostic(init, topo, n_steps, T, max_angle);
+                 }  // GIL re-acquired here, before building the Python-visible tuple below
+                 return std::make_tuple(r.move_type, r.proposed_delta, r.accepted,
+                                         r.d_hardcore, r.d_nonbonded_soft, r.d_sasa,
+                                         r.d_dih, r.d_ss);
+             },
+             py::arg("initial_state"),py::arg("topology"),py::arg("n_steps"),
+             py::arg("temperature")=0.6,py::arg("max_angle")=0.12)
         .def("num_threads",&PhysicsEngine::num_threads);
 }

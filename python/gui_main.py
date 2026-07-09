@@ -506,8 +506,18 @@ def _parse_pdb(path, log, physics_mod):
     # BondTopology.build() silently skips HETATM residues (not in bond_templates).
     topo = protein_physics.BondTopology()
     topo.build(meta_resnames, meta_atomnames, meta_residx)
+    # 곁사슬 협동 이동 후보 쌍 식별 (2026-07-09, IMPROVEMENTS.md 항목 #2 참고):
+    # build()는 좌표가 필요 없어 여기서 별도로 호출한다 — 좌표(atoms)가 이 시점에
+    # 이미 준비되어 있으므로 build() 직후가 자연스러운 호출 지점이다.
+    #
+    # Concerted sidechain-pair candidate identification (2026-07-09, see
+    # IMPROVEMENTS.md item #2): needs coordinates, so build() doesn't do this
+    # itself -- atoms are already available here, right after build() is the
+    # natural place to call it.
+    topo.identify_concerted_sidechain_pairs(atoms)
     log(f"  topology: {topo.num_bonds} bonds · {topo.num_rot_bonds} rotatable"
-        f" · {topo.num_concerted_pairs} crankshaft pairs")
+        f" · {topo.num_concerted_pairs} crankshaft pairs"
+        f" · {len(topo.concerted_sidechain_pairs)} sidechain-pair candidates")
 
     # ── 이황화 결합 탐지 (Disulfide bond detection, P2.3) ─────────────────────
     # 모든 CYS SG 원자 쌍 중 SG–SG < 2.5 Å인 쌍을 이황화 결합으로 간주한다.

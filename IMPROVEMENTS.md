@@ -482,17 +482,94 @@ the one pre-existing parsing bug the same test run exposed:
   now doubly de-prioritized given both R-hat and τ have failed as
   convergence signals for this sampler.
 
-  **Possible future add-on, not started: investigate the MC chain's
-  non-stationarity/drift directly.** One of two alternatives rejected at
-  the pragmatic-pivot decision point above — deferred as a substantially
-  larger, open-ended effort rather than dropped as wrong. The 100k-step
-  1UBQ probe found the chain still drifting (-1.54σ first-half vs
-  second-half mean energy) at T=0.6 with no sign of reaching a stationary
-  distribution within any affordable step budget; the current fix works
-  around this (structural-displacement gate + empirical repeat-run
-  validation) without resolving it. Worth exploring later: simulated
-  annealing or replica exchange in place of plain Metropolis MC, which
-  could address the root cause rather than the symptom.
+  **Investigate the MC chain's non-stationarity/drift directly — still
+  open; both originally-named alternatives have since been tried and
+  closed (2026-07-09 update).** The 100k-step 1UBQ probe found the chain
+  still drifting (-1.54σ first-half vs second-half mean energy) at T=0.6
+  with no sign of reaching a stationary distribution within any affordable
+  step budget; the shipped fix (structural-displacement gate + empirical
+  repeat-run validation, plus the later sampling-budget cut) works around
+  this without resolving it. This note originally proposed "simulated
+  annealing or replica exchange" as the way to address the root cause —
+  both were tried later this session, not just proposed:
+    - **Simulated annealing** (as a burn-in accelerant): tested, rejected —
+      made 1UBQ's funnel score lower and more variable than no annealing at
+      all, and using it for actual production sampling would bias the walk
+      toward the minimum-energy state, corrupting the population-weighted
+      basin estimates this classifier depends on.
+    - **Replica exchange**: fully implemented (temperature ladder, segmented
+      execution, swap logic — CPU and GPU), tuned, a real step-size-tuning
+      bug found and fixed, retested against all 4 ground-truth proteins —
+      mixed result (real win on 1LYZ, no clear win elsewhere, a reproduced
+      ~40% misclassification risk on 1XQ8 after the bug fix). Kept off by
+      default (`USE_REPLICA_EXCHANGE = False`).
+  Both closed, not abandoned as untried. **What's still genuinely open:
+  a different enhanced-sampling approach entirely** — not another tuning
+  pass on the PT design already tried, and not annealing. Candidates not
+  yet attempted: larger/smarter MC moves (e.g. explicit basin-hopping
+  jumps between already-discovered basins rather than relying on thermal
+  fluctuation to cross barriers), or a different exchange scheme (e.g.
+  Hamiltonian replica exchange varying the potential rather than
+  temperature, if the flat-temperature-ladder PT's specific failure mode
+  turns out to be more about *which* coordinate is being enhanced than
+  *whether* enhancement helps at all).
+
+  **Diagnostic (2026-07-09): measured which energy term actually blocks
+  rejected moves, before building either candidate above — decisive,
+  size- and move-type-dependent result.** Rather than guessing between
+  Hamiltonian REST (right fix if the bottleneck is torsional barrier
+  height) and coordinated/concerted moves (right fix if it's a
+  correlated steric clash the current single/double-DOF move set can't
+  route around), added an instrumented probe
+  (`PhysicsEngine::run_mc_diagnostic`, `physics_engine.cpp`) that
+  separates the hard-core (steric) contribution from the rest of the
+  non-bonded sum via a new `pair_e_diag`/`cross_e_diag` pair (duplicated
+  from `pair_e`/the existing `cross_e` lambda, not modifying either --
+  same precedent as `run_landscape_segment`), and logs every attempted
+  move's proposed angle magnitude, accept/reject outcome, and full
+  energy-component breakdown. Ran on 1UBQ (76 res, small) and 1YPI (494
+  res, large), bucketed proposed moves by `|delta|` into small (routine
+  in-basin jitter) vs. large (top quartile -- the moves that could
+  plausibly cross a basin boundary), and checked among **rejected,
+  large-bucket** moves whether `|d_hardcore|` or `|d_dih|` was the
+  bigger contributor:
+
+  | Protein | Move type | n rejected-large | Steric-dominant | Torsional-dominant |
+  |---|---|---|---|---|
+  | 1UBQ (76 res) | torsion | 2266 | 0.0% | 100.0% |
+  | 1UBQ (76 res) | crankshaft | 1206 | 8.1% | 91.9% |
+  | 1YPI (494 res) | torsion | 297 | 1.0% | 99.0% |
+  | 1YPI (494 res) | crankshaft | 196 | **90.8%** | 9.2% |
+
+  **Single-bond torsion moves are dihedral-barrier-limited at every size
+  tested** -- essentially never blocked by steric clash, regardless of
+  protein size. **But the concerted crankshaft moves (φ/ψ pair sharing a
+  Cα, the codebase's existing coordinated-move mechanism) flip
+  completely on the large protein**: torsional-dominant on 1UBQ (91.9%,
+  consistent with the torsion-move pattern), but overwhelmingly
+  steric-dominant on 1YPI (90.8%) -- and severely so: median hard-core
+  penalty among rejected large crankshaft moves on 1YPI is **46,213
+  kcal/mol** (vs. 0.00 on 1UBQ), meaning genuine deep atomic overlaps,
+  not marginal near-misses. Physically sensible: 1YPI is far more
+  densely packed, so even a 2-degree-of-freedom concerted move doesn't
+  have enough room to route a large backbone displacement around its
+  neighbors -- exactly the "single/double-DOF move can't find the real
+  multi-body path" mechanism, and specifically on the large-protein case
+  that's been the recurring hard case throughout this whole
+  investigation (PT, sampling depth -- always 1YPI).
+
+  **Verdict: Hamiltonian REST is not well-motivated by this data** for
+  the actual hard case -- the large-protein rejections that matter
+  (crankshaft, large-magnitude, i.e. the ones that could plausibly cross
+  a basin) are steric, not torsional. **The coordinated/concerted-move
+  family is the evidence-backed next step**, specifically because the
+  existing 2-DOF crankshaft mechanism already isn't enough room on a
+  densely-packed large protein -- candidates: more/larger coordinated
+  move sets (beyond the current single φ/ψ-pair case), loop-closure-style
+  moves guaranteed valid by construction, or explicit basin-jump moves
+  reusing the existing multi-branch/Kabsch-comparison infrastructure.
+  Not yet implemented as of this entry -- this diagnostic's job was to
+  pick the right direction before investing in either, not to build it.
 
   **Runtime-optimization follow-up (2026-07-09): what was tried, what was
   rejected, what was adopted.** Prompted by a GPU-speedup question, this
@@ -761,6 +838,135 @@ the one pre-existing parsing bug the same test run exposed:
   scaling closes the regression while keeping the win on every smaller
   case.
 
+  **Follow-up re-verification (2026-07-09): 1YPI funnel/label stability
+  re-checked (4 repeats) after all of this session's GPU/SSL/knot
+  changes landed, not just a single spot-check.** The earlier
+  re-validation above only ran 1YPI once; real production behavior had
+  changed further since (GPU auto-selected by default, SSL bundling
+  fixed, knot classifier fixed) without a repeat-run check the way
+  every other validation this session got. Ran the real production
+  path end-to-end (`generate_ensemble` -> size-dependent branch
+  selection -> `LandscapeWorker`, GPU engine) 4x: **4/4 correct
+  ORDERED**, funnel range [0.167, 0.322], avg time 131.7s (branch_count
+  correctly resolved to 3 at 494 res). Funnel range is a little wider
+  than the prior data points on record (0.122-0.222), driven by one run
+  at 0.322 -- not a regression: labels stayed correct in all 4, funnel
+  has been documented as a noisy statistic under this budget all
+  session, and a *higher* funnel is if anything more consistent with
+  1YPI's ground truth (rigid TIM-barrel, single-basin dominance
+  expected) than a lower one would be. GPU-default production path
+  confirmed still correct at this scale.
+
+  **MC mixing bottleneck diagnosis (2026-07-09): steric, not torsional,
+  and size-dependent.** With PT closed out as not worth pursuing
+  further, went back to the open non-stationarity question (100k-step
+  1UBQ probe: -1.54σ drift, chain never converges within any affordable
+  budget). Two candidate mechanisms were on the table -- Hamiltonian
+  replica exchange (scale the dihedral term; the right fix if the
+  bottleneck is torsional-barrier height) vs. coordinated/concerted
+  moves (the right fix if the bottleneck is a correlated steric clash
+  the current single/double-DOF move set can't route around by chance).
+  Built an instrumented diagnostic (`run_mc_diagnostic`,
+  `pair_e_diag`/`cross_e_diag` -- splits the hard-core steric term out
+  from the rest of the non-bonded sum for every *attempted* move, not
+  just accepted ones) and ran it on 1UBQ (76 res) and 1YPI (494 res),
+  bucketing proposed moves by size and asking whether `|d_hardcore|` or
+  `|d_dih|` dominates among rejected large moves:
+
+  | Protein | torsion: steric-dominant | crankshaft: steric-dominant |
+  |---|---|---|
+  | 1UBQ (76 res) | 0.0% | 8.1% |
+  | 1YPI (494 res) | 1.0% | 90.8% (median hard-core penalty 46,213 kcal/mol) |
+
+  **Decisive and size-dependent**: single-bond torsion moves are
+  dihedral-barrier-limited at every size tested (not a steric problem).
+  The existing 2-DOF backbone crankshaft move flips from
+  torsional-dominant on the small protein to overwhelmingly
+  steric-dominant (genuine deep atomic overlaps, not marginal
+  near-misses) on the large, densely-packed one. **Verdict: pursue
+  concerted/coordinated moves next, not Hamiltonian REST** -- the
+  blocking energy on the case that actually matters (the large protein)
+  is in the non-bonded term, which dihedral scaling wouldn't touch.
+
+  **Implemented: concerted sidechain-pair moves — real result:
+  no measurable improvement on the motivating bottleneck.** Added a
+  third MC move type, `try_concerted_sidechain`, to both landscape
+  production loops (`run_landscape_trajectory`, `run_landscape_segment`
+  -- `generate_ensemble` deliberately out of scope, its short relaxation
+  runs aren't attempting basin crossings). Design: at parse time,
+  `BondTopology::identify_concerted_sidechain_pairs()` finds pairs of
+  sidechain rotatable bonds with disjoint `rot_bond_sides` (fully
+  independent rotation groups, unlike φ/ψ which are hierarchically
+  nested) within 6.0 Å of each other (476 candidates on 1UBQ, 2728 on
+  1YPI); the new move proposes independent simultaneous deltas on both
+  bonds (15% selection probability when candidates exist), so a
+  sidechain whose swing would clash with a neighbor gets the chance to
+  have that neighbor move out of the way in the same proposal. Detailed
+  balance holds with no correction (both deltas drawn from the same
+  symmetric distribution every other move already uses, state-independent
+  pair selection). Correctly distinguishes the two independent groups
+  from the shared crankshaft/torsion exclusion machinery: reuses
+  `dihedral_e_boundary`/`ss_e_side` as-is via the existing boolean
+  `in_side` (their "any atom moved vs. any fixed" semantics don't care
+  which group), but adds a separate local `side_group`/`cross_e_concerted`
+  for the pairwise non-bonded sum specifically (needed so A-B cross-terms
+  between the two groups are correctly *included*, not skipped the way a
+  naive boolean union would).
+
+  Rebuilt (CPU+GPU, OpenMP confirmed detected, clean compile), smoke-tested
+  (finite/bounded energies on 1UBQ and 1YPI, no explosion). **Re-ran the
+  Part 4 diagnostic with the new move active** (added an unlogged copy of
+  the same move into `run_mc_diagnostic`'s state-evolution loop, since the
+  question is whether crankshaft's rejection profile changes once the
+  chain is actually sampling with the new move mixed in):
+
+  | Protein | crankshaft steric-dominant, before | after |
+  |---|---|---|
+  | 1UBQ (76 res) | 8.1% | 6.2% |
+  | 1YPI (494 res) | 90.8% (median 46,213 kcal/mol) | 91.8% (median 55,541 kcal/mol) |
+
+  **No measurable improvement on the motivating bottleneck** -- crankshaft's
+  steric-dominant rejection rate on 1YPI is unchanged within noise, and the
+  median hard-core penalty among rejected moves is, if anything, slightly
+  higher. Plausible explanation: the new move fires on a *different*,
+  independently-selected sidechain pair than whichever crankshaft move is
+  attempted next -- it doesn't target the specific local packing a given
+  crankshaft proposal is about to run into, so it doesn't function as the
+  "make room" mechanism the design intended. A pair-selection strategy
+  correlated with the crankshaft move actually being attempted (rather than
+  a uniformly random independent pick) might be needed to realize the
+  intended effect -- not attempted here.
+
+  **Regression + stability validation: no harm, all ground truth held.**
+  `tests/landscape_stability_test.py` (all 4 proteins, real production
+  path): **13/13 correct labels**, no change in direction from the
+  pre-Part-6 baseline -- 1UBQ 3/3 ORDERED (funnel 0.822-1.000), 1LYZ 3/3
+  ORDERED (funnel 0.250-0.700), 1YPI 4/4 ORDERED (funnel 0.167-0.267,
+  actually *tighter* than the 0.167-0.322 pre-Part-6 range), 1XQ8 3/3
+  POSSIBLY DISORDERED (funnel 0.317-0.333). Near-native stability
+  spot-check (mirrors `accuracy_test.py`'s own RMSD-during-MC method, but
+  against `run_landscape_trajectory` directly -- the function actually
+  modified, since `accuracy_test.py` only exercises `generate_ensemble`,
+  which Part 6 left untouched): 1UBQ Cα RMSD from the native crystal
+  structure stayed in [0.71, 1.35] Å over a full run (energy -534
+  kcal/mol, i.e. genuinely relaxing, not just wandering); 1YPI stayed in
+  [0.24, 2.33] Å (energy -3229 kcal/mol) -- both comfortably within the
+  few-Å near-native envelope the force field is expected to hold, no
+  RMSD blowup from the new move.
+
+  **Decision: keep the move (harmless, cheap, occasionally tightens
+  funnel consistency) but it did not resolve the motivating steric
+  bottleneck** -- large-protein crankshaft rejections remain
+  ~91% steric-dominant with or without it. Unlike PT, there's no
+  accuracy regression to weigh against keeping it, so it stays in the
+  code (no `USE_...`-style off switch was added; it's controlled purely
+  by `concerted_sidechain_pairs` availability + the 15% in-C++
+  selection probability). The real bottleneck this session set out to
+  fix (1YPI-scale crankshaft steric rejections) remains open --
+  candidate next step per the negative-result analysis above:
+  correlate pair selection with the specific crankshaft move about to
+  be attempted, rather than picking independently at random.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
@@ -826,6 +1032,19 @@ not an oversight.
 Remaining for this item: real partial charges/VDW for ATP (blocked on sourcing, see
 above — welcome a pointer to a verifiable parameter file/table), then heme/NAD⁺/FAD/
 PLP bond templates + charges following the same two-step pattern.
+
+**Follow-up sourcing attempt (2026-07-09), same wall, more thoroughly confirmed.**
+Revisited this specifically to add ATP's charges. Four more routes tried, all dead
+ends: the Manchester AMBER parameter database (still unreachable), the Meagher et al.
+2003 paper via a Wayback Machine snapshot (blocked), a targeted GitHub search for a
+redistributed `ATP.mol2`/`.prep`/`.lib` file with real RESP charges (no direct hit),
+and RCSB's own Chemical Component Dictionary CIF for ATP (`_chem_comp_atom.charge` —
+confirmed this is formal charge only, all zeros, not usable as a partial-charge force
+field parameter). **Decision (re-confirmed): stop here, keep the element-based
+fallback.** Not a quick problem to unblock with another search attempt — if picked up
+again, either bring a verified source/file directly, or deliberately choose the
+"chemically-reasoned approximation, clearly labeled as such" path discussed and
+declined this round (as opposed to presenting unverified numbers as real RESP values).
 
 **5. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
