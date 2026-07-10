@@ -3212,6 +3212,451 @@ public:
         return {snapshots, energies, cur_max};
     }
 
+    // ── Analytic torsion-angle-space gradient (for minimize_torsion below) ─────
+    //
+    // Every MC move in this file rotates exactly one bond's downstream side
+    // (rot_bond_sides[k]) at a time, and the existing boundary-ΔE evaluators
+    // (cross_e/dihedral_e_boundary/ss_e_side, used by every move already) only
+    // sum over pairs with one atom in the moving side and one outside it --
+    // purely-intra-side pairs contribute nothing (a rigid rotation preserves
+    // their internal geometry exactly). That means d(E)/d(theta) for a single
+    // bond is just a sum over that same small boundary set, differentiated
+    // instead of subtracted -- no full O(N) per-atom force array is needed.
+    //
+    // Generalized Born's Born radii (a_i) genuinely depend on every neighbor's
+    // position (born_radii()'s HCT integral accumulates a term from every
+    // neighbor), so a fully rigorous GB gradient needs a second pass
+    // propagating d(a_i)/d(r_j) back through the structure. This is
+    // deliberately NOT done here -- Born radii are treated as locally frozen
+    // during each single-bond gradient evaluation (same spirit as
+    // update_born(), which is already an incremental, not-fully-global,
+    // update), a standard simplification in GB-based minimizers. Still a true
+    // analytic derivative of the (approximated) GB expression, not a
+    // finite-difference punt. IMPROVEMENTS.md item #2 records this as an
+    // explicit, scoped-out follow-up.
+
+    // pair_e_dr: d(edh+egb[frozen a_i,a_j]+elj[+hardcore])/dr for pair_e()'s
+    // exact formula. Every term mirrors the matching line in pair_e() so the
+    // two can be visually diffed. Returns the scalar dE/dr; the caller
+    // multiplies by dr/dtheta to get dE/dtheta for one boundary pair.
+    static inline double pair_e_dr(const Particle& pi, const Particle& pj,
+                                    double ai, double aj) noexcept {
+        double dx=pi.x-pj.x, dy=pi.y-pj.y, dz=pi.z-pj.z;
+        double r2=dx*dx+dy*dy+dz*dz, r=std::sqrt(r2), sig=pi.radius+pj.radius;
+        double qp = pi.charge*pj.charge;
+
+        double edh = (COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
+        double dedh_dr = -edh*(KAPPA + 1.0/r);
+
+        double D = ai*aj;
+        double fgb = std::sqrt(r2 + D*std::exp(-r2/(4.0*D)));
+        double egb = GB_COEF*qp/fgb;
+        double dfgb_dr = r*(1.0 - 0.25*std::exp(-r2/(4.0*D))) / fgb;
+        double degb_dr = -egb/fgb * dfgb_dr;
+
+        double eps = std::sqrt(pi.epsilon*pj.epsilon), s6 = std::pow(sig/r, 6.0);
+        double delj_dr = -24.0*eps/r * s6*(2.0*s6 - 1.0);
+
+        double dE_dr = dedh_dr + degb_dr + delj_dr;
+
+        double r_cut = sig*HARD_CUTOFF_FRAC;
+        if (r < r_cut) {
+            double x = std::pow(r_cut/r, 12.0) - 1.0;
+            double E_hard_raw = HARD_SCALE*x*x;
+            if (E_hard_raw < HARD_CAP) {
+                double dx_dr = -12.0*(x+1.0)/r;
+                dE_dr += 2.0*HARD_SCALE*x*dx_dr;
+            }
+            // else: on the HARD_CAP plateau -- contributes 0 (subgradient of min()).
+        }
+        return dE_dr;
+    }
+
+    // dihedral_dphi_dtheta: d(phi)/d(theta) via DIRECT chain-rule differentiation
+    // through the same intermediate quantities dihedral_angle() computes
+    // (b1,b2,b3,n1,n2,m1,x,y), given each atom's velocity under the rotation
+    // (zero for fixed atoms, u×(r-origin) for moving ones -- see the `velocity`
+    // lambda in bond_dE_dtheta below). This is NOT a memorized closed-form
+    // per-atom torsion-gradient formula -- an earlier attempt using the
+    // textbook Blondel-Karplus formula for individual d(phi)/d(r_a) etc. was
+    // built, then caught by gradient_unit_check.py's finite-difference cross-
+    // check (large, inconsistent errors -- a sign/convention mismatch against
+    // this specific atan2/cross-product convention that wasn't worth chasing
+    // down against an external reference). This version instead mechanically
+    // differentiates the SAME code dihedral_angle() runs, line for line
+    // (product rule through every cross/dot product), which has no room for a
+    // "which paper's sign convention" mismatch -- verified independently in
+    // Python (dihedral_grad_isolated_check2.py) against 5 random configurations
+    // and all 12 atom-coordinate partials, max relative error ~1.7e-8
+    // (machine precision), before being ported here.
+    static inline double dihedral_dphi_dtheta(
+        const std::vector<Particle>& p, int a, int b, int c, int d,
+        double vax, double vay, double vaz, double vbx, double vby, double vbz,
+        double vcx, double vcy, double vcz, double vdx, double vdy, double vdz) noexcept {
+
+        double b1x=p[a].x-p[b].x, b1y=p[a].y-p[b].y, b1z=p[a].z-p[b].z;
+        double b2x=p[c].x-p[b].x, b2y=p[c].y-p[b].y, b2z=p[c].z-p[b].z;
+        double b3x=p[d].x-p[c].x, b3y=p[d].y-p[c].y, b3z=p[d].z-p[c].z;
+
+        double vb1x=vax-vbx, vb1y=vay-vby, vb1z=vaz-vbz;
+        double vb2x=vcx-vbx, vb2y=vcy-vby, vb2z=vcz-vbz;
+        double vb3x=vdx-vcx, vb3y=vdy-vcy, vb3z=vdz-vcz;
+
+        double n1x=b1y*b2z-b1z*b2y, n1y=b1z*b2x-b1x*b2z, n1z=b1x*b2y-b1y*b2x;
+        double n2x=b2y*b3z-b2z*b3y, n2y=b2z*b3x-b2x*b3z, n2z=b2x*b3y-b2y*b3x;
+        double m1x=n1y*b2z-n1z*b2y, m1y=n1z*b2x-n1x*b2z, m1z=n1x*b2y-n1y*b2x;
+
+        // v(A×B) = vA×B + A×vB, applied to n1=b1×b2, n2=b2×b3, m1=n1×b2.
+        double vn1x = vb1y*b2z-vb1z*b2y + b1y*vb2z-b1z*vb2y;
+        double vn1y = vb1z*b2x-vb1x*b2z + b1z*vb2x-b1x*vb2z;
+        double vn1z = vb1x*b2y-vb1y*b2x + b1x*vb2y-b1y*vb2x;
+
+        double vn2x = vb2y*b3z-vb2z*b3y + b2y*vb3z-b2z*vb3y;
+        double vn2y = vb2z*b3x-vb2x*b3z + b2z*vb3x-b2x*vb3z;
+        double vn2z = vb2x*b3y-vb2y*b3x + b2x*vb3y-b2y*vb3x;
+
+        double vm1x = vn1y*b2z-vn1z*b2y + n1y*vb2z-n1z*vb2y;
+        double vm1y = vn1z*b2x-vn1x*b2z + n1z*vb2x-n1x*vb2z;
+        double vm1z = vn1x*b2y-vn1y*b2x + n1x*vb2y-n1y*vb2x;
+
+        double x = n1x*n2x+n1y*n2y+n1z*n2z;
+        double y = m1x*n2x+m1y*n2y+m1z*n2z;
+        double vx = vn1x*n2x+vn1y*n2y+vn1z*n2z + n1x*vn2x+n1y*vn2y+n1z*vn2z;
+        double vy = vm1x*n2x+vm1y*n2y+vm1z*n2z + m1x*vn2x+m1y*vn2y+m1z*vn2z;
+
+        double denom = x*x+y*y;
+        if (denom < 1e-20) return 0.0;   // degenerate (near-linear) geometry
+        return (x*vy - y*vx) / denom;    // d(atan2(y,x))/dtheta
+    }
+
+    // bond_dE_dtheta: total analytic dE/dtheta at theta=0 for rotating `side`
+    // (already marked in in_side) around the axis through (ox,oy,oz) with unit
+    // direction (ux,uy,uz). Sums ONLY boundary-crossing contributions, mirroring
+    // cross_e/dihedral_e_boundary/ss_e_side/sasa_nonpolar's own boundary-set
+    // discovery exactly. Used by minimize_torsion() to pick a step DIRECTION;
+    // the actual accept/reject decision always uses the real boundary ΔE via
+    // those same existing functions, same as every MC move -- this never
+    // bypasses that check, it only informs which way to step.
+    static double bond_dE_dtheta(const std::vector<Particle>& st, const NeighborList& nl,
+                                  const std::vector<double>& a, const BondTopology& topo,
+                                  const std::vector<bool>& in_side,
+                                  double ox, double oy, double oz,
+                                  double ux, double uy, double uz,
+                                  size_t N,
+                                  double* dbg_nonbonded = nullptr, double* dbg_sasa = nullptr,
+                                  double* dbg_dih = nullptr, double* dbg_ss = nullptr) noexcept {
+        double dE = 0.0;
+        double dE_nb_track = 0.0, dE_sasa_track = 0.0, dE_dih_track = 0.0, dE_ss_track = 0.0;
+
+        auto velocity = [&](size_t idx, double& vx, double& vy, double& vz) {
+            double px = st[idx].x-ox, py = st[idx].y-oy, pz = st[idx].z-oz;
+            vx = uy*pz-uz*py; vy = uz*px-ux*pz; vz = ux*py-uy*px;
+        };
+
+        // Nonbonded (edh+egb[frozen]+elj+hardcore) boundary contribution --
+        // same double loop as cross_e(), differentiated instead of summed.
+        for (size_t i = 0; i < N; ++i)
+            for (size_t j : nl.nb[i]) {
+                if (in_side[i] == in_side[j]) continue;
+                if (topo.is_excluded((int)i, (int)j)) continue;
+                double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                double r2 = dx*dx+dy*dy+dz*dz;
+                if (r2 > PAIR_CUT2) continue;
+                double r = std::sqrt(r2);
+                size_t mv = in_side[i] ? i : j;
+                double sign = in_side[i] ? 1.0 : -1.0;   // d(r_i-r_j)/dtheta = +-v_mv
+                double vx, vy, vz; velocity(mv, vx, vy, vz);
+                double dr_dtheta = sign*(dx*vx+dy*vy+dz*vz)/r;
+                double term = pair_e_dr(st[i], st[j], a[i], a[j]) * dr_dtheta;
+                dE += term; dE_nb_track += term;
+            }
+
+        // SASA boundary contribution: the per-neighbor spherical-cap subtraction
+        // is linear in r (h=(dc-r)/(2R) => constant dh/dr), so its boundary-pair
+        // contribution is a constant pi*(Ri+Rj)*GAMMA_SA when r<dc, else 0 -- a
+        // real, inherent step-function kink already in this energy term's own
+        // design. The order-dependent min(sa*0.85,...) safety clamp inside the
+        // full per-atom aggregate is deliberately NOT differentiated here (rare-
+        // case regularizer, path-dependent on iteration order); the real,
+        // fully-clamped sasa_nonpolar() is still what decides accept/reject, so
+        // this can only affect step quality, never correctness.
+        for (size_t i = 0; i < N; ++i)
+            for (size_t j : nl.nb[i]) {
+                if (in_side[i] == in_side[j]) continue;
+                double Ri = st[i].radius+PROBE_R, Rj = st[j].radius+PROBE_R;
+                double dx=st[i].x-st[j].x, dy=st[i].y-st[j].y, dz=st[i].z-st[j].z;
+                double r2=dx*dx+dy*dy+dz*dz, r=std::sqrt(r2), dc=Ri+Rj;
+                if (r >= dc) continue;
+                size_t mv = in_side[i] ? i : j;
+                double sign = in_side[i] ? 1.0 : -1.0;
+                double vx, vy, vz; velocity(mv, vx, vy, vz);
+                double dr_dtheta = sign*(dx*vx+dy*vy+dz*vz)/r;
+                double term = GAMMA_SA * M_PI * (Ri+Rj) * dr_dtheta;
+                dE += term; dE_sasa_track += term;
+            }
+
+        // Dihedral boundary contribution: same any_side&&any_fixed condition as
+        // dihedral_e_boundary, differentiated via dihedral_dphi_dtheta above.
+        for (const auto& dr : topo.dihedrals) {
+            bool s_a=in_side[dr.a], s_b=in_side[dr.b], s_c=in_side[dr.c], s_d=in_side[dr.d];
+            bool any_side = s_a||s_b||s_c||s_d;
+            bool any_fixed = !s_a||!s_b||!s_c||!s_d;
+            if (!any_side || !any_fixed) continue;
+            double vax=0,vay=0,vaz=0, vbx=0,vby=0,vbz=0, vcx=0,vcy=0,vcz=0, vdx=0,vdy=0,vdz=0;
+            if (s_a) velocity((size_t)dr.a, vax, vay, vaz);
+            if (s_b) velocity((size_t)dr.b, vbx, vby, vbz);
+            if (s_c) velocity((size_t)dr.c, vcx, vcy, vcz);
+            if (s_d) velocity((size_t)dr.d, vdx, vdy, vdz);
+            double phi = dihedral_angle(st, dr.a, dr.b, dr.c, dr.d);
+            double dphi_dtheta = dihedral_dphi_dtheta(st, dr.a, dr.b, dr.c, dr.d,
+                vax,vay,vaz, vbx,vby,vbz, vcx,vcy,vcz, vdx,vdy,vdz);
+            double dE_dphi = 0.0;
+            for (const auto& t : dr.terms)
+                dE_dphi += -t.V2 * (double)t.n * std::sin((double)t.n * phi - t.gamma);
+            double term = dE_dphi * dphi_dtheta;
+            dE += term; dE_dih_track += term;
+        }
+
+        // Disulfide harmonic boundary contribution.
+        for (const auto& [i, j] : topo.disulfide_pairs) {
+            if (in_side[i] == in_side[j]) continue;
+            double dx=st[i].x-st[j].x, dy=st[i].y-st[j].y, dz=st[i].z-st[j].z;
+            double r2=dx*dx+dy*dy+dz*dz, r=std::sqrt(r2);
+            double dE_dr = 2.0*K_SS*(r-R0_SS);
+            size_t mv = in_side[i] ? (size_t)i : (size_t)j;
+            double sign = in_side[i] ? 1.0 : -1.0;
+            double vx, vy, vz; velocity(mv, vx, vy, vz);
+            double dr_dtheta = sign*(dx*vx+dy*vy+dz*vz)/r;
+            double term = dE_dr * dr_dtheta;
+            dE += term; dE_ss_track += term;
+        }
+
+        if (dbg_nonbonded) *dbg_nonbonded = dE_nb_track;
+        if (dbg_sasa)      *dbg_sasa      = dE_sasa_track;
+        if (dbg_dih)       *dbg_dih       = dE_dih_track;
+        if (dbg_ss)        *dbg_ss        = dE_ss_track;
+        return dE;
+    }
+
+    // minimize_torsion: coordinate-descent (Gauss-Seidel) torsion-angle
+    // minimizer. Visits rotatable bonds one at a time (shuffled order each
+    // sweep), computes the analytic dE/dtheta via bond_dE_dtheta() above,
+    // proposes a step in that direction, and accepts ONLY if the REAL boundary
+    // energy (same cross_e/sasa_nonpolar/dihedral_e_boundary/ss_e_side
+    // functions every MC move already uses) actually decreases -- the
+    // analytic gradient only picks direction/step size, it never substitutes
+    // for the real energy check. Per-bond adaptive step size via backtracking
+    // line search (same idiom as the MC cur_max tuning elsewhere in this file,
+    // just driven by a deterministic energy check instead of an
+    // acceptance-rate target).
+    //
+    // Exists because MC-only relaxation from a large coarse-pivot kick (Part 6/
+    // IMPROVEMENTS.md item #2's landscape-classifier pivot branch) was found to
+    // be far too slow on densely packed proteins -- and greedy near-zero-T MC
+    // made things WORSE on 1YPI specifically, by getting trapped in a worse
+    // local minimum (rejecting every uphill move forfeits the ability to cross
+    // a small barrier into a better basin).
+    //
+    // Returns (snapshots-per-sweep, energies) -- same shape as
+    // run_landscape_trajectory, so it's a drop-in-comparable call from Python.
+    // CPU only for v1 (matches this session's CPU-first precedent for every
+    // new move/capability).
+    std::pair<std::vector<std::vector<Particle>>, std::vector<double>>
+    minimize_torsion(
+        const std::vector<Particle>& init,
+        const BondTopology& topo,
+        int max_sweeps = 50,
+        double step_init = 0.05,
+        double tol = 1e-3)
+    {
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+        if (max_sweeps <= 0) throw std::invalid_argument("max_sweeps must be positive");
+
+        size_t N   = init.size();
+        int    nrb = (int)topo.rot_bonds.size();
+
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        double curE = total_e(st, nl, a, &topo);
+
+        std::vector<bool>   in_side(N, false);
+        std::vector<double> step(nrb, step_init);
+        std::vector<int>    order(nrb);
+        for (int k = 0; k < nrb; ++k) order[k] = k;
+
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
+        snapshots.reserve(max_sweeps);
+        energies.reserve(max_sweeps);
+
+        constexpr int    MAX_BACKTRACK = 5;
+        constexpr double STEP_GROW  = 1.2, STEP_SHRINK = 0.5;
+        constexpr double STEP_MAX   = 0.3, STEP_MIN    = 1e-6;
+        constexpr double DELTA_CAP  = 1.0;   // rad -- safety bound on one proposal,
+                                              // not the primary step-size control
+                                              // (line search handles refinement).
+
+        auto cross_e = [&]() -> double {
+            double E = 0.0;
+            for (size_t i = 0; i < N; ++i)
+                for (size_t j : nl.nb[i]) {
+                    if (in_side[i] == in_side[j]) continue;
+                    if (topo.is_excluded((int)i, (int)j)) continue;
+                    double dx = st[i].x-st[j].x, dy = st[i].y-st[j].y, dz = st[i].z-st[j].z;
+                    if (dx*dx+dy*dy+dz*dz > PAIR_CUT2) continue;
+                    E += pair_e(st[i], st[j], a[i], a[j]);
+                }
+            return E;
+        };
+
+        for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+            std::shuffle(order.begin(), order.end(), gen);
+            double sweep_dE = 0.0;
+
+            for (int rb_idx : order) {
+                if (nl.needs_rebuild(st)) {
+                    nl.build(st);
+                    a    = born_radii(st, nl);
+                    curE = total_e(st, nl, a, &topo);
+                }
+
+                const RotBond& rb = topo.rot_bonds[rb_idx];
+                const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+                if (side.empty()) continue;
+
+                double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+                double ux = st[rb.j].x-ox, uy = st[rb.j].y-oy, uz = st[rb.j].z-oz;
+                double ul = std::sqrt(ux*ux+uy*uy+uz*uz);
+                if (ul < 1e-10) continue;
+                ux/=ul; uy/=ul; uz/=ul;
+
+                for (int k : side) in_side[k] = true;
+
+                double grad = bond_dE_dtheta(st, nl, a, topo, in_side, ox, oy, oz, ux, uy, uz, N);
+                if (std::abs(grad) < 1e-12) { for (int k : side) in_side[k] = false; continue; }
+
+                double old_cross = cross_e();
+                double old_sasa  = sasa_nonpolar(st, nl);
+                double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                double old_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                 : ss_e_side(st, topo.disulfide_pairs, in_side);
+
+                std::vector<std::array<double,3>> old_pos(side.size());
+                std::vector<double>               old_born(side.size());
+                for (size_t k = 0; k < side.size(); ++k) {
+                    int idx = side[k];
+                    old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
+                    old_born[k] = a[idx];
+                }
+
+                double trial_step = step[rb_idx];
+                bool improved = false;
+                for (int bt = 0; bt < MAX_BACKTRACK; ++bt) {
+                    double delta = -trial_step * grad;
+                    delta = std::max(-DELTA_CAP, std::min(DELTA_CAP, delta));
+                    double cosD = std::cos(delta), sinD = std::sin(delta);
+                    for (int k : side)
+                        rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ux, uy, uz, cosD, sinD);
+                    for (int k : side) update_born((size_t)k, st, nl, a);
+
+                    double new_cross = cross_e();
+                    double new_sasa  = sasa_nonpolar(st, nl);
+                    double new_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
+                    double new_ss    = topo.disulfide_pairs.empty() ? 0.0
+                                     : ss_e_side(st, topo.disulfide_pairs, in_side);
+                    double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
+                              + (new_dih-old_dih)   + (new_ss-old_ss);
+
+                    if (dE < 0.0) {
+                        curE += dE;
+                        sweep_dE += dE;
+                        step[rb_idx] = std::min(STEP_MAX, trial_step*STEP_GROW);
+                        improved = true;
+                        break;
+                    }
+                    for (size_t k = 0; k < side.size(); ++k) {
+                        int idx = side[k];
+                        st[idx].x = old_pos[k][0]; st[idx].y = old_pos[k][1]; st[idx].z = old_pos[k][2];
+                        a[idx]    = old_born[k];
+                    }
+                    trial_step *= STEP_SHRINK;
+                    if (trial_step < STEP_MIN) break;
+                }
+                if (!improved) step[rb_idx] = std::max(STEP_MIN, trial_step);
+
+                for (int k : side) in_side[k] = false;
+            }
+
+            snapshots.push_back(st);
+            energies.push_back(curE);
+            if (-sweep_dE < tol) break;   // converged: this sweep barely improved anything
+        }
+
+        return {snapshots, energies};
+    }
+
+    // debug_bond_gradient: test-only accessor exposing bond_dE_dtheta() for a
+    // single bond, so the analytic torsion gradient can be finite-difference
+    // cross-checked from Python against calculate_potential() (see
+    // gradient_unit_check.py) without needing to expose the private
+    // boundary-ΔE lambdas themselves. Not used by minimize_torsion internally
+    // (which computes this the same way, inline, per bond per sweep) -- this
+    // exists purely for the build-time correctness check called for in the
+    // implementation plan.
+    double debug_bond_gradient(const std::vector<Particle>& init,
+                                const BondTopology& topo, int bond_idx) {
+        if (bond_idx < 0 || bond_idx >= (int)topo.rot_bonds.size())
+            throw std::invalid_argument("bond_idx out of range");
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        size_t N = st.size();
+        std::vector<bool> in_side(N, false);
+
+        const RotBond& rb = topo.rot_bonds[bond_idx];
+        const std::vector<int>& side = topo.rot_bond_sides[bond_idx];
+        if (side.empty()) return 0.0;
+        double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+        double ux = st[rb.j].x-ox, uy = st[rb.j].y-oy, uz = st[rb.j].z-oz;
+        double ul = std::sqrt(ux*ux+uy*uy+uz*uz);
+        if (ul < 1e-10) return 0.0;
+        ux/=ul; uy/=ul; uz/=ul;
+        for (int k : side) in_side[k] = true;
+        return bond_dE_dtheta(st, nl, a, topo, in_side, ox, oy, oz, ux, uy, uz, N);
+    }
+
+    // debug_bond_gradient_breakdown: same as debug_bond_gradient above, but
+    // also returns the 4 component sub-totals (nonbonded, sasa, dihedral, ss)
+    // -- test-only, used to isolate which energy term a finite-difference
+    // mismatch comes from.
+    std::tuple<double,double,double,double,double>
+    debug_bond_gradient_breakdown(const std::vector<Particle>& init,
+                                   const BondTopology& topo, int bond_idx) {
+        if (bond_idx < 0 || bond_idx >= (int)topo.rot_bonds.size())
+            throw std::invalid_argument("bond_idx out of range");
+        std::vector<Particle> st = init;
+        NeighborList nl; nl.build(st);
+        auto a = born_radii(st, nl);
+        size_t N = st.size();
+        std::vector<bool> in_side(N, false);
+
+        const RotBond& rb = topo.rot_bonds[bond_idx];
+        const std::vector<int>& side = topo.rot_bond_sides[bond_idx];
+        if (side.empty()) return {0,0,0,0,0};
+        double ox = st[rb.i].x, oy = st[rb.i].y, oz = st[rb.i].z;
+        double ux = st[rb.j].x-ox, uy = st[rb.j].y-oy, uz = st[rb.j].z-oz;
+        double ul = std::sqrt(ux*ux+uy*uy+uz*uz);
+        if (ul < 1e-10) return {0,0,0,0,0};
+        ux/=ul; uy/=ul; uz/=ul;
+        for (int k : side) in_side[k] = true;
+        double nb=0, sasa=0, dih=0, ss=0;
+        double total = bond_dE_dtheta(st, nl, a, topo, in_side, ox, oy, oz, ux, uy, uz, N,
+                                       &nb, &sasa, &dih, &ss);
+        return {nb, sasa, dih, ss, total};
+    }
+
     // run_mc_diagnostic: MC-rejection-cause investigation (IMPROVEMENTS.md item #2's
     // remaining open question -- is the sampler's mixing bottleneck a torsional
     // barrier or a correlated steric clash the current single-bond/single-pair move
@@ -3812,6 +4257,16 @@ PYBIND11_MODULE(protein_physics,m){
              py::arg("initial_state"),py::arg("topology"),
              py::arg("n_snapshots"),py::arg("steps_per_snapshot"),
              py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
+             py::call_guard<py::gil_scoped_release>())
+        .def("minimize_torsion",&PhysicsEngine::minimize_torsion,
+             py::arg("initial_state"),py::arg("topology"),
+             py::arg("max_sweeps")=50,py::arg("step_init")=0.05,py::arg("tol")=1e-3,
+             py::call_guard<py::gil_scoped_release>())
+        .def("debug_bond_gradient",&PhysicsEngine::debug_bond_gradient,
+             py::arg("initial_state"),py::arg("topology"),py::arg("bond_idx"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("debug_bond_gradient_breakdown",&PhysicsEngine::debug_bond_gradient_breakdown,
+             py::arg("initial_state"),py::arg("topology"),py::arg("bond_idx"),
              py::call_guard<py::gil_scoped_release>())
         .def("run_mc_diagnostic",
              [](PhysicsEngine& self, const std::vector<Particle>& init,

@@ -1195,6 +1195,103 @@ the one pre-existing parsing bug the same test run exposed:
   turns out to have a hard ceiling regardless of budget or acceptance
   temperature.
 
+  **Built the torsion-angle gradient minimizer (branch
+  `torsion-gradient-minimizer`) — real correctness bug found and fixed via
+  finite-difference cross-check, real head-to-head win over MC, but a real
+  new failure mode found too, not yet closed.** Added `minimize_torsion()`
+  to `src/physics_engine.cpp`: a Gauss-Seidel coordinate-descent minimizer
+  that visits rotatable bonds one at a time, computes an analytic `dE/dθ`
+  from the same boundary-crossing pair set every MC move already uses (no
+  full O(N) Cartesian force array needed — a rigid rotation leaves
+  intra-side pairs unchanged by construction), steps in that direction, and
+  accepts only if the *real* boundary ΔE (same `cross_e`/`sasa_nonpolar`/
+  `dihedral_e_boundary`/`ss_e_side` functions every MC move calls) actually
+  decreases — backtracking line search if not. Born radii are treated as
+  locally frozen per bond evaluation (GB's full radii chain rule is an
+  explicit, scoped-out follow-up, not silently dropped). No C++ changes were
+  needed to any *existing* function — this is new, additive code only.
+
+  **Correctness bug found and fixed during verification, exactly as the
+  plan anticipated it might need to be.** The first version's dihedral
+  gradient used a hand-derived closed-form per-atom formula recalled from
+  the literature (Blondel & Karplus-style); a finite-difference cross-check
+  against `calculate_potential()` (valid as ground truth here, since
+  boundary-only terms are the *only* ones that can change under a rigid
+  rotation) caught large, inconsistent errors — a sign/convention mismatch
+  against this file's specific `atan2`/cross-product convention that wasn't
+  worth chasing against an external reference. Replaced with a direct
+  mechanical chain-rule differentiation through the exact same intermediate
+  quantities `dihedral_angle()` computes (`b1,b2,b3,n1,n2,m1,x,y`), given
+  each atom's rotational velocity — independently verified in isolated
+  Python against numerical differentiation first (5 random configurations,
+  all 12 atom-coordinate partials, max relative error ~1.7e-8, machine
+  precision) before porting to C++. Re-running the full-engine
+  finite-difference check (`gradient_unit_check.py`, 1UBQ + 1LYZ, 13 sampled
+  bonds each spanning backbone/sidechain kinds) confirmed the fix: the
+  previously-worst case (a bond whose side is 601/602 atoms — nearly the
+  whole molecule) went from 3.78x relative error to exact agreement
+  (2e-8/2e-5).
+
+  **Remaining gradient-quality gap: the SASA term's known approximation
+  (documented, but larger in practice than expected).** Several
+  mid-chain backbone bonds still show 40-320% relative error, occasionally
+  even the wrong *sign*. Decomposed via a new `debug_bond_gradient_breakdown`
+  test accessor: the dihedral contribution is small and accurate on these
+  bonds (confirming the fix); the large nonbonded and SASA terms are each
+  individually large but nearly cancel, so the *documented* SASA
+  approximation (deliberately not differentiating the order-dependent
+  `min(sa*0.85,...)` safety clamp, since it's path-dependent on iteration
+  order) has an outsized effect on the *combined* relative error for
+  densely-neighbored backbone atoms specifically. This does **not**
+  compromise correctness — the minimizer's line search always gates
+  acceptance on the real energy, so a poor gradient direction only wastes
+  backtracking attempts, never accepts an uphill step — but it does mean the
+  direction quality is worse on exactly the backbone-heavy bonds this
+  feature most needs to be good at. Not yet fixed; flagged rather than
+  silently accepted.
+
+  **Head-to-head validation (`minimizer_vs_mc_test.py`) against the same
+  post-kick structures used for the greedy-MC test:**
+
+  | Protein | MC T=0.6 | greedy T=0.01 | minimize_torsion |
+  |---|---|---|---|
+  | 1LYZ | 15,519.7 | 15,785.2 | **9,378.3** |
+  | 1YPI | 70,835.5 | 63,769.0 | **22,809.8** |
+
+  A real, substantial win on both target cases (~40% lower on 1LYZ, ~65%
+  lower on 1YPI vs. the better of the two MC baselines), with provably
+  monotonic energy decrease (verified empirically, not just trusted from the
+  design).
+
+  **But the no-op sanity check (Verification step 4) failed, and it's
+  revealing something real, not a test artifact.** Running
+  `minimize_torsion` to convergence (20 sweeps) starting from the *native*
+  crystal structure directly moved it 26–88 Å Cα RMSD away from native while
+  still lowering energy (1LYZ 187,484→9,674; 1YPI 38,748→25,529) — the
+  structure was substantially unfolded/melted, not gently relaxed. This is
+  the well-known failure mode of running any minimizer *to convergence* on
+  an approximate implicit-solvent force field: real MD/structure-prep
+  workflows only ever run a short, bounded steepest-descent pass (typically
+  a few hundred steps) specifically to relieve local clashes, then hand off
+  to proper sampling — running all the way to a local minimum reliably finds
+  spurious low-energy states the simplified energy function allows but that
+  aren't physically real. The head-to-head win numbers above are therefore
+  suspect too — only energy was checked there, not whether the relaxed
+  post-kick structure stayed a reasonable conformation or was similarly
+  melted; this needs re-checking with an RMSD bound before the "40-65% lower
+  energy" result can be trusted as a real win rather than a differently-named
+  version of the same melting failure mode.
+
+  **Status: not yet closed.** Next steps, not yet done: (1) check post-kick
+  RMSD for the head-to-head comparison above, not just energy; (2) bound
+  `max_sweeps` much lower (a "relieve clashes" pass, not "run to
+  convergence") to match how real minimizers are actually used, and re-run
+  both the no-op and head-to-head checks at that bounded budget; (3) revisit
+  the SASA gradient approximation if the bounded-budget results still show
+  direction-quality problems on backbone-heavy proteins. All work so far is
+  on branch `torsion-gradient-minimizer` (pushed to `origin`), not yet
+  merged to `main`.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
