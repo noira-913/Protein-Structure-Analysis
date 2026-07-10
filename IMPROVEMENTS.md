@@ -967,6 +967,67 @@ the one pre-existing parsing bug the same test run exposed:
   correlate pair selection with the specific crankshaft move about to
   be attempted, rather than picking independently at random.
 
+  **Tried the candidate next step (`try_crankshaft_coupled`) -- also
+  negative, reverted.** Implemented a fourth move type, added to all
+  three of `run_landscape_trajectory`, `run_landscape_segment`, and
+  `run_mc_diagnostic` (unlogged variant): instead of coupling the
+  crankshaft to a randomly-chosen independent sidechain pair, it
+  precomputed (`BondTopology::identify_crankshaft_sidechain_neighbors()`)
+  which SIDECHAIN rotatable bonds sit spatially near *that specific
+  crankshaft pair's own Cα pivot*, and proposed the crankshaft rotation
+  together with one of those neighbors simultaneously -- directly
+  targeting the "random pair has no relationship to the crankshaft
+  move being attempted" explanation from the negative result above.
+  Same `side_group`/`cross_e_concerted` correctness pattern as
+  `try_concerted_sidechain`, same detailed-balance argument (independent
+  symmetric deltas, state-independent selection). Built clean (CPU+GPU),
+  smoke-tested (finite/bounded energies, 70/73 crankshaft pairs
+  couplable on 1UBQ, 456/480 on 1YPI).
+
+  Re-ran the Part 4 diagnostic with this move active (mixed into
+  `run_mc_diagnostic`'s state evolution, unlogged, same as before):
+
+  | Protein | crankshaft steric-dominant | median \|d_hardcore\| among rejected-large |
+  |---|---|---|
+  | original baseline (no coupled moves) | 90.8% | 46,213 kcal/mol |
+  | + `try_concerted_sidechain` only | 91.8% | 55,541 kcal/mol |
+  | + `try_crankshaft_coupled` also | **94.0%** | **53,257 kcal/mol** |
+
+  **Worse, not better** -- the correlated-pair-selection hypothesis was
+  the specific fix this move was built to test, and it didn't pan out;
+  crankshaft's steric-dominant rejection rate went up, not down (1UBQ's
+  own crankshaft steric-dominant rate also rose, 8.1%→11.2%, though n is
+  small there). `tests/landscape_stability_test.py` still passed 13/13
+  across all 4 ground-truth proteins (1UBQ 3/3, 1LYZ 3/3, 1YPI 4/4,
+  1XQ8 3/3, funnel ranges consistent with prior runs) and the
+  near-native RMSD spot-check stayed bounded (1UBQ max 3.22 Å, 1YPI max
+  0.85 Å, both genuinely relaxing) -- so it caused no correctness harm,
+  but also delivered no benefit, on real duplicated code across three
+  call sites with no GPU parity. **Decision: reverted** (unlike
+  `try_concerted_sidechain`, which was kept because it's cheap, causes
+  no harm, and occasionally tightens funnel consistency -- this move
+  had none of those upsides to offset its complexity, and directly made
+  the one number it was designed to move worse). `physics_engine.cpp`
+  and `gui_main.py` are back to the pre-this-addition state (matches
+  the `try_concerted_sidechain` commit exactly, verified via
+  `git diff --stat` showing no change after the revert).
+
+  Both attempts at "give a specific crankshaft pair a way to relieve
+  its own steric clash" (random independent pairing, then spatially/
+  move-correlated pairing) failed to move the needle. This suggests
+  the bottleneck may not be fixable by adding one more simultaneous
+  DOF to a 2-DOF backbone move at all -- on a protein packed as densely
+  as 1YPI's TIM-barrel core, resolving a genuine deep overlap plausibly
+  needs a real multi-body relaxation path (several neighbors moving in
+  a coordinated sequence, not one extra single rotation), which points
+  toward heavier mechanisms (loop-closure-style guaranteed-valid moves,
+  local minimization after a proposed move, or accepting that
+  single-temperature Metropolis MC with local moves has a hard sampling
+  ceiling on large, tightly packed proteins) rather than another
+  variant of "propose one more independent bond." Not attempted this
+  session -- item #2 is left open here, with this negative result
+  recorded so a future session doesn't re-try the same two ideas.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
