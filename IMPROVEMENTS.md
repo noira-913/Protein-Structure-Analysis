@@ -1074,6 +1074,81 @@ the one pre-existing parsing bug the same test run exposed:
   session -- item #2 is left open here, with this negative result
   recorded so a future session doesn't re-try the same two ideas.
 
+  **Tried a third mechanism instead: a coarse structural-pivot branch, built as
+  its own branch rather than a per-step move — partial win, real limitation
+  found.** The two attempts above both tried to get a large structural change
+  accepted by ordinary per-step Metropolis MC, and both failed for the same
+  reason: the immediate post-move energy of a large backbone rotation is
+  dominated by transient steric clashes, so it gets rejected almost by
+  construction (this is exactly what basin-hopping's standard shape avoids —
+  judge acceptance on the *relaxed* energy after a kick, never the raw
+  post-kick energy). Implemented as a new, dedicated branch in the landscape
+  classifier (`LandscapeWorker.USE_PIVOT_BRANCH`, `python/gui_main.py`)
+  rather than a per-step move: `_coarse_pivot()` applies one unconditional
+  (non-Metropolis) large (1.0-3.0 rad, well beyond `ANGLE_MAX=0.50`) rotation
+  to a random backbone φ/ψ bond (reusing the existing `concerted_pairs`
+  φ/ψ pairing) on a fresh copy of the top-ranked candidate structure, then
+  `_PivotBranchRunnable` relaxes it via the *same* `run_landscape_trajectory`
+  MC and step budget every other branch already uses. No C++ changes were
+  needed — `BondTopology.rot_bonds`/`.rot_bond_sides`/`.concerted_pairs` and
+  `Particle.x/y/z` were already exposed read-write to Python
+  (`src/physics_engine.cpp:3651-3682`), so the pivot itself is pure Python,
+  touching no verified hot path. Same output contract as every other branch
+  runnable, so zero changes were needed anywhere in the downstream PCA/DBSCAN/
+  basin-significance pipeline.
+
+  Validated (`<scratchpad>/pivot_branch_validation.py`, reusing
+  `tests/landscape_stability_test.py`'s exact headless pattern) across all 4
+  ground-truth proteins, pivot on vs. off, 3-4 repeats each:
+
+  | Protein | labels (pivot on) | pivot branch's own relaxed energy | vs. reference |
+  |---|---|---|---|
+  | 1UBQ (76 res) | 3/3 ORDERED (matches off) | ~2,900-3,040 kcal/mol | at or below native's 3,713.8 — genuinely relaxed |
+  | 1LYZ (129 res) | 3/3 ORDERED (matches off) | 61,476-1,937,427 kcal/mol | ~6-180x a relaxed-native reference (~10,666) — never recovered |
+  | 1YPI (494 res) | 4/4 ORDERED (matches off) | 1.9-9.2 billion kcal/mol | never remotely relaxed (native-scale is tens of thousands) |
+  | 1XQ8 (140 res, IDP) | 3/3 POSSIBLY DISORDERED (matches off) | ~11,745-11,935 kcal/mol | still elevated, closer than 1LYZ/1YPI |
+
+  **No label regression anywhere — 13/13 correct with the pivot branch active,
+  matching pivot-off exactly.** The existing basin-significance/competitive-
+  energy filtering correctly excludes an unrelaxed, astronomically-high-energy
+  pivot branch from ever counting as a "competitive" alternative, so the
+  concern flagged before validation (a spurious kick flipping a correct
+  ORDERED label) did not materialize on any tested case.
+
+  **But the mechanism's real success is narrow, and splits exactly along the
+  same size/packing line every other finding this session has hit.** On small,
+  loosely-packed 1UBQ, the shared per-branch step budget is enough to relax
+  the kick to a genuinely competitive (sometimes lower-than-native) energy,
+  and it visibly adds real alternative basins (`n_sig` rose from a 1-3 range
+  to 2-5 across repeats). On 1LYZ and especially 1YPI — the actual motivating
+  cases from the crankshaft-coupled investigation — the same shared budget
+  isn't remotely enough to relax a kick this large; the branch just sits at
+  an unphysical energy for its entire trajectory, correctly filtered out as
+  non-competitive (safe), but also non-functional (it never finds anything).
+  It also costs real wall time on the large cases for zero benefit: 1YPI runs
+  with the pivot branch active took up to 1658s vs. 403s worst-case without
+  it (extra neighbor-list-rebuild churn from the wildly displaced coordinates
+  plausibly compounds the cost, not just one more parallel branch's raw step
+  count). 1XQ8 sits in between — an IDP's more open structure relaxes further
+  than 1LYZ/1YPI but still nowhere near native-scale.
+
+  **Decision: kept, default OFF** (`USE_PIVOT_BRANCH = False`, same posture as
+  `USE_REPLICA_EXCHANGE`) — real, validated, harmless infrastructure that does
+  what it was designed to do on small proteins, but doesn't yet solve the
+  large-protein basin-diversity problem it was built for, and adds cost there
+  without benefit. The bottleneck is the same one identified for
+  `try_crankshaft_coupled`: MC-only relaxation (no gradient minimizer exists
+  in this codebase, confirmed by grep) is simply too slow to recover from a
+  large kick within an affordable step budget on a densely packed structure.
+  **Candidate next step, not attempted**: give the pivot branch its own larger
+  step budget instead of reusing the shared `N_per`/`S` (it starts much
+  farther from equilibrium than every other branch, so an apples-to-apples
+  budget was never obviously the right choice — this was an explicit open
+  question going into validation, and the data now argues for scaling it up,
+  at least on large proteins), or apply several smaller pivots instead of one
+  large one to keep displacement high while landing in a more recoverable
+  starting clash.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer

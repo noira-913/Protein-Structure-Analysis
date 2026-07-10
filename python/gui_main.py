@@ -1422,6 +1422,131 @@ class _LandscapeBranchRunnable(QRunnable):
                 self.results[self.bi] = (None, None, ex2)
 
 
+def _rodrigues_rotate_atoms(atoms, atom_indices, origin, axis, angle):
+    """Rotate atoms[i] for i in atom_indices around `axis` (unit vector) through
+    `origin` by `angle` radians, in place. Same math as physics_engine.cpp's
+    rodrigues() helper, reimplemented here in plain Python/numpy since this is
+    called once per pivot branch, not inside a hot per-step MC loop."""
+    ox, oy, oz = origin
+    ux, uy, uz = axis
+    cosA, sinA = np.cos(angle), np.sin(angle)
+    for idx in atom_indices:
+        px, py, pz = atoms[idx].x - ox, atoms[idx].y - oy, atoms[idx].z - oz
+        dot = px * ux + py * uy + pz * uz
+        cx = uy * pz - uz * py
+        cy = uz * px - ux * pz
+        cz = ux * py - uy * px
+        rx = px * cosA + cx * sinA + ux * dot * (1 - cosA)
+        ry = py * cosA + cy * sinA + uy * dot * (1 - cosA)
+        rz = pz * cosA + cz * sinA + uz * dot * (1 - cosA)
+        atoms[idx].x = rx + ox
+        atoms[idx].y = ry + oy
+        atoms[idx].z = rz + oz
+
+
+def _coarse_pivot(seed_atoms, topo, physics_mod, rng, n_pivots=1, angle_range=(1.0, 3.0)):
+    """Apply n_pivots large, UNCONDITIONAL (non-Metropolis) backbone phi/psi
+    rotations to a fresh copy of seed_atoms, producing a genuinely different
+    starting conformation for a dedicated MC branch.
+
+    This is the basin-hopping "propose" step: no energy evaluation or
+    accept/reject happens here, deliberately. IMPROVEMENTS.md item #2 records
+    two prior attempts (try_crankshaft_coupled, and testing generate_ensemble
+    at high temperature) that tried to get a large structural change accepted
+    by ordinary per-step Metropolis MC -- both failed, because the immediate
+    post-move energy of a large backbone rotation is dominated by transient
+    steric clashes and gets rejected almost by construction (or, at high T,
+    the ANGLE_MAX=0.50 rad cap and sidechain-dominated move mix mean no large
+    move is even proposed). Standard basin-hopping avoids this by judging
+    acceptance on the RELAXED energy after a kick, not the raw post-kick
+    energy -- this function is the "kick" half; the caller (_PivotBranchRunnable)
+    supplies the "relax" half via the existing run_landscape_trajectory MC.
+
+    Picks a random topo.concerted_pairs entry (the existing phi/psi crankshaft
+    pairing) rather than an arbitrary raw dihedral, so the axis/side-set
+    relationship is already-validated structure, then rotates one of that
+    pair's two bonds by a large (well beyond ANGLE_MAX) random angle.
+    """
+    pivoted = [physics_mod.Particle(a.x, a.y, a.z, a.charge, a.radius, a.epsilon, a.is_water)
+               for a in seed_atoms]
+    pairs = topo.concerted_pairs
+    if not pairs:
+        return pivoted, 0
+    n_applied = 0
+    for _ in range(n_pivots):
+        phi_idx, psi_idx = pairs[rng.integers(len(pairs))]
+        bond_idx = phi_idx if rng.random() < 0.5 else psi_idx
+        rb = topo.rot_bonds[bond_idx]
+        side = topo.rot_bond_sides[bond_idx]
+        if not side:
+            continue
+        origin = np.array([pivoted[rb.i].x, pivoted[rb.i].y, pivoted[rb.i].z])
+        target = np.array([pivoted[rb.j].x, pivoted[rb.j].y, pivoted[rb.j].z])
+        axis = target - origin
+        norm = np.linalg.norm(axis)
+        if norm < 1e-6:
+            continue
+        axis /= norm
+        angle = rng.uniform(*angle_range) * (1 if rng.random() < 0.5 else -1)
+        _rodrigues_rotate_atoms(pivoted, side, origin, axis, angle)
+        n_applied += 1
+    return pivoted, n_applied
+
+
+class _PivotBranchRunnable(QRunnable):
+    """Coarse structural-pivot branch: applies _coarse_pivot() to the seed
+    structure, then relaxes the result via the same run_landscape_trajectory
+    MC every other branch uses, over the same per-branch step budget.
+
+    Same output contract as _LandscapeBranchRunnable -- (snapshots, energies,
+    error) into results[bi] -- so it plugs into the existing pooling/PCA/
+    DBSCAN pipeline with zero downstream changes. See IMPROVEMENTS.md item #2
+    for the design rationale (basin-hopping "kick then relax", built as its
+    own branch rather than a per-step move so the kick is never itself
+    Metropolis-judged).
+    """
+    def __init__(self, bi, seed, topo, n_snapshots, steps_per_snap, T, max_angle,
+                 physics_mod, results, n_pivots=1, rng_seed=None):
+        super().__init__()
+        self.bi = bi
+        self.seed = seed
+        self.topo = topo
+        self.n_snapshots = n_snapshots
+        self.steps_per_snap = steps_per_snap
+        self.T = T
+        self.max_angle = max_angle
+        self.physics_mod = physics_mod
+        self.results = results
+        self.n_pivots = n_pivots
+        self.rng_seed = rng_seed
+
+    def run(self):
+        try:
+            rng = np.random.default_rng(self.rng_seed)
+            pivoted, _n_applied = _coarse_pivot(
+                self.seed, self.topo, self.physics_mod, rng, n_pivots=self.n_pivots)
+            engine = self.physics_mod.PhysicsEngine()
+            snaps, ens = engine.run_landscape_trajectory(
+                pivoted, self.topo, self.n_snapshots, self.steps_per_snap,
+                self.T, self.max_angle)
+            self.results[self.bi] = (snaps, ens, None)
+        except Exception as ex:
+            if self.physics_mod is protein_physics:
+                self.results[self.bi] = (None, None, ex)
+                return
+            try:
+                cpu_engine = protein_physics.PhysicsEngine()
+                pivoted, _n_applied = _coarse_pivot(
+                    self.seed, self.topo, protein_physics, np.random.default_rng(self.rng_seed),
+                    n_pivots=self.n_pivots)
+                snaps, ens = cpu_engine.run_landscape_trajectory(
+                    pivoted, self.topo, self.n_snapshots, self.steps_per_snap,
+                    self.T, self.max_angle)
+                self.results[self.bi] = (snaps, ens, ex)
+            except Exception as ex2:
+                self.results[self.bi] = (None, None, ex2)
+
+
 class _ReplicaExchangeBranchRunnable(QRunnable):
     """Runs one landscape MC branch as a parallel-tempering (replica exchange)
     ensemble instead of a single fixed-temperature chain.
@@ -1832,6 +1957,16 @@ class LandscapeWorker(QThread):
     PT_LADDER_RATIO    = 1.6     # T_k = T0 * ratio**k; ~20-40% neighbor swap accept is the target
     PT_SWAP_INTERVAL   = 5       # snapshots per segment between swap attempts
 
+    # Coarse structural-pivot branch (IMPROVEMENTS.md item #2, "should a large
+    # pivot happen before branches diverge" follow-up to the crankshaft-coupled
+    # and decoy-discrimination negative results): one extra branch, kicked away
+    # from init_atoms via _coarse_pivot() (an unconditional large phi/psi
+    # rotation, not Metropolis-judged) before its own MC relaxation runs. Off
+    # by default pending validation -- same conservative posture as
+    # USE_REPLICA_EXCHANGE.
+    USE_PIVOT_BRANCH = False
+    PIVOT_N_PIVOTS   = 1
+
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
                  extra_seeds=None, backbone_ncac=None):
         super().__init__()
@@ -1866,7 +2001,9 @@ class LandscapeWorker(QThread):
         from sklearn.cluster import DBSCAN
 
         seeds = [self.init_atoms] + self.extra_seeds
-        n_branches = len(seeds)
+        n_seed_branches = len(seeds)
+        use_pivot = self.USE_PIVOT_BRANCH and len(self.topo.concerted_pairs) > 0
+        n_branches = n_seed_branches + (1 if use_pivot else 0)
         n_res = len(self.ca_indices)
         N_per, S = self._adaptive_depth(n_res)  # per-branch target -- see class-level comment above
 
@@ -1935,6 +2072,15 @@ class LandscapeWorker(QThread):
                 pool.start(_LandscapeBranchRunnable(
                     bi, seed, self.topo, N_per, S, self.T, self.max_angle,
                     physics_mod_snapshot, branch_results))
+        if use_pivot:
+            pivot_bi = n_seed_branches
+            self.progress.emit(
+                f"  [LANDSCAPE] Branch {pivot_bi+1}/{n_branches}: "
+                f"coarse structural pivot + {N_per}×{S}-step relax (n_res={n_res})…")
+            pool.start(_PivotBranchRunnable(
+                pivot_bi, self.init_atoms, self.topo, N_per, S, self.T, self.max_angle,
+                physics_mod_snapshot, branch_results, n_pivots=self.PIVOT_N_PIVOTS,
+                rng_seed=n_seed_branches))
         pool.waitForDone()
 
         all_snapshots, all_energies, branch_lengths = [], [], []
