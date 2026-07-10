@@ -1149,6 +1149,52 @@ the one pre-existing parsing bug the same test run exposed:
   large one to keep displacement high while landing in a more recoverable
   starting clash.
 
+  **Tested greedy (near-zero-temperature) MC as a cheap, zero-new-code
+  relaxation alternative — mixed result, worse on the case that matters.**
+  Reused `run_landscape_trajectory` exactly as-is with `T=0.01` (only
+  energy-decreasing moves get accepted) instead of the pivot branch's normal
+  `T=0.6`, over the same shared step budget, starting from the same
+  post-kick structure (`<scratchpad>/greedy_mc_relax_test.py`). On 1LYZ the
+  two ended close (greedy 16,135 vs. normal 15,622 kcal/mol) but greedy was
+  still dropping at the end of the budget while normal MC had already
+  plateaued — inconclusive which wins with more steps. On **1YPI, greedy was
+  clearly worse** (95,233 vs. normal MC's 82,623 kcal/mol) and had already
+  plateaued, while normal T=0.6 MC was still steadily dropping (−1,646
+  kcal/mol over the last 5 snapshots, nowhere near converged). This is the
+  classic greedy-descent failure mode: rejecting every uphill move forfeits
+  the ability to cross a small barrier to reach a better basin, and on the
+  densely-packed 1YPI landscape that cost more than it saved — regular
+  Metropolis's thermal fluctuations found a better path greedy couldn't.
+  **Conclusion: greedy MC is not a good substitute for more normal-MC
+  budget.** The more useful signal is that normal T=0.6 MC had *not*
+  converged at the current shared step budget on 1YPI — direct evidence
+  for the "give the pivot branch a larger relax budget" lever noted above,
+  not a temperature-schedule change. Not yet implemented (budget increase
+  itself untested) — next concrete step if this thread continues.
+
+  **Queued candidate, to look at regardless of how the budget/greedy-MC
+  experiments above turn out: a torsion-angle-space gradient minimizer.**
+  Every relaxation mechanism tried this session (plain MC, PT, the pivot
+  branch's relax phase) is MC-only — there is no gradient of the energy
+  function anywhere in this codebase (confirmed by grep), so relaxing a
+  large kick means waiting for enough random accepted moves to happen in
+  the right order, rather than walking directly downhill. A minimizer
+  (steepest descent / conjugate gradient / L-BFGS) in torsion-angle space
+  would fit this engine's existing move representation (every move here
+  already works by rotating a bond and propagating the downstream side —
+  same as `rodrigues()`/`rot_bond_sides`), but needs analytic dE/dθ per
+  rotatable bond, chain-ruled through the nonbonded (LJ + electrostatics +
+  GB) and dihedral energy terms — real, nontrivial derivative math to
+  derive and verify per term, not a small addition. A Cartesian-space
+  minimizer would be more standard for MD-style tools but conflicts with
+  this engine's design, which deliberately keeps bond lengths/angles rigid
+  by construction (see item #3 below) — unconstrained per-atom movement
+  would need bond/angle constraints bolted on. Explicitly not contingent on
+  the pivot-branch budget/greedy-MC experiments succeeding or failing —
+  worth evaluating on its own terms as the deeper fix if MC-only relaxation
+  turns out to have a hard ceiling regardless of budget or acceptance
+  temperature.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
