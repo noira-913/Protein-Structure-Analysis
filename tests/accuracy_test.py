@@ -26,6 +26,48 @@ This script does, across several real, structurally diverse proteins. For each o
      field's minimum does not correspond to the real structure.
   4. Reports whether ALMA's sampling stays within, or blows past, the AlphaFold-vs-
      crystal baseline from step 2, for every protein tested.
+  5. (--decoy-discrimination flag) Generates a "decoy" via a long, hot MC run
+     (default T=2.5, 20000 steps) AND a same-budget "relaxed native" reference
+     (same 20000 steps, native T=0.6) from the same starting structure, then
+     compares their energies. The relaxed-native run exists specifically to
+     absorb local steric strain the raw deposited crystal coordinates carry
+     (crystallographic model uncertainty, no explicit H, alternate conformers) --
+     comparing a decoy that got a long relaxation budget against the raw crystal
+     energy (which only gets step 3's few hundred near-native steps) would
+     confound "more steps relaxed local clashes" with "the decoy is a genuinely
+     better fold," which isn't the question this test asks. Both runs' Calpha
+     RMSD back to the crystal structure is also reported: relaxed-native should
+     stay low (confirming it's still recognizably the native structure, not a
+     drifted alternative) while the decoy should be substantially higher if
+     T=2.5 actually explored away from the native basin. This checks a
+     different, complementary property from step 3: not "does sampling stay
+     near native when started there," but "does the energy function rank the
+     true structure below a substantially different alternative conformation of
+     the same chain, by a wide margin" -- the basic requirement for the energy
+     function to be useful as a scoring/ranking function, not just a stable
+     local sampler. Weaker than a real independent decoy set (e.g. Rosetta/CASP
+     decoys built by different means), but self-contained and a real check --
+     *when it can produce a genuine decoy at all*.
+
+     KNOWN LIMITATION, confirmed empirically (2026-07-10): generate_ensemble's
+     move set cannot currently produce a structurally divergent decoy no matter
+     how high --decoy-temp goes. Per-move rotation is hard-capped at
+     ANGLE_MAX=0.50 rad (physics_engine.cpp) regardless of temperature, and the
+     move mix is dominated by sidechain torsions (which don't move Calpha at
+     all) plus crankshaft pairs (deliberately designed to preserve downstream
+     backbone geometry via a compensating rotation, not reorganize the fold).
+     Tested up to T=8.0 (~13x native T=0.6) for 20000 steps on 1UBQ: Calpha
+     RMSD from native reached only 0.968 A, statistically indistinguishable
+     from the T=0.6 relaxed-native reference's own 0.683-0.919 A drift. This is
+     a real structural limit of the available move types, not a parameter that
+     needs more tuning -- so a negative "margin" from this test is NOT currently
+     meaningful evidence the force field fails to rank native correctly; it's
+     evidence the "decoy" never left the native basin. Left in as real,
+     reusable infrastructure (the same-budget relaxed-native design, and the
+     RMSD sanity check, are both still correct) for whenever a real
+     divergent-decoy generator (e.g. large rigid-body backbone perturbations,
+     fragment threading, or an uncapped/large-angle move mode) exists to plug
+     into it -- do not trust its verdict output until then.
 
 RESIDUE NUMBERING: AlphaFold predicts the full UniProt sequence (often including a
 cleaved signal peptide / propeptide the deposited mature-chain crystal structure
@@ -243,7 +285,52 @@ def ca_map_from_atoms(atoms, ca_indices, ca_map_keys):
             for idx, key in ca_map_keys}
 
 
-def run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod, gui_main, mc_steps, tmpdir):
+def decoy_discrimination(atoms, topo, engine, ca_indices, ca_map, ca_map_keys, n_atoms,
+                          decoy_temp=2.5, relax_steps=20000):
+    """Compare a hot-MC decoy against a SAME-BUDGET relaxed-native reference, not
+    the raw crystal energy. Raw deposited coordinates routinely carry local
+    steric strain (crystallographic model uncertainty, no explicit H, alternate
+    conformers) that thousands of MC steps relax away regardless of temperature
+    -- comparing a decoy that got that relaxation budget against a native energy
+    that didn't would confound "MC found a better nearby minimum than a few
+    hundred near-native steps reached" with "the decoy is a genuinely better,
+    different fold," which is the actual question here. Both runs get the same
+    step budget; only temperature differs. The relaxed-native run's own Calpha
+    RMSD is reported too, as a check that it actually stayed near-native (a
+    precondition for this being a meaningful reference at all -- if it drifted
+    as far as the decoy, this test isn't measuring what it claims to)."""
+    t0 = time.perf_counter()
+    relaxed_ens = engine.generate_ensemble(atoms, topo, 1, relax_steps, 0.6, 0.12)
+    dt_relax = time.perf_counter() - t0
+    relaxed = relaxed_ens[0]
+    e_relaxed = engine.calculate_potential(relaxed, topo)
+    e_relaxed_per_atom = e_relaxed / n_atoms
+    relaxed_ca_map = ca_map_from_atoms(relaxed, ca_indices, ca_map_keys)
+    relaxed_rmsd = compute_rmsd_generic(ca_map, relaxed_ca_map)
+
+    t0 = time.perf_counter()
+    decoy_ens = engine.generate_ensemble(atoms, topo, 1, relax_steps, decoy_temp, 0.12)
+    dt_decoy = time.perf_counter() - t0
+    decoy = decoy_ens[0]
+    e_decoy = engine.calculate_potential(decoy, topo)
+    e_decoy_per_atom = e_decoy / n_atoms
+    decoy_ca_map = ca_map_from_atoms(decoy, ca_indices, ca_map_keys)
+    decoy_rmsd = compute_rmsd_generic(ca_map, decoy_ca_map)
+
+    margin = e_decoy_per_atom - e_relaxed_per_atom
+    print(f"    relaxed-native (T=0.6, {relax_steps} steps, {dt_relax:.1f}s): "
+          f"E = {e_relaxed:.1f} kcal/mol ({e_relaxed_per_atom:.2f} kcal/mol/atom), "
+          f"Calpha RMSD to crystal = {relaxed_rmsd:.3f} Å")
+    print(f"    decoy (T={decoy_temp}, {relax_steps} steps, {dt_decoy:.1f}s): "
+          f"E = {e_decoy:.1f} kcal/mol ({e_decoy_per_atom:.2f} kcal/mol/atom), "
+          f"Calpha RMSD to crystal = {decoy_rmsd:.3f} Å, "
+          f"margin over relaxed-native = {margin:+.2f} kcal/mol/atom")
+    return {"e_relaxed_per_atom": e_relaxed_per_atom, "relaxed_rmsd": relaxed_rmsd,
+            "e_decoy_per_atom": e_decoy_per_atom, "decoy_rmsd": decoy_rmsd, "margin": margin}
+
+
+def run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod, gui_main, mc_steps, tmpdir,
+            run_decoy=False, decoy_temp=2.5, decoy_steps=20000):
     print(f"\n{'='*70}\n{label}  (UniProt {uniprot_id}, PDB {pdb_id})\n{'='*70}")
 
     crystal_path = os.path.join(tmpdir, f"{pdb_id}.pdb")
@@ -304,11 +391,16 @@ def run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod, gui_main, mc_steps, tmp
                   f"Calpha RMSD to native = {rmsd_to_native:.3f} Å")
 
     worst_rmsd = max(r[5] for r in row_results)
-    return {
+    result = {
         "label": label, "pdb_id": pdb_id, "n_atoms": n_atoms,
         "baseline_ca_rmsd": baseline_ca_rmsd, "worst_mc_rmsd": worst_rmsd,
         "n_disulfides": topo.num_disulfide_pairs,
     }
+    if run_decoy:
+        result["decoy"] = decoy_discrimination(atoms, topo, engines[0][1],
+                                                 ca_indices, ca_map, ca_map_keys, n_atoms,
+                                                 decoy_temp=decoy_temp, relax_steps=decoy_steps)
+    return result
 
 
 def main():
@@ -318,6 +410,14 @@ def main():
                      help="MC step counts to test per protein (default: 200 1000 5000)")
     ap.add_argument("--proteins", nargs="*", default=None,
                      help="Subset of protein labels to run (default: all)")
+    ap.add_argument("--decoy-discrimination", action="store_true",
+                     help="Also generate a hot-MC decoy per protein and check native "
+                          "scores lower (CPU engine only, adds one long MC run/protein)")
+    ap.add_argument("--decoy-temp", type=float, default=2.5,
+                     help="MC temperature for decoy generation (default: 2.5)")
+    ap.add_argument("--decoy-steps", type=int, default=20000,
+                     help="MC step budget for both the decoy and the same-budget "
+                          "relaxed-native reference (default: 20000)")
     args = ap.parse_args()
 
     try:
@@ -347,7 +447,9 @@ def main():
     for label, uniprot_id, pdb_id in proteins:
         try:
             summaries.append(run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod,
-                                      gui_main, args.mc_steps, tmpdir))
+                                      gui_main, args.mc_steps, tmpdir,
+                                      run_decoy=args.decoy_discrimination,
+                                      decoy_temp=args.decoy_temp, decoy_steps=args.decoy_steps))
         except Exception as ex:
             print(f"  FAILED: {ex}")
             summaries.append({"label": label, "pdb_id": pdb_id, "n_atoms": 0,
@@ -375,6 +477,27 @@ def main():
               f"{af_str:>9s} {mc_str:>14s}  {verdict}")
     print(f"\n{n_ok}/{len(summaries)} proteins had ALMA sampling stay within "
           f"~2x the AlphaFold-level accuracy bar.")
+
+    if args.decoy_discrimination:
+        print(f"\n{'='*70}\nDecoy discrimination (native vs. hot-MC decoy)\n{'='*70}")
+        print("CAVEAT (confirmed 2026-07-10, see module docstring point 5): "
+              "generate_ensemble cannot currently produce a structurally divergent "
+              "decoy at any --decoy-temp (ANGLE_MAX cap + sidechain-dominated move "
+              "mix) -- verdicts below are NOT meaningful until a real divergent-"
+              "decoy generator exists. Reported for the record, not as a pass/fail.")
+        n_discriminated = 0
+        n_with_decoy = 0
+        for s in summaries:
+            decoy = s.get("decoy")
+            if decoy is None:
+                continue
+            n_with_decoy += 1
+            ok = decoy["margin"] > 0
+            n_discriminated += int(ok)
+            print(f"{s['label']:30s} margin = {decoy['margin']:+7.2f} kcal/mol/atom  "
+                  f"{'OK -- native scores lower' if ok else 'FLAG -- decoy scores lower than native'}")
+        print(f"\n{n_discriminated}/{n_with_decoy} proteins: native scored lower "
+              f"(better) than its own hot-MC decoy.")
 
 
 if __name__ == "__main__":

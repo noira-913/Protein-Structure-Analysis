@@ -37,6 +37,52 @@ wrong* for the cases tested. Concretely still open:
     real parsing bug, not a red flag on the physics itself, but there's no reason
     to assume that streak continues without more testing.
 
+  **Attempted: decoy-discrimination metric — infrastructure built, but surfaced
+  a real limitation in the move set rather than closing the question.** Added
+  `--decoy-discrimination` to `tests/accuracy_test.py`: generates a hot-MC
+  "decoy" (`generate_ensemble` at elevated T) and a same-computational-budget
+  "relaxed-native" reference (same step count, native T=0.6) from the same
+  starting structure, then compares `calculate_potential()` scores. The
+  same-budget design matters — comparing a decoy that got a long relaxation
+  budget against the raw, un-relaxed crystal energy (only a few hundred
+  near-native steps in the existing test) would conflate "more steps relaxed
+  local crystal-packing strain" with "the decoy is a genuinely better fold"; an
+  early version of this test made exactly that mistake (1LYZ's raw crystal
+  energy is 187,484.6 kcal/mol — 20,000 relaxation steps alone drop that to
+  ~10,000 kcal/mol regardless of temperature) before being corrected to the
+  same-budget comparison.
+
+  **Real finding: `generate_ensemble` cannot currently produce a structurally
+  divergent decoy at any temperature.** Tested T=2.5 (1LYZ, 1UBQ) and T=8.0
+  (~13x native T=0.6, 1UBQ) at 20,000 steps each. Every decoy's Calpha RMSD
+  from native landed in the same 0.4–1.0 Å range as the same-budget T=0.6
+  relaxed-native reference's own RMSD — statistically indistinguishable, not a
+  divergent alternative conformation. Root cause, confirmed by reading the
+  code (not assumed): per-move rotation is hard-capped at `ANGLE_MAX = 0.50`
+  rad in every MC loop in `physics_engine.cpp`, so raising the nominal
+  temperature only saturates move-acceptance faster, it never permits a larger
+  single move; and the move mix (uniform over all rotatable bonds, plus 25%
+  crankshaft) is dominated by sidechain torsions, which don't move Cα at all,
+  with crankshaft pairs specifically designed (see Part 4/6 history above) to
+  preserve downstream backbone geometry via a compensating rotation rather
+  than reorganize the fold. There is currently no move type in this codebase
+  capable of a large, sustained backbone reorganization.
+
+  **Consequence: the metric's "margin" numbers are not currently meaningful
+  evidence about the energy function's ranking ability** — a negative margin
+  (decoy scores lower than native) reflects two near-identical near-native
+  ensembles differing by noise, not the force field failing to discriminate a
+  real decoy. **Decision: kept as infrastructure, not removed** (the
+  same-budget relaxed-native design and RMSD sanity check are both real,
+  reusable engineering, unlike Part 2's crankshaft-coupled move, which was
+  production physics code that actively made a target metric worse) — a
+  runtime caveat prints whenever `--decoy-discrimination` is used, and the
+  module docstring records the finding, so this isn't silently mistaken for a
+  working, validated check. **Follow-up needed before this closes**: a real
+  divergent-decoy generator — e.g. a dedicated large-angle/uncapped move mode,
+  rigid-body backbone-segment perturbation, or fragment-threading — none of
+  which existed in the move-set inventory checked this session.
+
 **2. IDP/disorder landscape classification — real-IDP calibration in progress, multiple real bugs found and fixed, not yet closed**
 The population-weighted, multi-branch IDP classifier (see "Completed Work" →
 Analysis for the original design) was calibrated only against stable, ordered
