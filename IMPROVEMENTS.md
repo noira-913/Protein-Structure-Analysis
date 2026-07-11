@@ -1625,6 +1625,54 @@ expected to improve this further but wasn't attempted this round — these
 functions are already negligible next to MC sampling time even at the
 current single-threaded speed, so it wasn't a blocking follow-up.
 
+**Follow-up: wider size sweep found the speedup wasn't uniform — a real
+O(n_ca³) algorithmic bug, not just an un-accelerated piece.** Benchmarking
+across a broader range (76 up to a synthetic 1500 residues, sized well
+past anything in the current ground-truth set) showed `_compute_contact_map`'s
+speedup climbing cleanly with size (6.6x → 36.3x), but
+`_compute_internal_scaling`'s speedup *peaking* around 1YPI's scale
+(~10.8x) and then **shrinking** at larger sizes (3.2x at 1500 residues) —
+worth explaining, not shrugging off. Root cause, isolated directly: only
+the O(n_ca²) mean-distance-matrix build had moved to C++; the function's
+own post-processing (binning that matrix by sequence separation) was still
+a Python loop doing a full O(n_ca²) boolean-mask comparison *per
+separation value* — O(n_ca³) total, never touched by the C++ work above.
+At n_ca=1500 that loop alone cost 2.18s, ~9x longer than the 0.24s
+C++-accelerated matrix build it was diluting.
+
+**The real fix wasn't more C++ — it was recognizing the O(n_ca³) was
+unnecessary in the first place.** `mean_dist_matrix[abs(i-j)==sep]` (the
+old code) does a full matrix comparison to find the values at one
+diagonal offset; `np.diagonal(mean_dist_matrix, offset=sep)` reads the
+exact same values directly, since the matrix is symmetric and both
+diagonals at a given offset contain identical values pairwise — averaging
+either one gives a mathematically identical mean (verified: max
+difference ~5×10⁻¹⁷ against the old algorithm on a synthetic symmetric
+matrix, pure floating-point noise), but costs O(n_ca-sep) with no
+comparison pass at all, O(n_ca²) total over the whole loop instead of
+O(n_ca³). Pure Python/numpy change, no new C++ needed for this piece.
+
+**Result: the divergence is gone.** Re-benchmarked the same size sweep
+with the fix in place — `_compute_internal_scaling` now:
+
+| n_ca | before (all-Python) | after (C++ matrix + fixed binning) | speedup |
+|---|---|---|---|
+| 76 | 0.006s | 0.0016s | 3.8x |
+| 129 | 0.020s | 0.0042s | 4.8x |
+| 140 | 0.020s | 0.0037s | 5.4x |
+| 494 (1YPI) | 0.633s | 0.0315s | **20.1x** |
+| 750 | 1.514s | 0.0578s | 26.2x |
+| 1000 | 2.829s | 0.1065s | 26.6x |
+| 1500 | 8.031s | 0.3105s | **25.9x** |
+
+Now climbs cleanly into the same 20-37x range as `_compute_contact_map`
+at large sizes, instead of declining. At n_ca=1500 the fixed binning step
+now costs ~0.06s (smaller than the 0.24s C++ matrix build itself), so it's
+no longer the bottleneck — no further C++ work is warranted for this
+piece. Re-verified end-to-end through the real GUI pipeline on 1UBQ
+(identical `Rg 11.6±0.0 Å · ν=0.17` as before) and `tests/bridge_test.py`
+clean.
+
 ---
 
 ## Completed Work

@@ -1070,14 +1070,25 @@ def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
             mean_dist_matrix += np.sqrt((diff ** 2).sum(-1))
         mean_dist_matrix /= n_snaps
 
-    seps_all = np.abs(np.subtract.outer(np.arange(n_ca), np.arange(n_ca)))
-    max_sep = n_ca - 1
+    # Bin by separation via np.diagonal rather than a full-matrix boolean
+    # mask per separation. mean_dist_matrix is symmetric, so the old
+    # `mean_dist_matrix[seps_all == sep]` approach summed BOTH the upper
+    # and lower diagonal at each offset -- two copies of the same (i,i+sep)
+    # values, which doesn't change the mean but costs an O(n_ca^2) mask
+    # comparison per separation (O(n_ca^3) total over the whole loop).
+    # np.diagonal(matrix, offset=sep) reads the same numbers directly in
+    # O(n_ca-sep) with no comparison pass at all -- O(n_ca^2) total,
+    # mathematically identical output (verified: max diff ~5e-17 on a
+    # synthetic symmetric matrix, floating-point noise). This was the
+    # actual bottleneck at large n_ca once the matrix build itself moved
+    # to C++ (IMPROVEMENTS.md item #7): at n_ca=1500 the old binning loop
+    # alone took 2.18s, ~9x longer than the C++-accelerated matrix build.
     seps, mean_dists = [], []
-    for sep in range(min_sep, max_sep + 1):
-        vals = mean_dist_matrix[seps_all == sep]
-        if len(vals) > 0:
+    for sep in range(min_sep, n_ca):
+        diag = np.diagonal(mean_dist_matrix, offset=sep)
+        if diag.size > 0:
             seps.append(sep)
-            mean_dists.append(vals.mean())
+            mean_dists.append(diag.mean())
     seps = np.array(seps, dtype=float)
     mean_dists = np.array(mean_dists, dtype=float)
 
