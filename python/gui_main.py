@@ -683,7 +683,7 @@ def _ensemble_ca_map(ref_ca_map, ca_indices, particles):
                 ca_map[key] = np.array([p.x, p.y, p.z])
     return ca_map
 
-def _kabsch_align_points(ref_pts, mobile_pts):
+def _kabsch_align_points(ref_pts, mobile_pts, fit_mask=None):
     """ref_pts, mobile_pts: (n,3) arrays of the same points in
     correspondence (same order, no keys needed). Returns mobile_pts
     optimally Kabsch-rotated/translated onto ref_pts' frame.
@@ -697,9 +697,25 @@ def _kabsch_align_points(ref_pts, mobile_pts):
     coordinates without this conflates "real conformational difference"
     with "same shape, different orientation" -- exactly the bug already
     fixed once for the external layered 3D view (see _render_external_layered).
+
+    fit_mask: optional boolean array (same length as ref_pts/mobile_pts)
+    selecting which points determine the fitted rotation -- e.g. an
+    IUPred-predicted rigid "core" subset. The rotation is still APPLIED to
+    every point in mobile_pts; only the least-squares fit itself is
+    restricted. Needed whenever part of the point set is genuinely mobile
+    (a disordered region): fitting on the full set lets that motion
+    contaminate the rotation itself ("the alignment chases the tail"),
+    which can both inflate apparent RMSF in the truly rigid part and mask
+    the disordered region's own real motion. Falls back to using every
+    point if fit_mask is None or selects fewer than 3 points (Kabsch needs
+    >=3 non-degenerate points to define a rotation).
     """
-    ref_c, mob_c = ref_pts.mean(0), mobile_pts.mean(0)
-    p0, q0 = ref_pts - ref_c, mobile_pts - mob_c
+    if fit_mask is not None and np.count_nonzero(fit_mask) >= 3:
+        fit_ref, fit_mob = ref_pts[fit_mask], mobile_pts[fit_mask]
+    else:
+        fit_ref, fit_mob = ref_pts, mobile_pts
+    ref_c, mob_c = fit_ref.mean(0), fit_mob.mean(0)
+    p0, q0 = fit_ref - ref_c, fit_mob - mob_c
     H = q0.T @ p0
     U, _, Vt = np.linalg.svd(H)
     d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
@@ -848,7 +864,7 @@ def _aligned_pdb_text(path, ref_ca_map):
     writer.save(buf, select=_NotNucleicAcidOrWater())
     return buf.getvalue()
 
-def _compute_rmsf(snapshots, ca_indices):
+def _compute_rmsf(snapshots, ca_indices, iupred_scores=None, core_threshold=0.5):
     """Per-Cα root-mean-square fluctuation (Å) across all trajectory snapshots.
     궤적 스냅샷 전체에 걸친 잔기별 Cα RMSF (Å).
 
@@ -856,6 +872,12 @@ def _compute_rmsf(snapshots, ca_indices):
                   LandscapeWorker의 MC 스냅샷 목록 (각 원소 = 입자 목록)
     ca_indices  — index of each Cα atom inside each particle list
                   각 Cα 원자의 입자 목록 내 인덱스
+    iupred_scores — optional, per-residue IUPred disorder score (same order/
+                  length as ca_indices). When given, the Kabsch alignment fit
+                  is restricted to the IUPred-predicted-ordered "core"
+                  (score < core_threshold) -- see _kabsch_align_points'
+                  fit_mask docstring for why. None (default) aligns on every
+                  Cα, matching the original behavior.
 
     Returns a 1-D array of length len(ca_indices).  High RMSF values indicate
     flexible or disordered regions.
@@ -899,15 +921,214 @@ def _compute_rmsf(snapshots, ca_indices):
     # "highly flexible" even when the actual fold barely changes. Same
     # principle as the layered-view/basin-comparison Kabsch fixes
     # elsewhere in this file.
+    #
+    # Fitting the rotation itself on ALL Cα atoms has a second, separate
+    # problem when a real disordered region is present: the least-squares
+    # fit gets dragged around by that region's motion ("the alignment
+    # chases the tail"), contaminating the reference frame used to measure
+    # every residue's fluctuation -- including the genuinely rigid core.
+    # Restrict the fit to IUPred-predicted-ordered residues when available
+    # (a signal available pre-MC, purely sequence-derived, so it can't be
+    # circularly biased by the RMSF it's used to compute), then apply that
+    # fitted rotation to all Cα atoms via _kabsch_align_points' fit_mask.
+    fit_mask = None
+    if iupred_scores is not None and len(iupred_scores) == n_ca:
+        fit_mask = np.asarray(iupred_scores) < core_threshold
     ref = coords[0]
     aligned = np.empty_like(coords)
     aligned[0] = ref
     for si in range(1, n_snaps):
-        aligned[si] = _kabsch_align_points(ref, coords[si])
+        aligned[si] = _kabsch_align_points(ref, coords[si], fit_mask=fit_mask)
 
     mean_pos = aligned.mean(axis=0)                          # [n_ca, 3]
     diff     = aligned - mean_pos[np.newaxis]                # [n_snaps, n_ca, 3]
     return np.sqrt((diff ** 2).sum(axis=2).mean(axis=0))   # [n_ca]
+
+
+def _compute_radius_of_gyration(snapshots, ca_indices):
+    """Per-snapshot Cα radius of gyration (Å):
+    Rg_t = sqrt( mean_i |r_i(t) - r_mean(t)|^2 ).
+
+    Unweighted Cα-based, matching this codebase's other residue-level
+    ensemble metrics (RMSF). Rotation/translation-invariant by
+    construction -- unlike RMSF, no Kabsch alignment is needed (Rg only
+    depends on each snapshot's own internal shape, not its absolute pose).
+
+    A compact, ordered fold should show a tight Rg distribution; a real
+    IDP's more open, fluctuating ensemble should show a wider one -- see
+    _compute_internal_scaling for the more discriminating polymer-scaling
+    companion metric.
+
+    Returns a 1-D array of length len(snapshots).
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca == 0:
+        return np.array([])
+    rg = np.empty(n_snaps)
+    for si, particles in enumerate(snapshots):
+        coords = np.array([[particles[pidx].x, particles[pidx].y, particles[pidx].z]
+                            for pidx in ca_indices if pidx < len(particles)])
+        if len(coords) == 0:
+            rg[si] = np.nan
+            continue
+        centroid = coords.mean(0)
+        rg[si] = np.sqrt(((coords - centroid) ** 2).sum(1).mean())
+    return rg
+
+
+def _compute_end_to_end(snapshots, ca_indices):
+    """Per-snapshot N-to-C terminal Cα-Cα distance (Å) -- the other classic
+    polymer-physics ensemble descriptor alongside Rg. Rotation/translation-
+    invariant, no alignment needed.
+
+    Returns a 1-D array of length len(snapshots).
+    """
+    n_snaps = len(snapshots)
+    if n_snaps == 0 or len(ca_indices) < 2:
+        return np.array([])
+    i0, i1 = ca_indices[0], ca_indices[-1]
+    dist = np.empty(n_snaps)
+    for si, particles in enumerate(snapshots):
+        if i0 < len(particles) and i1 < len(particles):
+            p0, p1 = particles[i0], particles[i1]
+            dist[si] = np.sqrt((p0.x - p1.x) ** 2 + (p0.y - p1.y) ** 2 + (p0.z - p1.z) ** 2)
+        else:
+            dist[si] = np.nan
+    return dist
+
+
+def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
+    """Ensemble-averaged internal distance scaling law: <R_ij> ~ |i-j|^nu,
+    the standard polymer-physics descriptor for distinguishing compact
+    globules (nu ~ 0.33), ideal/random-coil chains (nu ~ 0.5), and
+    expanded/self-avoiding disordered chains (nu ~ 0.6) -- computed from a
+    SINGLE protein's own conformational ensemble via its internal residue-
+    pair separations (Marsh & Forman-Kay 2010, Biophys J), unlike an
+    Rg-vs-chain-length scaling fit, which would need many different-length
+    proteins' ensembles to fit at all.
+
+    Computes the ensemble-mean Cα-Cα distance for every residue pair
+    (looping per-snapshot to bound memory to O(n_ca^2) rather than
+    O(n_snaps * n_ca^2) -- this codebase's larger cases, e.g. 1YPI at
+    n_ca~500, would otherwise need a multi-GB broadcast array), bins by
+    sequence separation |i-j|, then fits log<R_ij> = log(R0) + nu*log(|i-j|)
+    via ordinary least squares over separations >= min_sep (excludes the
+    shortest separations, where local bond/dihedral geometry rather than
+    long-range chain statistics dominates the mean distance).
+
+    Returns (seps, mean_dists, nu, log_r0, r_squared) -- seps/mean_dists are
+    1-D arrays (one entry per distinct |i-j| present), nu/log_r0 are the
+    fitted scaling exponent/prefactor, r_squared is the fit's goodness of
+    fit on the log-log data. Returns (array([]), array([]), None, None,
+    None) if there aren't enough residues or snapshots to fit.
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca < min_sep + 2:
+        return np.array([]), np.array([]), None, None, None
+
+    mean_dist_matrix = np.zeros((n_ca, n_ca), dtype=float)
+    for particles in snapshots:
+        coords = np.zeros((n_ca, 3), dtype=float)
+        for ci, pidx in enumerate(ca_indices):
+            if pidx < len(particles):
+                p = particles[pidx]
+                coords[ci] = [p.x, p.y, p.z]
+        diff = coords[:, None, :] - coords[None, :, :]         # [n_ca, n_ca, 3]
+        mean_dist_matrix += np.sqrt((diff ** 2).sum(-1))
+    mean_dist_matrix /= n_snaps
+
+    seps_all = np.abs(np.subtract.outer(np.arange(n_ca), np.arange(n_ca)))
+    max_sep = n_ca - 1
+    seps, mean_dists = [], []
+    for sep in range(min_sep, max_sep + 1):
+        vals = mean_dist_matrix[seps_all == sep]
+        if len(vals) > 0:
+            seps.append(sep)
+            mean_dists.append(vals.mean())
+    seps = np.array(seps, dtype=float)
+    mean_dists = np.array(mean_dists, dtype=float)
+
+    if len(seps) < 3:
+        return seps, mean_dists, None, None, None
+
+    log_sep, log_dist = np.log(seps), np.log(mean_dists)
+    A = np.vstack([log_sep, np.ones_like(log_sep)]).T
+    (nu, log_r0), _residuals, *_rest = np.linalg.lstsq(A, log_dist, rcond=None)
+    pred = A @ np.array([nu, log_r0])
+    ss_res = float(np.sum((log_dist - pred) ** 2))
+    ss_tot = float(np.sum((log_dist - log_dist.mean()) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else None
+
+    return seps, mean_dists, float(nu), float(log_r0), r_squared
+
+
+def _compute_contact_map(snapshots, ca_indices, cutoff=8.0):
+    """Per-residue-pair contact frequency across the ensemble (Cα-Cα
+    distance < cutoff Å), plus a per-residue "contact variance" summary --
+    a structural-promiscuity metric complementary to RMSF.
+
+    RMSF measures how far a residue's POSITION strays from its mean in a
+    fixed (Kabsch-aligned) reference frame, which becomes shakier the more
+    genuinely disordered a region is -- a residue sampling many unrelated
+    environments doesn't have a well-defined "mean position" even after the
+    core-restricted alignment fix above. Contact frequency instead asks
+    "which residues is this one near," which stays meaningful without any
+    global alignment at all (only relative Cα-Cα distances, computed per
+    snapshot, are used) -- a residue that contacts a shifting, inconsistent
+    set of partners across the ensemble is a real disorder signal even when
+    RMSF's alignment-dependent answer for it is noisy.
+
+    Loops per-snapshot (same O(n_ca^2)-at-a-time pattern as
+    _compute_internal_scaling) to avoid an O(n_snaps * n_ca^2) broadcast
+    array.
+
+    Returns (contact_freq, per_residue_variance):
+    - contact_freq: [n_ca, n_ca] array, fraction of snapshots each residue
+      pair is in contact.
+    - per_residue_variance: [n_ca] array. For each residue i, treats each
+      partner j's contact_freq[i,j] as a Bernoulli probability and averages
+      p_ij*(1-p_ij) over partners -- high when a residue's contacts are
+      inconsistent across the ensemble (near 0.25 per partner at p=0.5),
+      low when contacts are reliably present or reliably absent (p near 0
+      or 1). Excludes the diagonal and immediate sequence neighbors
+      (i±1, i±2), which are always in contact by covalent-bond construction
+      and would otherwise dilute every residue's score toward "consistent"
+      regardless of real disorder.
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca == 0:
+        return np.zeros((0, 0)), np.array([])
+
+    contact_freq = np.zeros((n_ca, n_ca), dtype=float)
+    for particles in snapshots:
+        coords = np.zeros((n_ca, 3), dtype=float)
+        for ci, pidx in enumerate(ca_indices):
+            if pidx < len(particles):
+                p = particles[pidx]
+                coords[ci] = [p.x, p.y, p.z]
+        diff = coords[:, None, :] - coords[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(-1))
+        contact_freq += (dist < cutoff)
+    contact_freq /= n_snaps
+    np.fill_diagonal(contact_freq, 0.0)
+
+    bernoulli_var = contact_freq * (1.0 - contact_freq)
+    mask = np.ones((n_ca, n_ca), dtype=bool)
+    np.fill_diagonal(mask, False)
+    for offset in (1, 2):
+        if offset < n_ca:
+            idx = np.arange(n_ca - offset)
+            mask[idx, idx + offset] = False
+            mask[idx + offset, idx] = False
+    per_residue_variance = np.array([
+        bernoulli_var[i][mask[i]].mean() if mask[i].any() else 0.0
+        for i in range(n_ca)
+    ])
+    return contact_freq, per_residue_variance
+
 
 def _extract_ca_residues(pdb_path):
     """Return [(chain_id, res_seq, res_name3)] for Cα residues in parse order."""
@@ -3712,7 +3933,8 @@ class ProteinApp(QMainWindow):
 
         # Compute RMSF from trajectory and draw disorder profile
         if self._ca_indices and self._pdb_path:
-            rmsf     = _compute_rmsf(data["snapshots"], self._ca_indices)
+            rmsf     = _compute_rmsf(data["snapshots"], self._ca_indices,
+                                      iupred_scores=self._iupred_scores)
             residues = _extract_ca_residues(self._pdb_path)
             self._rmsf          = rmsf
             self._rmsf_residues = residues

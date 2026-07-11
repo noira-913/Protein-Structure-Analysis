@@ -1368,6 +1368,107 @@ whose crystal numbering doesn't correspond linearly to full-length UniProt numbe
 at any single offset — hit once, for chymotrypsin inhibitor 2 (2CI2). This is a
 limitation of that test harness's alignment heuristic, not the physics engine.)*
 
+**7. IDP ensemble characterization — in progress, not yet wired into the GUI
+or validated (branch `idp-handling`)**
+Item #2's classifier only ever produces a binary ORDERED/POSSIBLY-DISORDERED/
+IDP label plus a funnel score — once something is flagged disordered, there's
+no further description of *what the ensemble actually looks like*. This item
+is the first of three originally-scoped directions (ensemble characterization,
+disorder-aware sampling, GUI/visualization) for actually giving the user a
+real IDP result rather than just a label; the other two are not started.
+
+Inventory taken before writing any code (avoid duplicating existing
+infrastructure): confirmed no radius of gyration, end-to-end distance, or
+contact-map computation exists anywhere in this codebase (C++ or Python);
+confirmed `sasa_nonpolar()` (`physics_engine.cpp`) is a private scalar-total
+helper baked into the energy function, not exposed to Python or usable as a
+general per-atom SASA routine; confirmed the one existing per-bond MC
+step-size hook (`BondTopology.rot_bond_scale`) is driven by a structural
+lever-arm heuristic, `def_readonly`, and never touched by IUPred/RMSF
+anywhere — i.e. there is currently zero feedback from the sequence-based
+disorder predictor into MC sampling.
+
+**Built so far (`python/gui_main.py`), all operating on `LandscapeWorker`'s
+existing pooled `snapshots` — no new C++ needed for any of it:**
+  - `_compute_radius_of_gyration()`, `_compute_end_to_end()` — per-snapshot,
+    Cα-based, rotation/translation-invariant (no alignment needed, unlike
+    RMSF).
+  - `_compute_internal_scaling()` — the polymer-physics internal-distance
+    scaling law `<R_ij> ~ |i-j|^ν` (Marsh & Forman-Kay 2010, Biophys J),
+    fit via ensemble-mean Cα-Cα distance binned by sequence separation, then
+    log-log least squares. Unlike an Rg-vs-chain-length fit, this works from
+    a *single* protein's own ensemble (no need to compare across differently-
+    sized proteins) — ν≈0.33 indicates a compact globule, ν≈0.5 an ideal/
+    random-coil chain, ν≈0.6 an expanded/self-avoiding disordered chain.
+    Loops per-snapshot to bound memory to O(n_ca²) rather than
+    O(n_snaps·n_ca²) — the naive broadcast form would need a multi-GB array
+    at 1YPI's scale (494 residues).
+  - `_compute_contact_map()` — per-residue-pair contact frequency across the
+    ensemble (Cα-Cα distance < 8 Å) plus a per-residue "contact variance"
+    summary (mean Bernoulli variance `p(1-p)` over non-adjacent partners).
+    Deliberately complementary to RMSF, not a duplicate: RMSF needs a
+    Kabsch-aligned reference frame, which becomes shaky for a residue deep
+    in a genuinely disordered region (no single "mean position" is
+    meaningful); contact frequency needs no global alignment at all, only
+    per-snapshot relative distances, so it stays meaningful exactly where
+    RMSF's assumption is weakest.
+  - **Real bug fixed along the way, not just new metrics**: `_compute_rmsf`'s
+    Kabsch fit was computed from *all* Cα atoms, including any genuinely
+    disordered ones. When a large flexible region is present, the
+    least-squares fit itself gets dragged around by that region's motion
+    ("the alignment chases the tail"), contaminating the reference frame
+    used to measure fluctuation everywhere — including the truly rigid core.
+    Fixed by adding a `fit_mask` parameter to `_kabsch_align_points()`: the
+    rotation is still *applied* to every atom, but is now *fitted* only from
+    IUPred-predicted-ordered residues (score < 0.5) when available — a
+    signal that exists pre-MC, purely from sequence, so it can't be
+    circularly biased by the RMSF it's used to compute. Standard practice in
+    MD ensemble analysis for exactly this reason (e.g. restricting alignment
+    to a `backbone and resid <core>` selection). Falls back to the original
+    all-atom fit if fewer than 3 residues pass the core threshold (Kabsch
+    needs ≥3 non-degenerate points).
+
+**Validated so far (synthetic + smoke tests, not yet the full ground-truth
+suite):**
+  - Synthetic core/tail contamination test: a rigid "core" cluster plus a
+    "tail" cluster given an independent extra rotation on top of a shared
+    rigid-body motion. Core-restricted fit recovered the true core rotation
+    to floating-point precision (residual ~2e-15 Å); fitting on the whole
+    set (old behavior) showed real, measurable contamination (1.18 Å
+    residual) — confirms the fix does what it's supposed to, not just that
+    it runs.
+  - Real smoke test on 1UBQ (76 res, 20-snapshot MC trajectory): Rg
+    11.61±0.02 Å (matches ubiquitin's known compactness), tight end-to-end
+    distribution, contact-map per-residue variance near zero (0.0002 mean —
+    correct for a short, near-native, rigid trajectory), core-aligned vs.
+    plain RMSF correlated at 0.93 with the expected direction of difference
+    on a synthetically-tagged "disordered" tail.
+  - Timing at 1YPI's scale (494 residues, 180 synthetic snapshots matching
+    production adaptive-depth budget): every new metric completes in under
+    3 seconds (`_compute_internal_scaling`/`_compute_contact_map`, the two
+    O(n_ca²)-per-snapshot ones, ~2.5s each) — negligible next to the MC
+    sampling itself.
+
+**Explicitly not done yet:**
+  - Not wired into `_on_landscape_done` or any GUI panel — the metrics exist
+    as standalone functions only, not yet called from the real result-
+    handling path or displayed anywhere.
+  - Not validated against the real ground-truth protein set (1UBQ/1LYZ/1YPI/
+    1XQ8) via real MC trajectories — only synthetic data and one small
+    smoke-test run so far. The expected qualitative signal (tighter Rg/lower
+    ν for the 3 ordered proteins vs. wider Rg/higher ν for 1XQ8, the real
+    IDP) has not been checked.
+  - Session paused before this validation pass specifically to rule out a
+    hardware/thermal concern on the development machine (recurring
+    unexpected shutdowns, unrelated root cause under investigation
+    separately) before running more sustained real-MC compute — not a code
+    or design blocker, just a deliberate pause. Picking this back up should
+    resume at wiring the metrics into `_on_landscape_done` + a new display
+    panel (following `_draw_disorder_profile`'s existing matplotlib-in-Qt
+    embedding pattern), then the real ground-truth validation pass.
+  - Disorder-aware sampling and GUI/visualization-support directions (the
+    other two originally-scoped IDP-handling targets) not started at all.
+
 ---
 
 ## Completed Work
