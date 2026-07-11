@@ -3375,6 +3375,15 @@ class ProteinApp(QMainWindow):
         self.ensemble_stats_lbl = QLabel("—")
         self.ensemble_stats_lbl.setStyleSheet("color:#94a3b8;font-size:9px;letter-spacing:1px;")
         ep_h.addWidget(self.ensemble_stats_lbl)
+        ep_h.addSpacing(16)
+        self.ensemble_overlay_btn = QPushButton("SHOW ENSEMBLE OVERLAY")
+        self.ensemble_overlay_btn.setObjectName("sec-btn")
+        self.ensemble_overlay_btn.setFixedHeight(22)
+        self.ensemble_overlay_btn.setStyleSheet(
+            "background:transparent;color:#7c3aed;border:1.5px solid #7c3aed;"
+            "border-radius:4px;padding:2px 10px;font-size:9px;letter-spacing:1px;")
+        self.ensemble_overlay_btn.clicked.connect(self._render_ensemble_overlay)
+        ep_h.addWidget(self.ensemble_overlay_btn)
         ep_v.addWidget(ep_hdr)
 
         self._ensemble_fig    = Figure(facecolor="#f8fafc", tight_layout=True)
@@ -5079,6 +5088,126 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         self._view_stack.setCurrentIndex(0)
         self.view_mode_btn.setVisible(True)
         self.disorder_toggle_btn.setText("⊛  DISORDER")
+
+    def _render_ensemble_overlay(self):
+        """Overlay a sample of MC trajectory snapshots in one 3Dmol viewer --
+        the classic NMR-ensemble "spaghetti plot" view of what the sampled
+        conformational ensemble actually looks like in 3D, rather than only
+        the scalar Rg/nu/contact-map summaries already on the ENSEMBLE page
+        (see IMPROVEMENTS.md item #7 -- this is the third, previously-
+        unstarted "GUI/visualization" direction).
+
+        Each overlay frame is Kabsch-superposed onto the first snapshot,
+        with the fit restricted to the IUPred-predicted ordered core when
+        available (same rationale/mask as _compute_rmsf) -- otherwise a
+        genuinely rigid core would look just as scattered as a real
+        disordered tail, since torsion-angle MC has no reason to keep a
+        fixed absolute pose across a trajectory. Frames are colored by the
+        same per-residue RMSF (b-factor, bwr gradient) already used for
+        COLOR BY FLEXIBILITY, so the rigid core stays visibly steady/blue
+        while a real disordered region visibly frays red across frames.
+        The lowest-energy dominant structure is drawn on top as an opaque
+        solid reference.
+        """
+        snaps = self._landscape_snaps
+        if not snaps or not self._ca_indices:
+            return
+        ca_indices = self._ca_indices
+        n_ca = len(ca_indices)
+        n_snaps = len(snaps)
+
+        coords = np.zeros((n_snaps, n_ca, 3), dtype=float)
+        for si, particles in enumerate(snaps):
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[si, ci] = [p.x, p.y, p.z]
+
+        fit_mask = None
+        if self._iupred_scores is not None and len(self._iupred_scores) == n_ca:
+            fit_mask = np.asarray(self._iupred_scores) < 0.5
+
+        ref = coords[0]
+        MAX_OVERLAY = 20
+        sample_idx = sorted(set(
+            np.linspace(0, n_snaps - 1, min(n_snaps, MAX_OVERLAY)).astype(int).tolist()))
+
+        bfac = (self._rmsf if self._rmsf is not None and len(self._rmsf) == n_ca
+                else None)
+
+        models_js = []
+        for k, si in enumerate(sample_idx):
+            frame = coords[si] if si == 0 else _kabsch_align_points(
+                ref, coords[si], fit_mask=fit_mask)
+            lines = []
+            for i in range(n_ca):
+                x, y, z = frame[i]
+                b = float(bfac[i]) if bfac is not None else 0.5
+                lines.append(
+                    f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b:6.2f}           C")
+            pdb_esc = "\n".join(lines).replace("\\", "\\\\").replace("`", "\\`")
+            models_js.append(
+                f'  var m{k}=v.addModel(`{pdb_esc}`,"pdb");\n'
+                f'  m{k}.setStyle({{}},{{cartoon:{{'
+                f'colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},'
+                f'thickness:0.5,opacity:0.30}}}});\n')
+
+        ref_js = ""
+        if self._landscape_dominant_particles:
+            dom_pdb = self._build_ca_pdb_str(self._landscape_dominant_particles)
+            dom_esc = dom_pdb.replace("\\", "\\\\").replace("`", "\\`")
+            ref_js = (
+                f'  var mRef=v.addModel(`{dom_esc}`,"pdb");\n'
+                f'  mRef.setStyle({{}},{{cartoon:{{color:"#1d4ed8",'
+                f'thickness:0.9,opacity:1.0}}}});\n')
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden; }}
+  #v {{ width:100vw;height:100vh; }}
+  #info {{
+    position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
+    letter-spacing:1px;color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;
+  }}
+  #legend {{
+    position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
+    letter-spacing:1px;color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;
+  }}
+</style></head><body>
+<div id="v"></div>
+<div id="info">ENSEMBLE OVERLAY &nbsp;&middot;&nbsp; {len(sample_idx)} sampled conformers \
+&nbsp;&middot;&nbsp; {n_ca} C&alpha; atoms</div>
+<div id="legend">
+  <span style="color:#1d4ed8">&#9632;</span> DOMINANT (reference)
+  &nbsp;&middot;&middot;&middot;&middot;&middot;&nbsp;
+  <span style="color:#2563eb">&#9632;</span> RIGID
+  &nbsp;&middot;&nbsp;
+  <span style="color:#dc2626">&#9632;</span> FLEXIBLE (per-conformer overlay)
+</div>
+<script>
+(function(){{
+  var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
+{''.join(models_js)}{ref_js}
+  v.zoomTo(); v.zoom(0.85); v.render();
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
+}})();
+</script></body></html>"""
+
+        self.viewer_cand_lbl.setText(
+            '<span style="color:#7c3aed;font-weight:bold;">ENSEMBLE OVERLAY</span>'
+            f' &nbsp;·&nbsp; {len(sample_idx)} conformers &nbsp;·&nbsp; '
+            'blue=rigid · red=disordered')
+        self._set_html(html)
+        self._view_stack.setCurrentIndex(0)
+        self.view_mode_btn.setVisible(True)
+        self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
 
     def _toggle_disorder(self):
         if self._view_stack.currentIndex() == 2:

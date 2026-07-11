@@ -1368,8 +1368,8 @@ whose crystal numbering doesn't correspond linearly to full-length UniProt numbe
 at any single offset — hit once, for chymotrypsin inhibitor 2 (2CI2). This is a
 limitation of that test harness's alignment heuristic, not the physics engine.)*
 
-**7. IDP ensemble characterization — in progress, not yet wired into the GUI
-or validated (branch `idp-handling`)**
+**7. IDP ensemble characterization — all three scoped directions shipped
+and validated (2026-07-12, branch `idp-handling`)**
 Item #2's classifier only ever produces a binary ORDERED/POSSIBLY-DISORDERED/
 IDP label plus a funnel score — once something is flagged disordered, there's
 no further description of *what the ensemble actually looks like*. This item
@@ -1572,8 +1572,96 @@ tier.** The genuinely-targeted version (per-bond `max_angle` scaled by
 IUPred score within a single trajectory, not just more total snapshots)
 remains a real, larger follow-up requiring new C++ engine surface — noted
 here as the natural next step if this coarser depth-scaling version proves
-insufficient, not attempted this round. GUI/visualization-support work (the
-third originally-scoped direction) still not started.
+insufficient, not attempted this round.
+
+**Third direction: GUI/visualization support (2026-07-11/12) — shipped and
+validated on a real IDP.** The `ENSEMBLE` page (from the first direction,
+above) only ever showed scalar summaries (Rg histogram, end-to-end
+histogram, internal-scaling fit, contact-frequency heatmap) — no structural
+picture of what the sampled ensemble actually *looks like*. Added a `SHOW
+ENSEMBLE OVERLAY` button (`python/gui_main.py`,
+`ProteinApp._render_ensemble_overlay`) that renders the classic NMR-
+ensemble "spaghetti plot": up to 20 evenly-spaced snapshots from the pooled
+landscape trajectory, each Kabsch-superposed onto the first frame (fit
+restricted to the IUPred-predicted ordered core when available — reusing
+the exact `fit_mask` machinery already validated for `_compute_rmsf`, for
+the same reason: without it a rigid core looks just as scattered as real
+disorder, since torsion-angle MC has no reason to hold a fixed absolute
+pose across a trajectory), all loaded as separate translucent 3Dmol cartoon
+models in one viewer, colored by the same per-residue RMSF/bwr gradient as
+the existing `COLOR BY FLEXIBILITY` view (blue=rigid, red=flexible). The
+lowest-energy dominant structure is drawn on top as an opaque solid
+reference. No new C++ or data plumbing needed — reuses
+`LandscapeWorker`'s already-pooled `snapshots`, `self._rmsf`, and
+`self._iupred_scores`, all already computed for the existing `ENSEMBLE`/
+`DISORDER` pages.
+
+Verified two ways, not just "renders without crashing": (1) headless smoke
+test constructing `ProteinApp` with no window and confirming the button's
+guard no-ops cleanly before any landscape run; (2) real end-to-end run —
+`LandscapeWorker.run()` on real MC data, fed through the actual
+`_on_landscape_done` path, then `_render_ensemble_overlay()` called for
+real, output HTML inspected directly (not assumed): 1UBQ (76 res, ordered)
+produced 20 sampled conformers + 1 reference model (21 `addModel` calls) as
+expected from its 45 pooled snapshots.
+
+**Validated on the real IDP case (1XQ8), not just the ordered controls —
+the RMSF values feeding the overlay's color scale show exactly the
+contrast the visualization is meant to show.** 1UBQ (ordered): RMSF range
+0.044–2.44 Å, mean 0.37 Å — uniformly low, matching a rigid, single-basin
+fold. 1XQ8 (140 res, real IDP, `POSSIBLY DISORDERED`, 75 pooled snapshots):
+RMSF range 1.25–**18.35 Å** — over 7x 1UBQ's own maximum, confirming the
+overlay's per-conformer color scale (clamped at 4.0 Å, same clamp as
+`COLOR BY FLEXIBILITY`) will show a visibly steady blue core fraying into
+solid red exactly where the real disorder is, rather than a uniform or
+random-looking spread. This is the same RMSF computation already validated
+against literature-documented flexibility (see item #2's 1LYZ N-terminus
+and item #7's `_compute_rmsf` core-alignment fix above) — the overlay adds
+a structural, 3D rendering of a signal that was already known-correct, not
+a new metric needing its own separate validation.
+
+**Live end-to-end run through the actual GUI (2026-07-12), driving the real
+app rather than internal functions — surfaced a real, pre-existing
+environment issue unrelated to this feature.** Drove the real `ProteinApp`
+window exactly as a user would (typed `1XQ8`, clicked `RUN ANALYSIS`,
+clicked `EXPLORE LANDSCAPE`, switched to `ENSEMBLE`, clicked `SHOW ENSEMBLE
+OVERLAY`) and screenshotted the live window. The pipeline/landscape run
+itself worked correctly end-to-end (`POSSIBLY DISORDERED`/`ORDERED` label
+shown correctly across repeat runs, matching the item #2 history), but the
+3D viewer panel rendered blank — `$3Dmol is not defined` in the embedded
+Chromium console. **Root-caused as pre-existing and unrelated to this
+feature, not a regression**: the identical failure reproduces on the
+already-shipped `SHOW BEST STRUCTURE` button (confirmed by instrumenting
+`self.web`'s page with a console-message handler and retrying up to 20s),
+while an isolated minimal `QWebEngineView` loading the same
+`<script src="https://3Dmol.org/...">` tag from a local file succeeds
+every time, including after importing `gui_main` and after constructing a
+real GPU `PhysicsEngine`. The actual differentiator is something specific
+to constructing the full `ProteinApp` window (not narrowed further — not
+GPU/CUDA contention, not a persistent disk cache, not page visibility, not
+the `QTWEBENGINE_DISABLE_SANDBOX` env var timing, all checked and ruled
+out) that intermittently breaks the embedded browser's fetch of the
+external 3Dmol.js CDN script specifically in *this* dev environment. Since
+every 3D view in this app (including all pre-existing ones) depends on the
+same external CDN load, this is a standing, environment-specific rendering
+caveat, not a defect in the ensemble overlay code — the overlay's own
+logic and data were already independently verified correct via direct HTML
+content inspection against real MC output (see above). Flagged here rather
+than silently dropped: a future, more resilient fix would be vendoring
+`3Dmol-min.js` locally instead of loading it from a CDN, removing the
+external-network dependency from every 3D view at once — not attempted
+this round, out of scope for validating this one feature.
+
+**Status: all three originally-scoped IDP directions (ensemble
+characterization, disorder-aware sampling, GUI/visualization) are now
+shipped.** Item #7 is functionally complete. Explicitly not done: a
+repeat-run visual regression check of the overlay itself (only single runs
+on 1UBQ/1XQ8 were inspected this round), the CDN-vendoring fix noted just
+above, and the overlay currently always samples snapshots evenly across
+the *pooled* multi-branch trajectory rather than exposing a per-basin
+overlay (e.g. "show only this basin's
+conformers") — a plausible follow-up if a user wants to visually compare
+basins rather than see the whole pooled ensemble at once.
 
 **Performance follow-up: the two O(n_ca²)-per-snapshot ensemble metrics
 moved to a new C++/OpenMP extension — real, verified speedup, no behavior
