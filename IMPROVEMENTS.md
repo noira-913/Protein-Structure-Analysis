@@ -1575,6 +1575,56 @@ here as the natural next step if this coarser depth-scaling version proves
 insufficient, not attempted this round. GUI/visualization-support work (the
 third originally-scoped direction) still not started.
 
+**Performance follow-up: the two O(n_ca²)-per-snapshot ensemble metrics
+moved to a new C++/OpenMP extension — real, verified speedup, no behavior
+change.** `_compute_internal_scaling`'s mean-distance-matrix pass and
+`_compute_contact_map`'s contact-frequency pass were the two actually
+"computation heavy" pieces of this item (both ~1-2.5s at 1YPI's scale;
+Rg/end-to-end/RMSF are each already sub-0.1s and stayed in Python).
+Followed an existing precedent already in this repo rather than inventing a
+new pattern: `feature/topological-mapping`'s `09f3d10` ("Add
+protein_analysis C++ extension for RQA and ACF acceleration") had already
+established the exact convention this needed — a standalone pybind11
+module separate from `protein_physics`, built via a second
+`Pybind11Extension` in `setup.py`, with the Python side falling back
+silently to its own pure-Python loop when the extension isn't built. New
+`src/analysis_ext.cpp` (module `protein_analysis`) exposes
+`compute_mean_dist_matrix(coords)` and
+`compute_contact_freq_matrix(coords, cutoff)`, both taking the same
+`(n_snaps, n_ca, 3)` coordinate array (built once in Python via a new
+`_snapshots_to_coord_array` helper, shared by both call sites and their
+fallback branches) and parallelized over residue index within each
+snapshot's O(n_ca²) inner pass (same race-free write pattern as
+`analysis_ext.cpp`'s original `compute_rqa`: thread `i` only ever writes
+cells `(i,j)`/`(j,i)` for `j>i`, so no two threads touch the same cell
+within one snapshot's parallel region, and the outer per-snapshot loop
+stays sequential since different snapshots accumulate into the same shared
+matrix).
+
+**Verified numerically identical to the pure-Python fallback** (forced both
+code paths on the same synthetic ensemble): mean-distance matrix max
+absolute difference `7.1e-15`, contact frequency `1.1e-16`, fitted ν
+difference `0.0` — all at floating-point rounding noise, not a real
+discrepancy. Re-ran the full real pipeline end-to-end on 1UBQ
+(`_on_landscape_done` with a real `LandscapeWorker` result) and got the
+exact same `Rg 11.6±0.0 Å · ν=0.17` as the pre-acceleration version.
+`tests/bridge_test.py` still clean.
+
+**Real, substantial speedup even without OpenMP active** — the same
+`has_openmp()` build-environment limitation already documented for
+`physics_engine.cpp` (bare `cl.exe` invocation outside a VS Developer
+environment can't find `omp.h`) applies here too, so this build is
+single-threaded C++, not multi-core. Benchmarked at 1YPI's scale (494
+residues, 180 synthetic snapshots): `_compute_internal_scaling` 1.16s →
+0.08s (**~14x**), `_compute_contact_map` 1.13s → 0.04s (**~26x**) — a
+compiled tight loop beats Python's per-iteration interpreter/numpy-allocation
+overhead by a lot on its own, before any multi-core parallelism is even
+switched on. Building inside a loaded VS Developer environment (the fix
+already documented for `physics_engine.cpp`, not re-applied here) would be
+expected to improve this further but wasn't attempted this round — these
+functions are already negligible next to MC sampling time even at the
+current single-threaded speed, so it wasn't a blocking follow-up.
+
 ---
 
 ## Completed Work

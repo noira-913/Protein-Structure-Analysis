@@ -82,6 +82,17 @@ from amber_params import missing_hydrogen_charge as _amber_missing_h_charge
 import iupred as _iupred
 import knot_analysis as _knot
 
+# Optional C++/OpenMP-accelerated backend for the two O(n_ca^2)-per-snapshot
+# ensemble metrics (_compute_internal_scaling's mean-distance matrix,
+# _compute_contact_map's contact-frequency matrix) -- see
+# IMPROVEMENTS.md item #7. Falls back to the pure-Python loops in this file
+# when the extension has not been built (same fallback convention as
+# protein_physics_cuda's optional GPU backend).
+try:
+    import protein_analysis as _analysis_ext
+except ImportError:
+    _analysis_ext = None
+
 
 def _app_base_dir():
     """Root directory for locating the sibling ``data`` folder.
@@ -998,6 +1009,20 @@ def _compute_end_to_end(snapshots, ca_indices):
     return dist
 
 
+def _snapshots_to_coord_array(snapshots, ca_indices):
+    """Build the (n_snaps, n_ca, 3) float64 array both accelerated ensemble
+    metrics (below) need as input to protein_analysis's C++ functions --
+    factored out once rather than duplicated in both fallback loops."""
+    n_snaps, n_ca = len(snapshots), len(ca_indices)
+    coords = np.zeros((n_snaps, n_ca, 3), dtype=float)
+    for si, particles in enumerate(snapshots):
+        for ci, pidx in enumerate(ca_indices):
+            if pidx < len(particles):
+                p = particles[pidx]
+                coords[si, ci] = [p.x, p.y, p.z]
+    return coords
+
+
 def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
     """Ensemble-averaged internal distance scaling law: <R_ij> ~ |i-j|^nu,
     the standard polymer-physics descriptor for distinguishing compact
@@ -1008,14 +1033,16 @@ def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
     Rg-vs-chain-length scaling fit, which would need many different-length
     proteins' ensembles to fit at all.
 
-    Computes the ensemble-mean Cα-Cα distance for every residue pair
-    (looping per-snapshot to bound memory to O(n_ca^2) rather than
-    O(n_snaps * n_ca^2) -- this codebase's larger cases, e.g. 1YPI at
-    n_ca~500, would otherwise need a multi-GB broadcast array), bins by
-    sequence separation |i-j|, then fits log<R_ij> = log(R0) + nu*log(|i-j|)
-    via ordinary least squares over separations >= min_sep (excludes the
-    shortest separations, where local bond/dihedral geometry rather than
-    long-range chain statistics dominates the mean distance).
+    Computes the ensemble-mean Cα-Cα distance for every residue pair via
+    protein_analysis.compute_mean_dist_matrix (C++/OpenMP) when that
+    extension is built, else a pure-Python per-snapshot loop (bounding
+    memory to O(n_ca^2) rather than O(n_snaps * n_ca^2) -- this codebase's
+    larger cases, e.g. 1YPI at n_ca~500, would otherwise need a multi-GB
+    broadcast array). Bins by sequence separation |i-j|, then fits
+    log<R_ij> = log(R0) + nu*log(|i-j|) via ordinary least squares over
+    separations >= min_sep (excludes the shortest separations, where local
+    bond/dihedral geometry rather than long-range chain statistics
+    dominates the mean distance).
 
     Returns (seps, mean_dists, nu, log_r0, r_squared) -- seps/mean_dists are
     1-D arrays (one entry per distinct |i-j| present), nu/log_r0 are the
@@ -1028,16 +1055,20 @@ def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
     if n_snaps == 0 or n_ca < min_sep + 2:
         return np.array([]), np.array([]), None, None, None
 
-    mean_dist_matrix = np.zeros((n_ca, n_ca), dtype=float)
-    for particles in snapshots:
-        coords = np.zeros((n_ca, 3), dtype=float)
-        for ci, pidx in enumerate(ca_indices):
-            if pidx < len(particles):
-                p = particles[pidx]
-                coords[ci] = [p.x, p.y, p.z]
-        diff = coords[:, None, :] - coords[None, :, :]         # [n_ca, n_ca, 3]
-        mean_dist_matrix += np.sqrt((diff ** 2).sum(-1))
-    mean_dist_matrix /= n_snaps
+    if _analysis_ext is not None:
+        coord_arr = _snapshots_to_coord_array(snapshots, ca_indices)
+        mean_dist_matrix = _analysis_ext.compute_mean_dist_matrix(coord_arr)
+    else:
+        mean_dist_matrix = np.zeros((n_ca, n_ca), dtype=float)
+        for particles in snapshots:
+            coords = np.zeros((n_ca, 3), dtype=float)
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[ci] = [p.x, p.y, p.z]
+            diff = coords[:, None, :] - coords[None, :, :]         # [n_ca, n_ca, 3]
+            mean_dist_matrix += np.sqrt((diff ** 2).sum(-1))
+        mean_dist_matrix /= n_snaps
 
     seps_all = np.abs(np.subtract.outer(np.arange(n_ca), np.arange(n_ca)))
     max_sep = n_ca - 1
@@ -1080,9 +1111,10 @@ def _compute_contact_map(snapshots, ca_indices, cutoff=8.0):
     set of partners across the ensemble is a real disorder signal even when
     RMSF's alignment-dependent answer for it is noisy.
 
-    Loops per-snapshot (same O(n_ca^2)-at-a-time pattern as
-    _compute_internal_scaling) to avoid an O(n_snaps * n_ca^2) broadcast
-    array.
+    Computed via protein_analysis.compute_contact_freq_matrix (C++/OpenMP)
+    when that extension is built, else a pure-Python per-snapshot loop
+    (same O(n_ca^2)-at-a-time pattern as _compute_internal_scaling, to
+    avoid an O(n_snaps * n_ca^2) broadcast array).
 
     Returns (contact_freq, per_residue_variance):
     - contact_freq: [n_ca, n_ca] array, fraction of snapshots each residue
@@ -1102,18 +1134,22 @@ def _compute_contact_map(snapshots, ca_indices, cutoff=8.0):
     if n_snaps == 0 or n_ca == 0:
         return np.zeros((0, 0)), np.array([])
 
-    contact_freq = np.zeros((n_ca, n_ca), dtype=float)
-    for particles in snapshots:
-        coords = np.zeros((n_ca, 3), dtype=float)
-        for ci, pidx in enumerate(ca_indices):
-            if pidx < len(particles):
-                p = particles[pidx]
-                coords[ci] = [p.x, p.y, p.z]
-        diff = coords[:, None, :] - coords[None, :, :]
-        dist = np.sqrt((diff ** 2).sum(-1))
-        contact_freq += (dist < cutoff)
-    contact_freq /= n_snaps
-    np.fill_diagonal(contact_freq, 0.0)
+    if _analysis_ext is not None:
+        coord_arr = _snapshots_to_coord_array(snapshots, ca_indices)
+        contact_freq = _analysis_ext.compute_contact_freq_matrix(coord_arr, cutoff)
+    else:
+        contact_freq = np.zeros((n_ca, n_ca), dtype=float)
+        for particles in snapshots:
+            coords = np.zeros((n_ca, 3), dtype=float)
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[ci] = [p.x, p.y, p.z]
+            diff = coords[:, None, :] - coords[None, :, :]
+            dist = np.sqrt((diff ** 2).sum(-1))
+            contact_freq += (dist < cutoff)
+        contact_freq /= n_snaps
+        np.fill_diagonal(contact_freq, 0.0)
 
     bernoulli_var = contact_freq * (1.0 - contact_freq)
     mask = np.ones((n_ca, n_ca), dtype=bool)
