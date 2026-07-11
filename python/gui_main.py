@@ -2084,8 +2084,9 @@ class LandscapeWorker(QThread):
     WORK_BUDGET_MULT   = 3.0     # allow ~3x the anchor's total MC-step work
 
     @classmethod
-    def _adaptive_depth(cls, n_res):
-        """Per-branch (n_snapshots, steps_per_snap) scaled for protein size.
+    def _adaptive_depth(cls, n_res, disorder_frac=0.0):
+        """Per-branch (n_snapshots, steps_per_snap) scaled for protein size
+        and (optionally) IUPred-predicted disorder fraction.
 
         n_snapshots grows with sqrt(n_res/ANCHOR_N_RES) so DBSCAN still has enough
         pooled points to resolve real basins as the PCA feature space grows with
@@ -2094,9 +2095,29 @@ class LandscapeWorker(QThread):
         per-step cost is ~O(n_res)) would exceed WORK_BUDGET_MULT times the
         anchor's work -- see class-level comment above for why this isn't tau-
         derived.
+
+        disorder_frac (IMPROVEMENTS.md item #7, "disorder-aware sampling"):
+        the fraction of residues IUPred predicts disordered (0.0 if
+        unavailable -- e.g. tests/landscape_stability_test.py's synthetic
+        3-identical-seed usage has no sequence info at all). A genuinely
+        disordered region is, by construction, sampling a heterogeneous mix
+        of sub-populations rather than fluctuating around one well -- the
+        same "DBSCAN needs more pooled points to resolve what's really
+        there" argument that already motivates the size-based sqrt scaling
+        above, just along a second axis. Scaled linearly (not sqrt, unlike
+        the size term): more disordered residues means proportionally more
+        distinct heterogeneous states to resolve, not a spread-of-noise
+        argument the central-limit-style sqrt reasoning applies to. Modest,
+        bounded first-pass constant (DISORDER_DEPTH_MULT=1.0, i.e. a fully
+        IUPred-disordered protein gets up to 2x depth) -- applied before the
+        existing N_SNAPSHOTS_CAP clamp, so it can't runaway past the
+        already-validated cost ceiling; not yet independently tuned beyond
+        that cap, same "reasoned starting value, not a fitted optimum"
+        posture as every other constant introduced this way in this file.
         """
         r = max(n_res, 1) / cls.ANCHOR_N_RES
-        n_snap = int(round(cls.N_SNAPSHOTS * r ** 0.5))
+        disorder_mult = 1.0 + cls.DISORDER_DEPTH_MULT * max(0.0, min(1.0, disorder_frac))
+        n_snap = int(round(cls.N_SNAPSHOTS * r ** 0.5 * disorder_mult))
         n_snap = max(cls.N_SNAPSHOTS, min(n_snap, cls.N_SNAPSHOTS_CAP))
 
         steps = cls.STEPS_PER_SNAP
@@ -2188,8 +2209,16 @@ class LandscapeWorker(QThread):
     USE_PIVOT_BRANCH = False
     PIVOT_N_PIVOTS   = 1
 
+    # Disorder-aware sampling depth (IMPROVEMENTS.md item #7) -- see
+    # _adaptive_depth's docstring for the full derivation. Always active
+    # (not an opt-in toggle like USE_REPLICA_EXCHANGE/USE_PIVOT_BRANCH):
+    # disorder_frac defaults to 0.0 when no IUPred scores are supplied, so
+    # this is a pure no-op extension of the already-shipped size-based
+    # depth scaling, not a new behavior that needs its own off-switch.
+    DISORDER_DEPTH_MULT = 1.0
+
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
-                 extra_seeds=None, backbone_ncac=None):
+                 extra_seeds=None, backbone_ncac=None, iupred_scores=None):
         super().__init__()
         self.engine      = engine
         self.init_atoms  = init_atoms
@@ -2198,6 +2227,11 @@ class LandscapeWorker(QThread):
         self.physics_mod = physics_mod if physics_mod is not None else protein_physics
         self.T           = T
         self.max_angle   = max_angle
+        # IUPred per-residue disorder scores (same order as ca_indices),
+        # used only to scale sampling depth via _adaptive_depth -- see
+        # DISORDER_DEPTH_MULT above. None/empty -> disorder_frac=0.0,
+        # identical to the pre-existing size-only behavior.
+        self.iupred_scores = iupred_scores
         # 다중 분지 탐색용 추가 시드 (예: 상위 K개 MC 후보) — 없으면 기존처럼
         # 단일 궤적으로 동작한다.
         # Extra seeds for multi-branch exploration (e.g. the next-best K MC
@@ -2226,7 +2260,9 @@ class LandscapeWorker(QThread):
         use_pivot = self.USE_PIVOT_BRANCH and len(self.topo.concerted_pairs) > 0
         n_branches = n_seed_branches + (1 if use_pivot else 0)
         n_res = len(self.ca_indices)
-        N_per, S = self._adaptive_depth(n_res)  # per-branch target -- see class-level comment above
+        disorder_frac = (_iupred.fraction_disordered(self.iupred_scores)
+                          if self.iupred_scores else 0.0)
+        N_per, S = self._adaptive_depth(n_res, disorder_frac)  # per-branch target -- see class-level comment above
 
         # ── 다중 분지 탐색 (Multi-branch exploration) ────────────────────
         # 시드 하나(최적 후보)에서만 뻗으면, 안정 단백질에서는 문제없다
@@ -3942,7 +3978,8 @@ class ProteinApp(QMainWindow):
 
         self._landscape_worker = LandscapeWorker(
             ls_engine, start_atoms, self._ca_indices, self._topo, self._physics_mod,
-            extra_seeds=extra_seeds, backbone_ncac=backbone_ncac)
+            extra_seeds=extra_seeds, backbone_ncac=backbone_ncac,
+            iupred_scores=self._iupred_scores)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
         self._landscape_worker.gpu_fallback.connect(self._on_gpu_fallback)

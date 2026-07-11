@@ -1517,9 +1517,63 @@ reliable IDP-detection signal on its own.
 scoped directions) is functionally complete and validated.** Rg + internal
 scaling exponent are real, working, literature-grounded IDP descriptors,
 now visible in the GUI. `contact_var` is shipped as correct infrastructure
-with an honestly-documented limitation rather than oversold. Explicitly not
-done: disorder-aware sampling and further GUI/visualization-support work
-(the other two originally-scoped directions) — not started.
+with an honestly-documented limitation rather than oversold.
+
+**Second direction: disorder-aware sampling — shipped, minimal and
+provably bounded.** Constrained by a real API limitation surfaced during
+the original scoping: `run_landscape_trajectory`'s `temperature`/`max_angle`
+are single scalars for the whole chain, and the one existing per-bond move
+hook (`BondTopology.rot_bond_scale`) is `def_readonly` and computed
+internally in C++ — genuinely targeting *only* the residues IUPred flags
+disordered, within a single trajectory, would need new C++ engine surface
+(a per-bond `max_angle` array), not attempted here. What's achievable
+Python-side without touching the engine: `_adaptive_depth` (already
+size-aware, `n_snapshots ∝ sqrt(n_res/76)`) now also scales with the
+IUPred-predicted disordered fraction, linearly rather than sqrt (more
+disordered residues means proportionally more distinct heterogeneous
+states to resolve, not a spread-of-noise argument the size term's
+central-limit-style sqrt reasoning applies to): `disorder_mult = 1 +
+DISORDER_DEPTH_MULT * disorder_frac` (`DISORDER_DEPTH_MULT = 1.0`, so a
+fully IUPred-disordered protein gets up to 2x depth), applied *before* the
+existing `N_SNAPSHOTS_CAP` clamp so it can't run past the already-validated
+cost ceiling. `LandscapeWorker` now takes an `iupred_scores` constructor
+argument (wired through from `ProteinApp._start_landscape`'s existing
+`self._iupred_scores`, computed at parse time — no new sequence analysis
+needed), and always applies this scaling (not an opt-in
+`USE_...`-style toggle, unlike replica exchange/pivot branch/alternating
+relax) since `disorder_frac` defaults to `0.0` when no scores are supplied,
+making this a provable no-op extension of the already-shipped behavior
+rather than a new mode needing its own off-switch.
+
+**Validated as a true no-op on the 3 ordered ground-truth proteins, and a
+real, bounded, correctness-preserving effect on the one real IDP:**
+
+| Protein | IUPred disordered fraction | N_per (before → after) | steps (before → after) |
+|---|---|---|---|
+| 1UBQ (76 res) | 0.000 | 15 → 15 | 600 → 600 |
+| 1LYZ (129 res) | 0.000 | 20 → 20 | 600 → 600 |
+| 1YPI (494 res) | 0.000 | 30 → 30 | 300 → 300 |
+| 1XQ8 (140 res, real IDP) | 0.250 | 20 → 25 | 600 → 586 |
+
+Confirmed identical `N_per`/`steps` for the 3 ordered proteins directly from
+`_adaptive_depth`'s output (not just expected — the disorder-scaling code
+path is exercised and produces byte-identical results when `disorder_frac`
+is genuinely `0.0`, so no separate re-run of those 3 cases was needed; this
+was a deliberate choice to avoid redundant heavy compute given an ongoing
+hardware/thermal concern on the dev machine — see memory, not this file).
+1XQ8 re-run 3x with the new depth active (real end-to-end
+`LandscapeWorker.run()`, not synthetic): **3/3 correctly POSSIBLY
+DISORDERED**, funnel 0.320-0.333 (consistent with the pre-existing baseline
+range), wall time 37.9-39.1s (no cost regression from the modest depth
+increase).
+
+**Status: disorder-aware sampling shipped as the achievable Python-only
+tier.** The genuinely-targeted version (per-bond `max_angle` scaled by
+IUPred score within a single trajectory, not just more total snapshots)
+remains a real, larger follow-up requiring new C++ engine surface — noted
+here as the natural next step if this coarser depth-scaling version proves
+insufficient, not attempted this round. GUI/visualization-support work (the
+third originally-scoped direction) still not started.
 
 ---
 
