@@ -1282,15 +1282,76 @@ the one pre-existing parsing bug the same test run exposed:
   energy" result can be trusted as a real win rather than a differently-named
   version of the same melting failure mode.
 
-  **Status: not yet closed.** Next steps, not yet done: (1) check post-kick
-  RMSD for the head-to-head comparison above, not just energy; (2) bound
-  `max_sweeps` much lower (a "relieve clashes" pass, not "run to
-  convergence") to match how real minimizers are actually used, and re-run
-  both the no-op and head-to-head checks at that bounded budget; (3) revisit
-  the SASA gradient approximation if the bounded-budget results still show
-  direction-quality problems on backbone-heavy proteins. All work so far is
-  on branch `torsion-gradient-minimizer` (pushed to `origin`), not yet
-  merged to `main`.
+  **Follow-up: bounding `max_sweeps` alone does NOT fix the melting problem
+  — it happens in the first 1-2 sweeps, not from running too long.** Tried
+  the obvious fix first: cap `max_sweeps` low (2/5/10) and re-run the no-op
+  check. Result: RMSD was *already* 42-150 Å at `max_sweeps=2` (1YPI:
+  89.8 Å at 2 sweeps vs. 88.3 Å at the original 30 — essentially all the
+  drift happens immediately). So this isn't a "ran too long" problem, it's
+  inherent to what a single sweep does.
+
+  **Root cause found: the angular safety cap (`DELTA_CAP=1.0` rad) doesn't
+  bound the thing that actually matters — Cartesian displacement.** A
+  rotation of `delta` radians moves a side atom at lever-arm distance `L`
+  from the pivot by roughly `L·delta`. For a bond near the N-terminus of a
+  494-residue protein, `L` to the farthest downstream atom can be 100+ Å, so
+  even the "safe" 1.0 rad angular cap can swing the C-terminus by 80+ Å in
+  *one* accepted step — and coordinate descent visits every rotatable bond
+  (hundreds of them) every sweep, not one bond per step like MC. `DELTA_CAP`
+  is also looser than MC's own `ANGLE_MAX=0.5` rad, compounding it.
+
+  **Fix: replaced the angular cap with a per-bond Cartesian displacement cap
+  (`MAX_DISP=0.3 Å`), computed from each bond's actual lever-arm length.**
+  Before clamping `delta`, `minimize_torsion` now finds the farthest side
+  atom from the pivot (`max_lever`) and uses
+  `eff_cap = min(DELTA_CAP, MAX_DISP / max_lever)` — long-lever-arm backbone
+  bonds get a much tighter angular budget, short-lever-arm bonds (e.g.
+  sidechain tips) are essentially unaffected. This directly targets the
+  measured mechanism rather than guessing at a smaller global angle.
+
+  **Re-ran the no-op check with the fix: RMSD now stays small (0.6-2.8 Å)
+  across all three candidate budgets**, letting a real bounded-budget choice
+  be made empirically instead of falling back by default:
+
+  | Protein | max_sweeps=2 | max_sweeps=5 | max_sweeps=10 | chosen |
+  |---|---|---|---|---|
+  | 1LYZ | RMSD 1.03 Å | RMSD 1.72 Å | RMSD 2.80 Å (flag) | 5 |
+  | 1YPI | RMSD 0.64 Å | RMSD 1.00 Å | RMSD 1.71 Å | 10 |
+
+  **Re-ran the head-to-head comparison at the chosen bounded budgets — the
+  original 40-65% "win" over MC does not hold up; it was largely the same
+  uncapped-displacement artifact.** At a budget that actually keeps the
+  no-op check honest, `minimize_torsion` is roughly *comparable* to MC, not
+  a decisive win:
+
+  | Protein | budget | MC T=0.6 | greedy T=0.01 | minimize_torsion |
+  |---|---|---|---|---|
+  | 1LYZ | 5 sweeps | 15,626.3 | 15,615.9 | 15,893.8 (worse, +1.8%) |
+  | 1YPI | 10 sweeps | 83,149.4 | 87,851.3 | 80,863.3 (better, ~3% vs. normal / ~8% vs. greedy) |
+
+  Cα RMSD-from-native for all three methods' final structures landed in the
+  same ballpark per protein (1LYZ ~33-36 Å, 1YPI ~57-58 Å) — the large
+  coarse-pivot kick itself dominates the RMSD at this scale, so RMSD doesn't
+  discriminate the relaxation methods here; energy is still the meaningful
+  axis, and on it the minimizer is a wash on 1LYZ and a modest win on 1YPI,
+  not the "40-65% lower" result originally reported.
+
+  **Status: closed for now, with an honest (smaller) result.** The
+  original head-to-head numbers were an artifact of the same
+  uncapped-Cartesian-displacement mechanism that broke the no-op check —
+  correcting it also removed most of the apparent win. At a bounded budget
+  that's actually safe (no-op RMSD < ~2 Å), `minimize_torsion` is roughly on
+  par with existing MC relaxation, with a small edge on the larger/denser
+  case (1YPI) and a small deficit on the smaller case (1LYZ). Not worth
+  wiring into `_PivotBranchRunnable`'s relax phase as a blanket MC
+  replacement on this evidence alone. Deprioritizing the SASA-approximation
+  gradient-quality revisit (it wasn't the limiting factor here — the
+  displacement cap was). If revisited later, the next lever to pull is
+  probably `MAX_DISP` tuning or a smarter per-bond ordering (e.g. sidechain
+  bonds first, since they have short lever arms and cheap wins), not the
+  gradient formulas themselves. All work is on branch
+  `torsion-gradient-minimizer` (pushed to `origin`), not yet merged to
+  `main`.
 
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
