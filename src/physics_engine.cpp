@@ -3494,9 +3494,21 @@ public:
         constexpr int    MAX_BACKTRACK = 5;
         constexpr double STEP_GROW  = 1.2, STEP_SHRINK = 0.5;
         constexpr double STEP_MAX   = 0.3, STEP_MIN    = 1e-6;
-        constexpr double DELTA_CAP  = 1.0;   // rad -- safety bound on one proposal,
-                                              // not the primary step-size control
-                                              // (line search handles refinement).
+        constexpr double DELTA_CAP  = 1.0;   // rad -- angular safety bound only;
+                                              // NOT sufficient alone on large proteins
+                                              // (see MAX_DISP below).
+        // A rotation of `delta` swings a side atom at lever-arm distance L by
+        // roughly L*delta (Cartesian). DELTA_CAP alone bounds the ANGLE, but a
+        // bond near the N-terminus of a large protein has an L of 100+ A to its
+        // farthest downstream atom, so even a "safe" 1.0 rad angular cap can move
+        // the C-terminus by 80+ A in a single accepted step -- this was measured
+        // directly (bounded max_sweeps=2 still produced 42-150 A native-structure
+        // RMSD; nearly all drift happened in sweep 1). MAX_DISP bounds the
+        // Cartesian displacement of the FARTHEST side atom instead, which is what
+        // actually determines structural drift; this shrinks the effective angle
+        // cap for long-lever-arm bonds without limiting short-lever-arm bonds
+        // (e.g. sidechain tips) at all.
+        constexpr double MAX_DISP   = 0.3;   // Angstrom, per accepted single-bond step
 
         auto cross_e = [&]() -> double {
             double E = 0.0;
@@ -3537,6 +3549,15 @@ public:
                 double grad = bond_dE_dtheta(st, nl, a, topo, in_side, ox, oy, oz, ux, uy, uz, N);
                 if (std::abs(grad) < 1e-12) { for (int k : side) in_side[k] = false; continue; }
 
+                double max_lever2 = 0.0;
+                for (int k : side) {
+                    double dx = st[k].x-ox, dy = st[k].y-oy, dz = st[k].z-oz;
+                    double d2 = dx*dx+dy*dy+dz*dz;
+                    if (d2 > max_lever2) max_lever2 = d2;
+                }
+                double max_lever  = std::sqrt(max_lever2);
+                double eff_cap    = std::min(DELTA_CAP, MAX_DISP / std::max(max_lever, 1e-6));
+
                 double old_cross = cross_e();
                 double old_sasa  = sasa_nonpolar(st, nl);
                 double old_dih   = dihedral_e_boundary(st, topo.dihedrals, in_side);
@@ -3555,7 +3576,7 @@ public:
                 bool improved = false;
                 for (int bt = 0; bt < MAX_BACKTRACK; ++bt) {
                     double delta = -trial_step * grad;
-                    delta = std::max(-DELTA_CAP, std::min(DELTA_CAP, delta));
+                    delta = std::max(-eff_cap, std::min(eff_cap, delta));
                     double cosD = std::cos(delta), sinD = std::sin(delta);
                     for (int k : side)
                         rodrigues(st[k].x, st[k].y, st[k].z, ox, oy, oz, ux, uy, uz, cosD, sinD);
