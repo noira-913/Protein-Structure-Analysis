@@ -1673,6 +1673,90 @@ piece. Re-verified end-to-end through the real GUI pipeline on 1UBQ
 (identical `Rg 11.6±0.0 Å · ν=0.17` as before) and `tests/bridge_test.py`
 clean.
 
+**Widened the search for other C++-worthy hot loops.** With the ensemble
+metrics now confirmed genuinely fast (profiled all remaining pieces —
+Rg, end-to-end, RMSF, and the leftover Python post-processing inside both
+accelerated functions — at up to a synthetic 2500 residues; all sub-0.1s,
+none worth porting), asked where else in the codebase a Python-level
+O(n²)+ loop runs on the main analysis path. Ruled out (all confirmed
+linear or operating on tiny n, not worth porting): `iupred.score()`
+(genuinely O(N), two fixed-width sliding windows), `LandscapeWorker._ca_vec`
+and the PCA `coord_mat` build (O(N·n_ca), linear in both dimensions),
+`_parse_pdb`'s per-atom loops (the only nested one, the CYS SG-SG
+disulfide scan, is O(n_cys²) but `n_cys` is tiny even in large real
+proteins), and `_compute_rmsd`/`_kabsch_fit`/`_kabsch_align_points` (fully
+vectorized numpy, SVD on a fixed 3×3 matrix regardless of atom count).
+
+**Found a real one: `knot_analysis.py`'s KMT reduction + crossing
+detection — a nested Python loop with heavy per-element numpy dispatch
+overhead, run 12+ times on every real landscape analysis.**
+`classify_backbone_knot` is called from `LandscapeWorker.run()` before MC
+sampling even starts (topology classification runs once per parse/landscape
+job); its stochastic-closure loop calls `kmt_reduce` (genuinely nested,
+O(passes·n²), each inner check calling `np.cross`/`np.dot` several times on
+raw 3-vectors — real per-call dispatch overhead, not just FLOPs) and
+`find_crossings` (O(m²) on the KMT-reduced vertex count) once per trial,
+12+ times per call. Profiled directly on real single-chain protein data
+(not the pooled-both-chains bug documented in item #6 — used chain-A-only
+Cα traces, matching `PipelineWorker`'s actual production behavior):
+
+| Protein | n_ca | `classify_backbone_knot` time (pure Python) |
+|---|---|---|
+| 1UBQ | 76 | 0.62s |
+| 1LYZ | 129 | 1.73s |
+| 1YPI (chain A) | 247 | 6.43s |
+
+Scaling (~O(n²)) confirmed the static-analysis estimate; at 247 residues
+this was already a real, non-trivial cost, and would keep growing worse
+relative to MC sampling time as protein size increases further (MC cost is
+roughly linear per step; KMT reduction is quadratic-or-worse).
+
+**Ported `kmt_reduce` and `find_crossings` to `src/analysis_ext.cpp`
+(extending the existing `protein_analysis` module, not a new one) — direct
+ports, not rewrites.** `find_crossings` takes the random projection axis as
+an explicit argument rather than drawing its own RNG value internally
+(`knot_analysis.find_crossings` still draws the axis in Python via the
+existing `_random_unit_vector`, then passes the concrete vector to either
+backend) — this keeps RNG consumption byte-identical regardless of which
+backend runs, so `classify_backbone_knot`'s trial sequence and results
+don't depend on whether the extension is built. `kmt_reduce`'s C++ version
+mirrors the Python original's mutable-list vertex-deletion semantics
+exactly, including *not* advancing the loop index after a deletion (the
+vertex that shifts into the just-vacated position gets re-examined in the
+same pass — a real behavioral subtlety, not incidental, that had to be
+replicated precisely for topological correctness). Both functions fall
+back to the original pure-Python implementations (renamed
+`_kmt_reduce_py`/`_find_crossings_py`) when the extension isn't built.
+
+**Verified numerically identical at every level, not just "runs without
+crashing":**
+- `kmt_reduce` alone: exact match on real closed chains from all 3
+  ground-truth proteins (max diff `0.0`).
+- `find_crossings` alone: 30/30 trials exact match on a synthetic
+  parametric trefoil (standard trefoil parametrization, matching this
+  module's own documented synthetic-curve validation methodology) — a case
+  chosen specifically because a genuine unknot reduces all the way down to
+  a 3-vertex triangle (no crossings possible), so the real proteins alone
+  couldn't exercise `find_crossings`' actual crossing-detection logic;
+  covered real crossings (3-7 per trial), correct degenerate-projection
+  detection, and the correct minimal 6-vertex trefoil reduction.
+- Full `classify_backbone_knot` pipeline, same seed, C++ vs. forced-Python
+  fallback: identical `name`/`crossing_number`/`alexander_coeffs`/
+  `confidence` on all 3 real ground-truth proteins.
+- The official `tests/knot_test.py` regression suite (3/3 PASS, including
+  the real documented trefoil positive control, YibK/1J85) and
+  `tests/bridge_test.py` both clean.
+
+**Speedup: far larger than the ensemble-metrics work — 74x to 1628x,
+growing with size.** 1UBQ (76 res): 0.62s → 0.01s (74x). 1LYZ (129 res):
+1.78s → 0.00s (492x). 1YPI chain A (247 res): 6.52s → 0.00s (1628x). Much
+larger than the ensemble-metrics functions' 20-37x because the original
+bottleneck here wasn't raw FLOPs (which numpy already handles reasonably),
+it was per-call Python/numpy dispatch overhead on `np.cross`/`np.dot` calls
+operating on individual 3-vectors inside a tight nested loop — exactly the
+overhead a compiled loop eliminates entirely, and it dominated even more as
+the loop trip count grew with protein size.
+
 ---
 
 ## Completed Work
