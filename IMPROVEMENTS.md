@@ -1349,9 +1349,25 @@ the one pre-existing parsing bug the same test run exposed:
   displacement cap was). If revisited later, the next lever to pull is
   probably `MAX_DISP` tuning or a smarter per-bond ordering (e.g. sidechain
   bonds first, since they have short lever arms and cheap wins), not the
-  gradient formulas themselves. All work is on branch
-  `torsion-gradient-minimizer` (pushed to `origin`), not yet merged to
-  `main`.
+  gradient formulas themselves.
+
+  **Final decision: branch closed out, not merged, left as-is.** As a
+  standalone full replacement for MC's relax phase, the evidence doesn't
+  support wiring `minimize_torsion` into `_PivotBranchRunnable` — it's a
+  wash on the smaller case and only a modest win on the larger one, never
+  both faster *and* better in the same case. One genuinely untested and
+  more promising angle surfaced along the way, worth a note for whoever
+  picks this back up: the minimizer crashes a badly-clashing raw post-kick
+  energy extremely fast in its *first* sweep alone (1YPI: 1.19B → ~12.9M,
+  ~99% drop) — a 1-2 sweep run as a cheap clash-relief *preconditioner*
+  before handing off to MC, rather than as a full relax-phase replacement,
+  was never benchmarked and could be worth trying before writing the
+  approach off entirely. All code (`minimize_torsion`, `bond_dE_dtheta`,
+  `pair_e_dr`, `dihedral_dphi_dtheta`, the `MAX_DISP` lever-arm cap, debug
+  accessors) remains on branch `torsion-gradient-minimizer` (pushed to
+  `origin`, commit `8b1e9c1`), intentionally not merged to `main` — it's
+  correct and safe to use standalone, just not adopted into production
+  given the marginal result.
 
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
