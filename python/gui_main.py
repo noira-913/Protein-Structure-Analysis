@@ -3121,6 +3121,12 @@ class ProteinApp(QMainWindow):
         self.disorder_toggle_btn.setFixedHeight(24)
         self.disorder_toggle_btn.setEnabled(False)
         vh_layout.addWidget(self.disorder_toggle_btn)
+        self.ensemble_toggle_btn = QPushButton("⊚  ENSEMBLE")
+        self.ensemble_toggle_btn.setObjectName("sec-btn")
+        self.ensemble_toggle_btn.clicked.connect(self._toggle_ensemble)
+        self.ensemble_toggle_btn.setFixedHeight(24)
+        self.ensemble_toggle_btn.setEnabled(False)
+        vh_layout.addWidget(self.ensemble_toggle_btn)
         self._candidate_btns = []
         viewer_v.addWidget(viewer_header)
 
@@ -3265,6 +3271,35 @@ class ProteinApp(QMainWindow):
         dp_v.addWidget(self._disorder_canvas)
 
         self._view_stack.addWidget(disorder_page)    # index 2
+
+        # Page 3: IDP ensemble metrics (Rg, end-to-end, internal scaling
+        # law, contact-map) -- see IMPROVEMENTS.md item #7. Deliberately a
+        # separate page from the disorder/RMSF profile above rather than
+        # folded into it: these are whole-ensemble/pairwise descriptors
+        # (Rg is one value per snapshot, contact frequency is per residue
+        # PAIR), a different data shape from the disorder page's per-
+        # residue-only line plots.
+        ensemble_page = QWidget()
+        ep_v = QVBoxLayout(ensemble_page)
+        ep_v.setContentsMargins(0, 0, 0, 0); ep_v.setSpacing(0)
+
+        ep_hdr = QWidget(); ep_hdr.setFixedHeight(30)
+        ep_hdr.setStyleSheet("background:#ffffff;border-bottom:1px solid #e2e8f0;")
+        ep_h = QHBoxLayout(ep_hdr); ep_h.setContentsMargins(16, 0, 16, 0)
+        ep_title = QLabel("IDP ENSEMBLE METRICS")
+        ep_title.setStyleSheet("color:#64748b;font-size:10px;letter-spacing:2px;")
+        ep_h.addWidget(ep_title); ep_h.addStretch()
+        self.ensemble_stats_lbl = QLabel("—")
+        self.ensemble_stats_lbl.setStyleSheet("color:#94a3b8;font-size:9px;letter-spacing:1px;")
+        ep_h.addWidget(self.ensemble_stats_lbl)
+        ep_v.addWidget(ep_hdr)
+
+        self._ensemble_fig    = Figure(facecolor="#f8fafc", tight_layout=True)
+        self._ensemble_canvas = FigureCanvas(self._ensemble_fig)
+        self._ensemble_canvas.setStyleSheet("border:none;")
+        ep_v.addWidget(self._ensemble_canvas)
+
+        self._view_stack.addWidget(ensemble_page)    # index 3
         viewer_v.addWidget(self._view_stack)
 
         # Candidate energy bar
@@ -3355,6 +3390,7 @@ class ProteinApp(QMainWindow):
         self.landscape_start_btn.setEnabled(False)
         self.landscape_toggle_btn.setEnabled(False)
         self.disorder_toggle_btn.setEnabled(False)
+        self.ensemble_toggle_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.status_lbl.setText("RUNNING")
         self.status_lbl.setStyleSheet("color:#d97706;font-size:11px;font-weight:bold;")
@@ -3365,6 +3401,7 @@ class ProteinApp(QMainWindow):
         self.idp_status_lbl.setText("—")
         self.idp_status_lbl.setStyleSheet("font-size:10px;font-weight:bold;color:#94a3b8;")
         self.disorder_stats_lbl.setText("—")
+        self.ensemble_stats_lbl.setText("—")
         self._rmsf = None
 
         # Reset view to structure page and fix button labels
@@ -3374,6 +3411,7 @@ class ProteinApp(QMainWindow):
             "⊞  LAYERED" if self._view_mode == "sidebyside" else "◧  SIDE-BY-SIDE")
         self.landscape_toggle_btn.setText("◈  LANDSCAPE")
         self.disorder_toggle_btn.setText("⊛  DISORDER")
+        self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
 
         self.landscape_start_btn.setText("◈  EXPLORE LANDSCAPE")
         self._log(f"[{target}] Analysis initiated")
@@ -3941,6 +3979,16 @@ class ProteinApp(QMainWindow):
             self._draw_disorder_profile(rmsf=rmsf, residues=residues,
                                         iupred_scores=self._iupred_scores)
             self.disorder_toggle_btn.setEnabled(True)
+
+            rg = _compute_radius_of_gyration(data["snapshots"], self._ca_indices)
+            end_to_end = _compute_end_to_end(data["snapshots"], self._ca_indices)
+            seps, mean_dists, nu, log_r0, r_squared = _compute_internal_scaling(
+                data["snapshots"], self._ca_indices)
+            contact_freq, _contact_var = _compute_contact_map(
+                data["snapshots"], self._ca_indices)
+            self._draw_ensemble_metrics(rg, end_to_end, seps, mean_dists, nu, log_r0,
+                                        r_squared, contact_freq)
+            self.ensemble_toggle_btn.setEnabled(True)
 
         self._log(f"[LANDSCAPE] Classification: {lbl}  ·  "
                   f"{data['n_sig']} metastable basins  ·  "
@@ -4770,6 +4818,95 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
 
         self._disorder_canvas.draw()
 
+    def _draw_ensemble_metrics(self, rg, end_to_end, seps, mean_dists, nu, log_r0, r_squared,
+                                contact_freq):
+        """Draw the 4-panel IDP ensemble-characterization figure (Rg
+        histogram, end-to-end histogram, internal-distance scaling-law fit,
+        contact-map heatmap) -- see IMPROVEMENTS.md item #7 for the design
+        rationale of each metric. Any panel is skipped if its data is empty
+        (e.g. the scaling-law fit needs >=3 distinct sequence separations
+        and returns None for nu/r_squared when there aren't enough).
+        """
+        have_rg      = rg is not None and len(rg) > 0
+        have_e2e     = end_to_end is not None and len(end_to_end) > 0
+        have_scaling = seps is not None and len(seps) > 0 and nu is not None
+        have_contact = contact_freq is not None and contact_freq.size > 0
+
+        if not (have_rg or have_e2e or have_scaling or have_contact):
+            return
+
+        self._ensemble_fig.clear()
+        self._ensemble_fig.patch.set_facecolor("#f8fafc")
+        axes = self._ensemble_fig.subplots(2, 2)
+
+        def _style(ax_obj):
+            ax_obj.set_facecolor("#f8fafc")
+            ax_obj.tick_params(colors="#94a3b8", labelsize=6)
+            for sp in ax_obj.spines.values():
+                sp.set_edgecolor("#e2e8f0"); sp.set_linewidth(0.7)
+
+        # ── Rg histogram ─────────────────────────────────────────
+        ax = axes[0][0]; _style(ax)
+        if have_rg:
+            ax.hist(rg, bins=min(20, max(5, len(rg) // 2)), color="#7c3aed", alpha=0.6,
+                    edgecolor="#5b21b6")
+            ax.set_xlabel("Rg (Å)", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("count", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"Radius of gyration  ·  {rg.mean():.2f}±{rg.std():.2f} Å",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── End-to-end histogram ─────────────────────────────────
+        ax = axes[0][1]; _style(ax)
+        if have_e2e:
+            ax.hist(end_to_end, bins=min(20, max(5, len(end_to_end) // 2)),
+                    color="#0891b2", alpha=0.6, edgecolor="#0e7490")
+            ax.set_xlabel("N-to-C distance (Å)", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("count", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"End-to-end distance  ·  {end_to_end.mean():.2f}±{end_to_end.std():.2f} Å",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── Internal scaling law: <R_ij> ~ |i-j|^nu ──────────────
+        ax = axes[1][0]; _style(ax)
+        if have_scaling:
+            ax.scatter(seps, mean_dists, s=10, color="#ea580c", alpha=0.7, zorder=3)
+            fit_x = np.array([seps.min(), seps.max()])
+            fit_y = np.exp(nu * np.log(fit_x) + log_r0)
+            ax.plot(fit_x, fit_y, color="#1e293b", lw=1.2, linestyle="--", zorder=2)
+            ax.set_xscale("log"); ax.set_yscale("log")
+            ax.set_xlabel("sequence separation |i-j|", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("<R_ij> (Å)", fontsize=7, color="#64748b", labelpad=3)
+            r2_str = f"{r_squared:.2f}" if r_squared is not None else "n/a"
+            ax.set_title(f"Internal scaling  ·  ν={nu:.3f}  (R²={r2_str})",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── Contact-map heatmap ───────────────────────────────────
+        ax = axes[1][1]; _style(ax)
+        if have_contact:
+            im = ax.imshow(contact_freq, cmap="viridis", vmin=0, vmax=1, origin="lower")
+            ax.set_xlabel("residue", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("residue", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title("Contact frequency", fontsize=8, color="#1e293b",
+                         fontweight="bold", pad=5)
+            cbar = self._ensemble_fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=6, colors="#94a3b8")
+        else:
+            ax.axis("off")
+
+        stats_bits = []
+        if have_rg:
+            stats_bits.append(f"Rg {rg.mean():.1f}±{rg.std():.1f} Å")
+        if have_scaling:
+            stats_bits.append(f"ν={nu:.2f}")
+        self.ensemble_stats_lbl.setText("  ·  ".join(stats_bits) if stats_bits else "—")
+
+        self._ensemble_canvas.draw()
+
     def _render_colored_by_rmsf(self):
         """Load the MC best structure into 3Dmol colored by per-residue RMSF (B-factor).
         MC 최저 에너지 구조를 잔기별 RMSF(B-인수)로 색칠해 3Dmol로 렌더링.
@@ -4869,6 +5006,18 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             self._view_stack.setCurrentIndex(2)
             self.view_mode_btn.setVisible(False)
             self.disorder_toggle_btn.setText("⊡  STRUCTURE")
+            self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+
+    def _toggle_ensemble(self):
+        if self._view_stack.currentIndex() == 3:
+            self._view_stack.setCurrentIndex(0)
+            self.view_mode_btn.setVisible(True)
+            self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
+            self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+        else:
+            self._view_stack.setCurrentIndex(3)
+            self.view_mode_btn.setVisible(False)
+            self.ensemble_toggle_btn.setText("⊡  STRUCTURE")
             self.landscape_toggle_btn.setText("◈  LANDSCAPE")
 
 

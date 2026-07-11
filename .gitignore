@@ -40,3 +40,8 @@ error_log.txt
 
 # Claude Code local tooling state (worktrees, session config)
 .claude/
+
+# One-off validation/probe scripts (referenced by name only in
+# IMPROVEMENTS.md, never committed -- e.g. autocorr_probe.py,
+# pivot_branch_validation.py, ensemble_metrics_validation.py)
+scratchpad/

@@ -1449,25 +1449,77 @@ suite):**
     O(n_ca²)-per-snapshot ones, ~2.5s each) — negligible next to the MC
     sampling itself.
 
-**Explicitly not done yet:**
-  - Not wired into `_on_landscape_done` or any GUI panel — the metrics exist
-    as standalone functions only, not yet called from the real result-
-    handling path or displayed anywhere.
-  - Not validated against the real ground-truth protein set (1UBQ/1LYZ/1YPI/
-    1XQ8) via real MC trajectories — only synthetic data and one small
-    smoke-test run so far. The expected qualitative signal (tighter Rg/lower
-    ν for the 3 ordered proteins vs. wider Rg/higher ν for 1XQ8, the real
-    IDP) has not been checked.
-  - Session paused before this validation pass specifically to rule out a
-    hardware/thermal concern on the development machine (recurring
-    unexpected shutdowns, unrelated root cause under investigation
-    separately) before running more sustained real-MC compute — not a code
-    or design blocker, just a deliberate pause. Picking this back up should
-    resume at wiring the metrics into `_on_landscape_done` + a new display
-    panel (following `_draw_disorder_profile`'s existing matplotlib-in-Qt
-    embedding pattern), then the real ground-truth validation pass.
-  - Disorder-aware sampling and GUI/visualization-support directions (the
-    other two originally-scoped IDP-handling targets) not started at all.
+**GUI wiring completed.** A new `ENSEMBLE` page (`_view_stack` index 3,
+toggle button next to `DISORDER`) shows a 4-panel figure — Rg histogram,
+end-to-end histogram, the internal-scaling log-log fit (with ν/R²
+annotated), and a contact-frequency heatmap — following
+`_draw_disorder_profile`'s existing matplotlib-in-Qt embedding pattern
+exactly (same `Figure`/`FigureCanvas` construction, same page-toggle
+mechanics as the existing `DISORDER`/`LANDSCAPE` pages). Wired into
+`_on_landscape_done` right after the existing RMSF computation, reusing the
+same `data["snapshots"]`/`self._ca_indices` already available there — no new
+data plumbing needed. Verified end-to-end headlessly (construct `ProteinApp`
+without showing a window, feed it a real MC result dict, confirm no
+exceptions and that the toggle button/stats label update correctly) before
+running the real validation below.
+
+**Validated against all 4 ground-truth proteins — a real, decisive signal on
+two of the four metrics, a genuine negative finding on the third.** Single
+production run per protein (not a repeat-stability suite — this is a first
+qualitative check, matching the same adaptive-depth budget and plain-MC path
+used everywhere else in this file, i.e. `USE_ALTERNATING_RELAX`/
+`USE_REPLICA_EXCHANGE`/`USE_PIVOT_BRANCH` all default `False` — none of the
+`minimize_torsion` cost-wall machinery from the closed-out alternating-GM/MC
+branch is involved here):
+
+| Protein | Direction | Label | Rg (Å) | ν | R² | contact_var |
+|---|---|---|---|---|---|---|
+| 1UBQ (76 res) | ordered | ORDERED | 11.55±0.04 | 0.168 | 0.29 | 0.0006 |
+| 1LYZ (129 res) | ordered | ORDERED | 13.86±0.03 | 0.105 | 0.17 | 0.0010 |
+| 1YPI (494 res) | ordered | ORDERED | 24.26±0.02 | 0.276 | 0.93 | 0.0001 |
+| 1XQ8 (140 res, real IDP) | IDP | POSSIBLY DISORDERED | 48.30±1.34 | **0.716** | **0.98** | 0.0001 |
+
+**Rg and ν both show a sharp, real separation, exactly matching the
+literature-grounded expectation.** 1XQ8's Rg (48.3 Å) is dramatically larger
+than any of the ordered proteins despite being the second-*smallest* chain
+in the set (140 res, smaller than 1YPI's 494) — a folded protein this size
+would never reach that radius. Its Rg spread is also far wider in absolute
+terms (std 1.34 Å vs. 0.02-0.04 Å for the ordered cases). Most decisively:
+ν=0.716 with R²=0.978 (an excellent power-law fit) lands squarely in
+expanded/self-avoiding-chain territory, sharply distinct from the ordered
+proteins' compact-globule range (ν=0.105-0.276). 1YPI's own ν (0.276,
+R²=0.933) is higher and better-fit than 1UBQ/1LYZ's (0.105-0.168,
+R²=0.17-0.29) — plausibly because its larger, more extended shape gives
+genuine polymer-like scaling behavior over a longer range of sequence
+separations, while the two smaller compact globules are mostly just noise
+at their scale (too small to show clean internal scaling at all).
+
+**`contact_var` did not discriminate as motivated — a real, mechanistic
+negative finding, not a bug.** It stayed low (0.0001-0.0010) across *all
+four* proteins, including 1XQ8, with no clear ordered-vs-IDP separation.
+Root cause, understood after the fact: `contact_var` is a Bernoulli-variance
+statistic (`p·(1-p)`, maximized at contact probability `p=0.5`), but the two
+regimes it was meant to distinguish both drive `p` toward the *extremes*,
+not toward 0.5, just via different mechanisms — a compact ordered protein
+has most residue pairs *permanently* in contact or permanently far apart
+(`p≈1` or `p≈0`), while 1XQ8's fully-expanded ensemble has most pairs
+*almost never* in contact at all (`p≈0` too, just via chain extension rather
+than fixed structure). The metric only lights up for residues with
+genuinely *intermediate, fluctuating* contact behavior across the ensemble
+(e.g. molten-globule-like transient contacts, or a residue oscillating
+between a compact and an open sub-state) — a real, different physical
+question from the general ordered/disordered axis it was introduced to
+detect. Kept in the codebase (the underlying computation is correct and the
+metric may be useful for that narrower question), but not treated as a
+reliable IDP-detection signal on its own.
+
+**Status: ensemble characterization (item #7's first of three originally-
+scoped directions) is functionally complete and validated.** Rg + internal
+scaling exponent are real, working, literature-grounded IDP descriptors,
+now visible in the GUI. `contact_var` is shipped as correct infrastructure
+with an honestly-documented limitation rather than oversold. Explicitly not
+done: disorder-aware sampling and further GUI/visualization-support work
+(the other two originally-scoped directions) — not started.
 
 ---
 
