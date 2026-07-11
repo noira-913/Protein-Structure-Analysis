@@ -1737,6 +1737,148 @@ class _ReplicaSegmentRunnable(QRunnable):
         self.results[self.k] = (snaps, ens, final_cur_max)
 
 
+class _AlternatingRelaxBranchRunnable(QRunnable):
+    """Runs one landscape branch by alternating gradient-minimization (GM)
+    sweeps with ordinary Metropolis MC blocks, instead of pure MC.
+
+    Motivation (IMPROVEMENTS.md item #2): the analytic torsion-gradient
+    minimizer (minimize_torsion, branch torsion-gradient-minimizer) was
+    tried as a full relax-phase *replacement* and fell short -- "never both
+    faster and better in the same case" vs. plain MC -- but its first-sweep
+    behavior on a badly-clashing structure was dramatic (1YPI: 1.19B ->
+    ~12.9M kcal/mol in one sweep). GM is good at fast clash removal but bad
+    at basin-crossing (it only ever accepts a real energy decrease); MC is
+    the opposite. This alternates the two so each does what it's good at --
+    basin-hopping's standard shape.
+
+    Population-corruption risk (carried in, not hypothetical): simulated
+    annealing was tried earlier as a burn-in-only accelerant and still hurt
+    the funnel score, because biasing the walk toward a minimum-energy
+    state -- even briefly -- corrupts the population-weighted basin
+    statistics this classifier depends on. minimize_torsion is a
+    zero-temperature quench, same basic character as SA. This is why every
+    pooled snapshot is tagged 'gm'/'mc'/'mc_fallback' in phase_tags, so the
+    validation script can directly check whether the alternating-relax arm's
+    funnel/e_spread distribution looks like the SA finding (tighter/lower)
+    rather than assuming the risk away.
+
+    Stagnation criteria (both derived from kT=0.592, the codebase's existing
+    physical energy-scale constant, following the same pattern as
+    COMPETITIVE_KT = 20*sqrt(n_res/76) -- not flat, hand-picked constants):
+    - GM phase: minimize_torsion's own early-termination on `tol`. A full
+      sweep touches every rotatable bond once, so tol is scaled as
+      GM_TOL_KT_MULT * n_rot_bonds * kT -- "0.1 kT of total drop per bond
+      touched" is a topology-adaptive "this sweep isn't doing real work
+      anymore" threshold.
+    - MC phase: net energy drop over a fixed-size block (mirrors the
+      existing PT_SWAP_INTERVAL precedent) compared against
+      MC_STAGNATION_KT_MULT * kT.
+
+    Budget/stop rule -- BUDGET-MATCHED FALLBACK VARIANT (tested first, per
+    plan decision): once both the most recent GM phase and MC block report
+    stagnation, this does NOT stop the branch early. It falls back to
+    spending the remaining shared budget on plain MC, so every arm of the
+    validation A/B spends the same total snapshot budget and wall-time
+    comparisons stay apples-to-apples. A true early-stop variant (leave
+    budget unused once both phases stagnate) is a deliberate follow-up only
+    if this variant's results look reasonable -- not implemented here.
+
+    Output contract: writes (snapshots, energies, error, phase_tags) into
+    results[bi] -- one extra element vs. the other 3 runnable types'
+    (snaps, ens, err) 3-tuple. The unpack site (LandscapeWorker.run()) reads
+    this as `snaps, ens, err, *rest = branch_results[bi]`, so the other
+    runnables' plain 3-tuples are unaffected.
+    """
+    def __init__(self, bi, seed, topo, n_snapshots, steps_per_snap, T, max_angle,
+                 physics_mod, results, gm_max_sweeps, gm_step_init, gm_tol_kt_mult,
+                 mc_block_snapshots, mc_stagnation_kt_mult):
+        super().__init__()
+        self.bi = bi
+        self.seed = seed
+        self.topo = topo
+        self.n_snapshots = n_snapshots
+        self.steps_per_snap = steps_per_snap
+        self.T = T
+        self.max_angle = max_angle
+        self.physics_mod = physics_mod
+        self.results = results
+        self.gm_max_sweeps = gm_max_sweeps
+        self.gm_step_init = gm_step_init
+        self.gm_tol_kt_mult = gm_tol_kt_mult
+        self.mc_block_snapshots = mc_block_snapshots
+        self.mc_stagnation_kt_mult = mc_stagnation_kt_mult
+
+    def run(self):
+        try:
+            snaps, ens, phase_tags = self._run_alternating(self.physics_mod)
+            self.results[self.bi] = (snaps, ens, None, phase_tags)
+        except Exception as ex:
+            if self.physics_mod is protein_physics:
+                self.results[self.bi] = (None, None, ex, None)
+                return
+            try:
+                snaps, ens, phase_tags = self._run_alternating(protein_physics)
+                self.results[self.bi] = (snaps, ens, ex, phase_tags)
+            except Exception as ex2:
+                self.results[self.bi] = (None, None, ex2, None)
+
+    def _run_alternating(self, physics_mod):
+        engine = physics_mod.PhysicsEngine()
+        state = self.seed
+        kT = 0.592
+        n_rot = max(1, len(self.topo.rot_bonds))
+        gm_tol = self.gm_tol_kt_mult * n_rot * kT
+
+        pooled_snaps, pooled_energies, phase_tags = [], [], []
+        snapshots_used = 0
+
+        while snapshots_used < self.n_snapshots:
+            # ---- GM phase ----
+            gm_snaps, gm_ens = engine.minimize_torsion(
+                state, self.topo, max_sweeps=self.gm_max_sweeps,
+                step_init=self.gm_step_init, tol=gm_tol)
+            take = min(len(gm_snaps), self.n_snapshots - snapshots_used)
+            if take > 0:
+                pooled_snaps.extend(gm_snaps[:take])
+                pooled_energies.extend(gm_ens[:take])
+                phase_tags.extend(['gm'] * take)
+                snapshots_used += take
+                state = gm_snaps[take - 1]
+            # tol fired before max_sweeps was exhausted -> GM phase stagnated
+            gm_stagnant = len(gm_snaps) < self.gm_max_sweeps
+            if snapshots_used >= self.n_snapshots:
+                break
+
+            # ---- MC phase ----
+            block_n = min(self.mc_block_snapshots, self.n_snapshots - snapshots_used)
+            mc_snaps, mc_ens = engine.run_landscape_trajectory(
+                state, self.topo, block_n, self.steps_per_snap, self.T, self.max_angle)
+            pooled_snaps.extend(mc_snaps)
+            pooled_energies.extend(mc_ens)
+            phase_tags.extend(['mc'] * len(mc_snaps))
+            snapshots_used += len(mc_snaps)
+            if mc_snaps:
+                state = mc_snaps[-1]
+            block_drop = (mc_ens[0] - mc_ens[-1]) if mc_ens else 0.0
+            mc_stagnant = block_drop < self.mc_stagnation_kt_mult * kT
+
+            if gm_stagnant and mc_stagnant:
+                # Budget-matched fallback: spend whatever's left on plain MC
+                # rather than stopping early -- see class docstring.
+                remaining = self.n_snapshots - snapshots_used
+                if remaining > 0:
+                    fb_snaps, fb_ens = engine.run_landscape_trajectory(
+                        state, self.topo, remaining, self.steps_per_snap,
+                        self.T, self.max_angle)
+                    pooled_snaps.extend(fb_snaps)
+                    pooled_energies.extend(fb_ens)
+                    phase_tags.extend(['mc_fallback'] * len(fb_snaps))
+                    snapshots_used += len(fb_snaps)
+                break
+
+        return pooled_snaps, pooled_energies, phase_tags
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  LandscapeWorker — MC trajectory → conformational graph
 # ═══════════════════════════════════════════════════════════════════
@@ -1967,6 +2109,24 @@ class LandscapeWorker(QThread):
     USE_PIVOT_BRANCH = False
     PIVOT_N_PIVOTS   = 1
 
+    # Alternating GM/MC relaxation (IMPROVEMENTS.md item #2, direct follow-up
+    # to the closed-out torsion-gradient-minimizer investigation) -- swaps
+    # each seed branch's relax mechanism from pure MC to alternating
+    # gradient-minimization sweeps + MC blocks (see
+    # _AlternatingRelaxBranchRunnable's docstring for the full design and the
+    # SA-precedent population-corruption risk this is validated against).
+    # Off by default pending A/B validation -- same conservative posture as
+    # USE_REPLICA_EXCHANGE/USE_PIVOT_BRANCH. Mutually exclusive with
+    # USE_REPLICA_EXCHANGE (both are alternate relax mechanisms for the same
+    # seed branches); USE_PIVOT_BRANCH can coexist (it adds one extra branch
+    # on top), though that combination is untested.
+    USE_ALTERNATING_RELAX = False
+    GM_MAX_SWEEPS          = 50    # minimize_torsion's own cap; tol should fire first in practice
+    GM_STEP_INIT           = 0.05
+    GM_TOL_KT_MULT         = 0.1   # gm_tol = GM_TOL_KT_MULT * n_rot_bonds * kT -- see docstring
+    MC_BLOCK_SNAPSHOTS     = 5     # mirrors PT_SWAP_INTERVAL precedent above
+    MC_STAGNATION_KT_MULT  = 2.0   # mc_stagnant if net block drop < this * kT
+
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
                  extra_seeds=None, backbone_ncac=None):
         super().__init__()
@@ -1999,6 +2159,11 @@ class LandscapeWorker(QThread):
     def run(self):
         from sklearn.decomposition import PCA
         from sklearn.cluster import DBSCAN
+
+        if self.USE_ALTERNATING_RELAX and self.USE_REPLICA_EXCHANGE:
+            raise ValueError(
+                "USE_ALTERNATING_RELAX and USE_REPLICA_EXCHANGE are mutually "
+                "exclusive relax mechanisms for the same seed branches")
 
         seeds = [self.init_atoms] + self.extra_seeds
         n_seed_branches = len(seeds)
@@ -2050,10 +2215,23 @@ class LandscapeWorker(QThread):
         # itself is left untouched here, since _dedicated_subsearch reuses it
         # sequentially later, after this parallel section completes.
         physics_mod_snapshot = self.physics_mod
+        if self.USE_ALTERNATING_RELAX and physics_mod_snapshot is not protein_physics:
+            # minimize_torsion has no CUDA port -- force CPU rather than
+            # silently no-op the toggle, same posture as the existing
+            # gpu_fallback mechanism (explicit, visible fallback).
+            self.progress.emit(
+                "  [LANDSCAPE] Alternating GM/MC relax forces CPU engine "
+                "(minimize_torsion has no CUDA port)…")
+            physics_mod_snapshot = protein_physics
         branch_results = [None] * n_branches
         pool = QThreadPool()
         pool.setMaxThreadCount(max(1, n_branches))
-        pt_note = " [replica exchange]" if self.USE_REPLICA_EXCHANGE else ""
+        if self.USE_REPLICA_EXCHANGE:
+            pt_note = " [replica exchange]"
+        elif self.USE_ALTERNATING_RELAX:
+            pt_note = " [alternating GM/MC]"
+        else:
+            pt_note = ""
         for bi, seed in enumerate(seeds):
             if n_branches > 1:
                 self.progress.emit(
@@ -2068,6 +2246,12 @@ class LandscapeWorker(QThread):
                     physics_mod_snapshot, branch_results,
                     self.PT_N_REPLICAS, self.PT_LADDER_RATIO, self.PT_SWAP_INTERVAL,
                     rng_seed=bi))
+            elif self.USE_ALTERNATING_RELAX:
+                pool.start(_AlternatingRelaxBranchRunnable(
+                    bi, seed, self.topo, N_per, S, self.T, self.max_angle,
+                    physics_mod_snapshot, branch_results,
+                    self.GM_MAX_SWEEPS, self.GM_STEP_INIT, self.GM_TOL_KT_MULT,
+                    self.MC_BLOCK_SNAPSHOTS, self.MC_STAGNATION_KT_MULT))
             else:
                 pool.start(_LandscapeBranchRunnable(
                     bi, seed, self.topo, N_per, S, self.T, self.max_angle,
@@ -2084,9 +2268,15 @@ class LandscapeWorker(QThread):
         pool.waitForDone()
 
         all_snapshots, all_energies, branch_lengths = [], [], []
+        all_branch_phase_tags = []
         gpu_fallback_error = None
         for bi in range(n_branches):
-            snaps, ens, err = branch_results[bi]
+            # _AlternatingRelaxBranchRunnable writes a 4th element
+            # (phase_tags); the other 3 runnable types still write plain
+            # 3-tuples, so unpack defensively rather than assuming length.
+            entry = branch_results[bi]
+            snaps, ens, err = entry[0], entry[1], entry[2]
+            phase_tags = entry[3] if len(entry) > 3 else None
             if snaps is None:
                 raise err  # fatal -- matches the original single-branch-failure-aborts-run behavior
             if physics_mod_snapshot is not protein_physics and err is not None:
@@ -2094,6 +2284,7 @@ class LandscapeWorker(QThread):
             all_snapshots.extend(snaps)
             all_energies.extend(ens)
             branch_lengths.append(len(snaps))
+            all_branch_phase_tags.append(phase_tags)
 
         if gpu_fallback_error is not None:
             self.progress.emit(
@@ -2635,7 +2826,7 @@ class LandscapeWorker(QThread):
             })
         basin_summary.sort(key=lambda b: -b["population"])
 
-        self.result.emit({
+        result_dict = {
             "snapshots":    snapshots,
             "energies":     energies,
             "layout":       layout,
@@ -2651,7 +2842,16 @@ class LandscapeWorker(QThread):
             "dominant_particles": dominant_particles,
             "sub_candidates": sub_candidates,
             "basin_summary": basin_summary,
-        })
+        }
+        if self.USE_ALTERNATING_RELAX:
+            # Per-branch 'gm'/'mc'/'mc_fallback' tags, only populated for this
+            # experimental relax mode -- lets a validation script check the
+            # GM-fraction each branch actually reached (sanity-checks whether
+            # GM_TOL_KT_MULT/MC_STAGNATION_KT_MULT are firing at reasonable
+            # points) without affecting every other existing usage of this
+            # result dict.
+            result_dict["branch_phase_tags"] = all_branch_phase_tags
+        self.result.emit(result_dict)
 
     def _pick_strategy(self, pop_frac, region_size):
         """Decide reuse vs. dedicated vs. hybrid for one competitive basin.

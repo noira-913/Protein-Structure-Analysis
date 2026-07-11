@@ -1353,6 +1353,110 @@ the one pre-existing parsing bug the same test run exposed:
   `torsion-gradient-minimizer` (pushed to `origin`), not yet merged to
   `main`.
 
+  **Follow-up: alternating GM/MC relaxation per branch — real accuracy
+  regression on the one case that matters, reverted to off.** The standalone
+  minimizer's verdict above was "never both faster and better in the same
+  case" as a *full* relax-phase replacement — but its first-sweep behavior
+  on a badly-clashing structure was dramatic (1YPI: 1.19B → ~12.9M kcal/mol
+  in one sweep), suggesting it's good at fast clash removal specifically,
+  just not as a full MC substitute. Tested the natural hybrid instead:
+  alternate GM sweeps and MC blocks *within* each existing seed branch (not
+  a new branch type), each phase stopping on its own stagnation criterion,
+  so GM handles clash removal and MC handles basin-crossing — basin-hopping's
+  standard shape. Cherry-picked `minimize_torsion` onto a new branch
+  (`alternating-gm-mc-relax`, commits `0c80bb5`/`8b1e9c1` from
+  `torsion-gradient-minimizer`, skipping that branch's own docs-only
+  close-out) and added `_AlternatingRelaxBranchRunnable`
+  (`python/gui_main.py`), gated behind `LandscapeWorker.USE_ALTERNATING_RELAX`
+  (default `False`), mutually exclusive with `USE_REPLICA_EXCHANGE`, forcing
+  the CPU engine (`minimize_torsion` has no CUDA port).
+
+  **This was explicitly designed and validated against a named risk, not a
+  hypothetical one**: simulated annealing was tried earlier as a
+  *burn-in-only* accelerant and still hurt the funnel score, because biasing
+  the walk toward a minimum-energy state — even briefly — corrupts the
+  population-weighted basin statistics this classifier depends on.
+  `minimize_torsion` is a zero-temperature quench, same basic character as
+  SA. Every pooled snapshot was tagged `'gm'`/`'mc'`/`'mc_fallback'`
+  (surfaced via a new `branch_phase_tags` result-dict key) specifically so
+  this could be checked directly rather than assumed away.
+
+  Stagnation criteria, both size/topology-adaptive rather than flat
+  constants (same pattern as `COMPETITIVE_KT = 20*sqrt(n_res/76)`): GM phase
+  stops via `minimize_torsion`'s own `tol` early-termination, scaled as
+  `gm_tol = 0.1 * n_rot_bonds * kT` ("0.1 kT of drop per bond touched per
+  sweep"); MC phase stops when a 5-snapshot block's net energy drop falls
+  under `2.0 * kT`. Once *both* phases stagnate in the same cycle, the
+  budget-matched variant (tested first, per plan) falls back to spending the
+  rest of the shared step budget on plain MC rather than stopping the branch
+  early, so the A/B comparison's wall-time/snapshot-count stays apples-to-
+  apples.
+
+  **1YPI (494 res) excluded from the A/B run — a real, previously-unmeasured
+  cost wall, not a bug.** An isolated timing probe found a single
+  `minimize_torsion` sweep costs **~176 seconds on 1YPI** (1876 rotatable
+  bonds — every sweep is Gauss-Seidel over all of them, each bond with up to
+  5 backtracking retries). With `GM_MAX_SWEEPS=50` as the only other cap,
+  one GM phase call could run up to ~2.4 hours if `tol` doesn't fire
+  quickly, and the alternation loop calls GM repeatedly per branch — the
+  first full validation attempt ran silently for 2 hours (fully buffered
+  stdout hid this) before being killed once the isolated probe confirmed the
+  cause. This is a genuine cost characteristic of coordinate-descent
+  minimization scaling with rotatable-bond count on a large, densely-packed
+  protein, not an infinite loop or a wiring bug — left as an open cost
+  problem for any future revisit, not investigated further this round.
+
+  **Validated on the 3 tractable ground-truth proteins
+  (`scratchpad/alternating_relax_validation.py`, 3 repeats each, same seeds
+  both arms):**
+
+  | Protein | baseline labels | alternating labels | baseline funnel | alternating funnel | baseline e_spread | alternating e_spread | avg time (base → alt) |
+  |---|---|---|---|---|---|---|---|
+  | 1UBQ (76 res) | 3/3 ORDERED | 3/3 ORDERED | [0.356, 0.733] | [0.467, 0.756] | [0.00, 0.00] | [0.00, 0.00] | 47.1s → 59.5s |
+  | 1LYZ (129 res) | 3/3 ORDERED | 3/3 ORDERED | [0.300, 0.317] | [0.533, 0.867] | [0.00, 0.00] | [0.00, 0.00] | 116.6s → 262.2s |
+  | 1XQ8 (140 res, real IDP) | 3/3 POSSIBLY DISORDERED | **0/3 — all ORDERED** | [0.267, 0.333] | [0.283, 0.433] | [223.7, 381.4] | **[0.00, 0.00]** | 144.9s → 201.2s |
+
+  **Verdict on the population-corruption question (the specific thing this
+  experiment set out to check): corruption occurred, and the mechanism is
+  visible directly in the data.** 1XQ8 — the one case in the ground-truth
+  set that specifically tests whether the classifier still detects real
+  disorder, not just correctly stays quiet on rigid proteins — misclassified
+  as ORDERED in **all 3** alternating-relax runs, reproducibly, with
+  `e_spread` collapsing to exactly `0.000` in every one of those runs (vs.
+  223.7–381.4 at baseline). `e_spread` is the basin-to-basin energy range
+  the classifier's competitive-basin gating depends on; a hard collapse to
+  zero across all 3 independent seeds is the SA-like signature named as the
+  risk going in, now reproduced via a different mechanism (torsion-gradient
+  quench rather than annealing): the zero-temperature GM phase pulls
+  branches toward similar low-energy states regardless of which basin they
+  started exploring, destroying the energy diversity a genuine IDP's
+  multiple real conformational states should show. 1UBQ/1LYZ stayed
+  correctly labeled (6/6 combined) with funnel scores that were, if
+  anything, higher/wider than baseline (not the tighter/lower SA-like
+  pattern) — the corruption specifically shows up on the case that depends
+  on energy diversity being real, not on every case uniformly, which is
+  consistent with "quenching collapses energy spread" as the actual
+  mechanism rather than a generic regression.
+
+  **Final decision: `USE_ALTERNATING_RELAX` stays `False`.** This is not a
+  borderline or cost-only result the way replica exchange or the pivot
+  branch were — it's a reproduced, 3/3 misclassification of the one
+  ground-truth case that checks real disorder detection, with a clear
+  causal signature (`e_spread` → 0) pointing at exactly the risk named
+  before the experiment ran. The budget-matched-fallback variant is not
+  recommended for further tuning as designed; the true early-stop variant
+  (leave budget unused once both phases stagnate, planned as a follow-up
+  only if the fallback variant looked reasonable) was not attempted, since
+  it shares the same root mechanism (interleaved zero-temperature quenching
+  during production sampling) and there's no reason to expect it would avoid
+  the same collapse. Code kept on branch `alternating-gm-mc-relax` (pushed
+  to `origin`, not merged to `main`) as correct, working, off-by-default
+  infrastructure — same posture as `USE_REPLICA_EXCHANGE`/`USE_PIVOT_BRANCH`
+  — in case a future design (e.g. restricting GM strictly to a bounded
+  pre-production burn-in prefix with zero GM-tagged snapshots ever pooled
+  into the population statistics, rather than interleaved throughout) wants
+  to revisit the underlying idea without repeating this specific mistake.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
