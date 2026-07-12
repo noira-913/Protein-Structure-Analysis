@@ -593,6 +593,59 @@ for _a, _q in [
 ]:
     PARTIAL_CHARGES[("TYR",_a)] = _q
 
+# ── ATP (2026-07-13, IMPROVEMENTS.md item #4 F2) ───────────────────────────────
+#
+# Real RESP partial charges, sourced (not hand-transcribed) from the Manchester
+# AMBER Parameter Database's ATP.prep entry ("revised phosphate parameters",
+# citing Meagher, Redman & Carlson (2003) J. Comput. Chem. 24, 1016 -- the exact
+# paper this module's own bond-connectivity comment above already named as the
+# target reference, before this session, when it was unreachable). The database's
+# live index (personalpages.manchester.ac.uk/staff/Richard.Bryce/amber/) still
+# lists the file, but its actual file host (pdrives.manchester.ac.uk) has since
+# been repurposed to a Horde webmail login and returns 404 for every direct file
+# request -- retrieved instead via a live Wayback Machine snapshot dated
+# 2025-12-15 (web.archive.org/web/20251215142629/http://amber.manchester.ac.uk/
+# cof/ATP.prep), confirmed genuine by its NONBON section (frcmod.phos,
+# same source) citing the identical "J Comp Chem 2003, 24, 1016-1025" reference.
+#
+# This codebase only ever creates Particles for heavy atoms actually present in
+# a PDB file (see "United-atom charge correction" below, and the same real-PDB
+# HETATM caveat already noted for ATP's bond-connectivity entry in
+# physics_engine.cpp) -- real deposited ATP HETATM records essentially never
+# resolve hydrogens. So each hydrogen's RESP charge from the source PREP file
+# was folded onto its bonded heavy-atom parent (same "united atom" convention
+# already used for every standard amino acid via missing_hydrogen_charge()
+# below), using the PREP file's own internal Z-matrix parent-atom column to
+# determine H-to-heavy-atom bonding directly from the source, not inferred.
+# Atom names below use the modern prime notation (O5', C5', ...) to match the
+# PDB v3 / RCSB CCD convention already used in physics_engine.cpp's ATP bond
+# template, translating the source file's older "*" notation (O5*, C5*, ...).
+#
+# Verified: summing all 31 united-atom charges below gives exactly -4.0000e,
+# matching ATP's expected ATP4- formal charge (the standard fully-deprotonated
+# form used in this force-field lineage) -- a real internal-consistency check,
+# not just "the file looked plausible."
+#
+# VDW radii/epsilon are intentionally NOT added here -- the source frcmod.phos
+# only covers the phosphate-linker atom types (already cross-validated: its
+# H1/O2/CT values match this file's own VDW_PARAMS exactly), not the several
+# purine/ribose atom types ATP also needs (N*, CK, CQ, ...) that live in the
+# base AMBER94/99 force field, not this phosphate-specific frcmod. Rather than
+# transcribe those from memory (the same risk already declined for ATP's
+# charges before this session), ATP's VDW still goes through
+# amber_params.py's element-based fallback -- unchanged, not a regression.
+for _a, _q in [
+    ("O1G",-0.9526),("PG",  1.2650),("O2G",-0.9526),("O3G",-0.9526),
+    ("O3B",-0.5322),("PB",  1.3852),("O1B",-0.8894),("O2B",-0.8894),
+    ("O3A",-0.5689),("PA",  1.2532),("O1A",-0.8799),("O2A",-0.8799),
+    ("O5'",-0.5987),("C5'", 0.1916),("C4'", 0.2239),("O4'",-0.3548),
+    ("C1'", 0.2401),("N9", -0.0251),("C8",  0.3559),("N7", -0.6073),
+    ("C5",  0.0515),("C6",  0.7009),("N6", -0.0789),("N1", -0.7615),
+    ("C2",  0.6348),("N3", -0.6997),("C4",  0.3053),("C3'", 0.2637),
+    ("O3'",-0.2165),("C2'", 0.1642),("O2'",-0.1953),
+]:
+    PARTIAL_CHARGES[("ATP",_a)] = _q
+
 # ── 금속 이온 파라미터 (Common metal/ion params, P2.1) ───────────────────────
 #
 # PDB HETATM 레코드에 등장하는 일반적인 금속 이온과 단원자 이온에 대한

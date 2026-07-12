@@ -48,11 +48,21 @@ ssl_binaries = [
     for path in glob.glob(os.path.join(ssl_dll_dir, pattern))
 ]
 
+# Vendored 3Dmol.js build (2026-07-13, IMPROVEMENTS.md item #7): replaces the
+# CDN <script src="https://3Dmol.org/..."> tag every 3D view used to embed,
+# which intermittently failed to load inside the embedded QWebEngineView.
+# gui_main._vendor_asset_path() looks for this under sys._MEIPASS/vendor/ in
+# a frozen build, matching the "vendor" destination folder given here.
+vendor_datas = [
+    (path, "vendor")
+    for path in glob.glob(os.path.join(repo_root, "python", "vendor", "*"))
+]
+
 a = Analysis(
     ["python/gui_main.py"],
     pathex=[repo_root, os.path.join(repo_root, "python")],
     binaries=extension_binaries + ssl_binaries,
-    datas=[],
+    datas=vendor_datas,
     hiddenimports=["amber_params", "iupred"],
     hookspath=[],
     hooksconfig={},

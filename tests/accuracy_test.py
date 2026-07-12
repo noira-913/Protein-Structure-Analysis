@@ -286,7 +286,7 @@ def ca_map_from_atoms(atoms, ca_indices, ca_map_keys):
 
 
 def decoy_discrimination(atoms, topo, engine, ca_indices, ca_map, ca_map_keys, n_atoms,
-                          decoy_temp=2.5, relax_steps=20000):
+                          decoy_temp=2.5, relax_steps=20000, gui_main=None, physics_mod=None):
     """Compare a hot-MC decoy against a SAME-BUDGET relaxed-native reference, not
     the raw crystal energy. Raw deposited coordinates routinely carry local
     steric strain (crystallographic model uncertainty, no explicit H, alternate
@@ -325,8 +325,40 @@ def decoy_discrimination(atoms, topo, engine, ca_indices, ca_map, ca_map_keys, n
           f"E = {e_decoy:.1f} kcal/mol ({e_decoy_per_atom:.2f} kcal/mol/atom), "
           f"Calpha RMSD to crystal = {decoy_rmsd:.3f} Å, "
           f"margin over relaxed-native = {margin:+.2f} kcal/mol/atom")
-    return {"e_relaxed_per_atom": e_relaxed_per_atom, "relaxed_rmsd": relaxed_rmsd,
-            "e_decoy_per_atom": e_decoy_per_atom, "decoy_rmsd": decoy_rmsd, "margin": margin}
+    result = {"e_relaxed_per_atom": e_relaxed_per_atom, "relaxed_rmsd": relaxed_rmsd,
+              "e_decoy_per_atom": e_decoy_per_atom, "decoy_rmsd": decoy_rmsd, "margin": margin}
+
+    # Pivot-branch decoy arm (2026-07-13, Phase B of the IMPROVEMENTS.md items
+    # #1+#2 joint investigation): the hot-MC decoy above is documented (see
+    # module docstring point 5) to never actually leave the native basin --
+    # this arm instead uses the same "coarse structural pivot" kick-then-relax
+    # mechanism already built for LandscapeWorker's disabled USE_PIVOT_BRANCH
+    # (gui_main._coarse_pivot), which a same-day smoke test showed CAN produce
+    # a structurally divergent, energetically comparable alternate conformation
+    # (~11-15 A Calpha RMSD from seed on 1UBQ, final energy well within the
+    # ordinary-branch range). Same-budget discipline preserved: the post-kick
+    # relax gets the identical relax_steps budget as the other two arms, at
+    # native T=0.6 (not decoy_temp -- the kick itself, not elevated
+    # temperature, is what's supposed to produce the divergence here).
+    if gui_main is not None and physics_mod is not None and len(topo.concerted_pairs) > 0:
+        rng = np.random.default_rng(0)
+        pivoted, n_applied = gui_main._coarse_pivot(atoms, topo, physics_mod, rng, n_pivots=1)
+        t0 = time.perf_counter()
+        pivot_ens = engine.generate_ensemble(pivoted, topo, 1, relax_steps, 0.6, 0.12)
+        dt_pivot = time.perf_counter() - t0
+        pivot_relaxed = pivot_ens[0]
+        e_pivot = engine.calculate_potential(pivot_relaxed, topo)
+        e_pivot_per_atom = e_pivot / n_atoms
+        pivot_ca_map = ca_map_from_atoms(pivot_relaxed, ca_indices, ca_map_keys)
+        pivot_rmsd = compute_rmsd_generic(ca_map, pivot_ca_map)
+        pivot_margin = e_pivot_per_atom - e_relaxed_per_atom
+        print(f"    pivot-branch decoy ({n_applied} kick(s), T=0.6, {relax_steps} steps, "
+              f"{dt_pivot:.1f}s): E = {e_pivot:.1f} kcal/mol ({e_pivot_per_atom:.2f} "
+              f"kcal/mol/atom), Calpha RMSD to crystal = {pivot_rmsd:.3f} Å, "
+              f"margin over relaxed-native = {pivot_margin:+.2f} kcal/mol/atom")
+        result.update({"e_pivot_per_atom": e_pivot_per_atom, "pivot_rmsd": pivot_rmsd,
+                        "pivot_margin": pivot_margin})
+    return result
 
 
 def run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod, gui_main, mc_steps, tmpdir,
@@ -399,7 +431,8 @@ def run_one(label, uniprot_id, pdb_id, cpu_mod, gpu_mod, gui_main, mc_steps, tmp
     if run_decoy:
         result["decoy"] = decoy_discrimination(atoms, topo, engines[0][1],
                                                  ca_indices, ca_map, ca_map_keys, n_atoms,
-                                                 decoy_temp=decoy_temp, relax_steps=decoy_steps)
+                                                 decoy_temp=decoy_temp, relax_steps=decoy_steps,
+                                                 gui_main=gui_main, physics_mod=cpu_mod)
     return result
 
 
@@ -487,6 +520,8 @@ def main():
               "decoy generator exists. Reported for the record, not as a pass/fail.")
         n_discriminated = 0
         n_with_decoy = 0
+        n_pivot_discriminated = 0
+        n_with_pivot = 0
         for s in summaries:
             decoy = s.get("decoy")
             if decoy is None:
@@ -496,8 +531,23 @@ def main():
             n_discriminated += int(ok)
             print(f"{s['label']:30s} margin = {decoy['margin']:+7.2f} kcal/mol/atom  "
                   f"{'OK -- native scores lower' if ok else 'FLAG -- decoy scores lower than native'}")
+            if "pivot_margin" in decoy:
+                n_with_pivot += 1
+                pivot_ok = decoy["pivot_margin"] > 0
+                n_pivot_discriminated += int(pivot_ok)
+                print(f"{'':30s} pivot-branch margin = {decoy['pivot_margin']:+7.2f} "
+                      f"kcal/mol/atom, RMSD = {decoy['pivot_rmsd']:.2f} Å  "
+                      f"{'OK -- native scores lower' if pivot_ok else 'FLAG -- pivot decoy scores lower than native'}")
         print(f"\n{n_discriminated}/{n_with_decoy} proteins: native scored lower "
               f"(better) than its own hot-MC decoy.")
+        if n_with_pivot:
+            print(f"\nPivot-branch decoy arm (2026-07-13, Phase B): unlike the hot-MC "
+                  f"decoy above, this one DOES produce a structurally divergent decoy "
+                  f"(see IMPROVEMENTS.md items #1/#2) -- its verdicts below ARE "
+                  f"meaningful evidence about ranking ability, not just \"never left "
+                  f"the native basin.\"")
+            print(f"{n_pivot_discriminated}/{n_with_pivot} proteins: native scored "
+                  f"lower (better) than its own pivot-branch decoy.")
 
 
 if __name__ == "__main__":

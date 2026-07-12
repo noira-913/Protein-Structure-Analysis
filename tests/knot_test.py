@@ -22,6 +22,13 @@ multi-chain/large-backbone control existed in this suite before now. fetch_ca_tr
 below now selects only the largest chain rather than pooling every chain in the model,
 matching the fix applied to the real call site (gui_main.py's PipelineWorker.run()).
 
+Deep-knot positive control: ubiquitin C-terminal hydrolase L1 (PDB 2ETL), added
+2026-07-13 alongside extending knot_analysis.KNOWN_KNOTS past trefoil/figure-eight.
+UCH-L1 carries a well-documented 5_2 ("Gordian") knot -- described in the literature
+as one of the most complex knotted folds found in a eukaryotic protein -- so it
+exercises the newly-added 5_2 table entry against a real deposited structure, not
+just the synthetic-curve validation the module's docstring already covers.
+
 Requires internet access (fetches from files.rcsb.org).
 """
 import os
@@ -42,6 +49,7 @@ CASES = [
     ("Hen egg-white lysozyme", "1LYZ", "unknot"),
     ("YibK methyltransferase (SPOUT family)", "1J85", "3_1 (trefoil)"),
     ("Triosephosphate isomerase (TIM barrel)", "1YPI", "unknot"),
+    ("Ubiquitin C-terminal hydrolase L1 (UCH-L1)", "2ETL", "5_2"),
 ]
 
 

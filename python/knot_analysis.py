@@ -379,6 +379,18 @@ KNOWN_KNOTS = {
     (1,): "unknot",
     (1, -1, 1): "3_1 (trefoil)",
     (1, -3, 1): "4_1 (figure-eight)",
+    # Added 2026-07-13 (IMPROVEMENTS.md item #6 re-test): cross-verified against
+    # the primary Knot Atlas table (katlas.org/wiki/<name>), not just recalled --
+    # 5_2: Delta(t) = 2t-3+2/t; 6_1: Delta(t) = -2t+5-2/t; 6_2: Delta(t) =
+    # -t^2+3t-3+3/t-1/t^2; 6_3: Delta(t) = t^2-3t+5-3/t+1/t^2. Coefficients below
+    # are each polynomial's centered-Laurent form after this module's own
+    # leading-coefficient sign normalization (matching how (1,-1,1)/(1,-3,1) above
+    # were derived). The Alexander polynomial doesn't distinguish chirality, same
+    # caveat as the existing trefoil/figure-eight entries.
+    (2, -3, 2): "5_2",
+    (2, -5, 2): "6_1",
+    (1, -3, 3, -3, 1): "6_2",
+    (1, -3, 5, -3, 1): "6_3",
 }
 
 

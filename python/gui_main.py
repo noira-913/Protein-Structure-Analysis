@@ -106,6 +106,30 @@ def _app_base_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _vendor_asset_path(name):
+    """Absolute filesystem path to a locally-vendored third-party web asset.
+
+    Added 2026-07-13 (IMPROVEMENTS.md item #7 re-test) to replace the CDN
+    <script src="https://3Dmol.org/..."> tag every 3D view used to embed:
+    that external fetch intermittently failed inside this app's embedded
+    QWebEngineView ($3Dmol is not defined -- root-caused as specific to
+    constructing the full ProteinApp window, not a code bug in any one
+    view), and vendoring removes the external-network dependency entirely.
+    Source lives at python/vendor/ in dev; PyInstaller (alma.spec) bundles
+    the same folder as vendor/ under sys._MEIPASS in a frozen build.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.join(sys._MEIPASS, "vendor")
+    else:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+    return os.path.join(base, name)
+
+
+# file:// URL for the vendored 3Dmol.js build, embedded via <script src="...">
+# in every 3D-view HTML page generated below (see _vendor_asset_path above).
+_3DMOL_JS_URL = QUrl.fromLocalFile(_vendor_asset_path("3Dmol-min.js")).toString()
+
+
 def _try_gpu_backend():
     """Attempt to import the CUDA extension.  Returns (module, gpu_name) or (None, None)."""
     try:
@@ -1381,7 +1405,7 @@ class PipelineWorker(QThread):
                         f"classifying topology for chain {primary_chain} only "
                         f"(knot type isn't well-defined across separate, non-bonded chains)")
                 ca_coords = np.array(ca_coords_by_chain[primary_chain], dtype=float)
-                knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=12)
+                knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=24)
                 self.progress.emit(
                     f"  Topology: {knot_result.name} "
                     f"({knot_result.crossing_number} crossings, "
@@ -2145,8 +2169,10 @@ class LandscapeWorker(QThread):
 
         disorder_frac (IMPROVEMENTS.md item #7, "disorder-aware sampling"):
         the fraction of residues IUPred predicts disordered (0.0 if
-        unavailable -- e.g. tests/landscape_stability_test.py's synthetic
-        3-identical-seed usage has no sequence info at all). A genuinely
+        unavailable -- e.g. a caller that never computed IUPred scores at
+        all; tests/landscape_stability_test.py DOES have real sequence info
+        from the parsed PDB and passes real scores through as of the
+        2026-07-13 fix, see that file). A genuinely
         disordered region is, by construction, sampling a heterogeneous mix
         of sub-populations rather than fluctuating around one well -- the
         same "DBSCAN needs more pooled points to resolve what's really
@@ -2936,6 +2962,14 @@ class LandscapeWorker(QThread):
                 "energy_min": min(e_vals), "energy_max": max(e_vals),
                 "particles": snapshots[rep_idx],
                 "is_dominant": c is best_comm,
+                # Pooled-snapshot indices belonging to this basin (2026-07-13,
+                # IMPROVEMENTS.md item #7 re-test) -- lets the ensemble overlay
+                # show only this basin's conformers instead of always the whole
+                # pooled trajectory. Stored here (not reconstructed from the
+                # raw `communities` list) because basin_summary is built from
+                # `sig` and then population-sorted, so its index order doesn't
+                # match `communities`' original order.
+                "member_indices": list(c),
             })
         basin_summary.sort(key=lambda b: -b["population"])
 
@@ -3797,7 +3831,7 @@ class ProteinApp(QMainWindow):
                       f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -3869,7 +3903,7 @@ class ProteinApp(QMainWindow):
             right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
@@ -4169,6 +4203,17 @@ class ProteinApp(QMainWindow):
                 "font-size:9px;padding:2px 10px;")
             btn.clicked.connect(lambda _, bi=bi: self._render_basin(bi))
             h.addWidget(btn)
+            # OVERLAY button (2026-07-13, item #7 re-test): spaghetti-plot
+            # view of just this basin's own conformers, reusing
+            # _render_ensemble_overlay's existing rendering via basin_idx --
+            # see _render_basin_overlay.
+            overlay_btn = QPushButton("OVERLAY")
+            overlay_btn.setFixedHeight(20)
+            overlay_btn.setStyleSheet(
+                "background:#7c3aed;color:#fff;border:none;border-radius:3px;"
+                "font-size:9px;padding:2px 10px;")
+            overlay_btn.clicked.connect(lambda _, bi=bi: self._render_basin_overlay(bi))
+            h.addWidget(overlay_btn)
             self._basinpool_v.addWidget(row)
             self._basinpool_rows.append(row)
 
@@ -4182,7 +4227,7 @@ class ProteinApp(QMainWindow):
         n_atoms = len(basin["particles"])
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4261,7 +4306,7 @@ E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
         resi_list = list(range(lo + 1, hi + 2))
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4424,7 +4469,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         n_atoms   = len(particles)
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4651,7 +4696,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             legend = ('<div id="legend">'
                       '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE</div>')
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4730,7 +4775,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             right_info   = f"&#9733; C{best_idx+1} (BEST) &nbsp;&middot;&nbsp; {best_e} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
             right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
@@ -5037,7 +5082,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         pdb_esc = pdb_str.replace("\\", "\\\\").replace("`", "\\`")
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -5089,7 +5134,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         self.view_mode_btn.setVisible(True)
         self.disorder_toggle_btn.setText("⊛  DISORDER")
 
-    def _render_ensemble_overlay(self):
+    def _render_ensemble_overlay(self, basin_idx=None):
         """Overlay a sample of MC trajectory snapshots in one 3Dmol viewer --
         the classic NMR-ensemble "spaghetti plot" view of what the sampled
         conformational ensemble actually looks like in 3D, rather than only
@@ -5108,8 +5153,21 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         while a real disordered region visibly frays red across frames.
         The lowest-energy dominant structure is drawn on top as an opaque
         solid reference.
+
+        basin_idx (2026-07-13, IMPROVEMENTS.md item #7 re-test): when given,
+        restricts the overlay to only that basin_summary entry's member
+        snapshots (via its "member_indices", see run()'s basin_summary
+        construction) instead of the whole pooled multi-branch trajectory --
+        lets a user compare one basin's conformers in isolation rather than
+        always seeing every basin superimposed. None (default) reproduces
+        the original always-pooled behavior unchanged.
         """
         snaps = self._landscape_snaps
+        if basin_idx is not None:
+            if basin_idx >= len(self._basin_summary):
+                return
+            member_indices = self._basin_summary[basin_idx]["member_indices"]
+            snaps = [snaps[i] for i in member_indices if i < len(snaps)]
         if not snaps or not self._ca_indices:
             return
         ca_indices = self._ca_indices
@@ -5163,7 +5221,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
                 f'thickness:0.9,opacity:1.0}}}});\n')
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -5182,7 +5240,8 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   }}
 </style></head><body>
 <div id="v"></div>
-<div id="info">ENSEMBLE OVERLAY &nbsp;&middot;&nbsp; {len(sample_idx)} sampled conformers \
+<div id="info">ENSEMBLE OVERLAY{f' &nbsp;&middot;&nbsp; BASIN {basin_idx+1}' if basin_idx is not None else ''} \
+&nbsp;&middot;&nbsp; {len(sample_idx)} sampled conformers \
 &nbsp;&middot;&nbsp; {n_ca} C&alpha; atoms</div>
 <div id="legend">
   <span style="color:#1d4ed8">&#9632;</span> DOMINANT (reference)
@@ -5200,14 +5259,22 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
 }})();
 </script></body></html>"""
 
+        basin_tag = f' (basin {basin_idx+1})' if basin_idx is not None else ''
         self.viewer_cand_lbl.setText(
-            '<span style="color:#7c3aed;font-weight:bold;">ENSEMBLE OVERLAY</span>'
+            f'<span style="color:#7c3aed;font-weight:bold;">ENSEMBLE OVERLAY{basin_tag}</span>'
             f' &nbsp;·&nbsp; {len(sample_idx)} conformers &nbsp;·&nbsp; '
             'blue=rigid · red=disordered')
         self._set_html(html)
         self._view_stack.setCurrentIndex(0)
         self.view_mode_btn.setVisible(True)
         self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
+
+    def _render_basin_overlay(self, basin_idx):
+        """OVERLAY button in the basin pool (2026-07-13, item #7 re-test) --
+        same spaghetti-plot view as _render_ensemble_overlay, restricted to
+        one basin's own conformers via its member_indices (see run()'s
+        basin_summary construction)."""
+        self._render_ensemble_overlay(basin_idx=basin_idx)
 
     def _toggle_disorder(self):
         if self._view_stack.currentIndex() == 2:

@@ -51,7 +51,8 @@ CASES = [
 ]
 
 
-def run_one(gui_main, protein_physics, QApplication_unused, atoms, ca_indices, topo, seed):
+def run_one(gui_main, protein_physics, QApplication_unused, atoms, ca_indices, topo, seed,
+            iupred_scores=None):
     import numpy as np
 
     engine = protein_physics.PhysicsEngine()
@@ -64,7 +65,7 @@ def run_one(gui_main, protein_physics, QApplication_unused, atoms, ca_indices, t
     # single trajectory -- testing with only 1 branch would under-test it.
     worker = gui_main.LandscapeWorker(
         engine, atoms, ca_indices, topo, protein_physics,
-        extra_seeds=[atoms, atoms])
+        extra_seeds=[atoms, atoms], iupred_scores=iupred_scores)
 
     collected = {}
 
@@ -99,16 +100,30 @@ def main():
     for label, pdb_file, expected, n_repeats in CASES:
         path = os.path.join(DATA_DIR, pdb_file)
         print(f"=== {label} -- expecting {n_repeats}/{n_repeats} {expected} ===")
-        atoms, ca_indices, ca_map, topo, *_rest = gui_main._parse_pdb(
+        atoms, ca_indices, ca_map, topo, iupred_scores, *_rest = gui_main._parse_pdb(
             path, lambda *a: None, protein_physics)
         n_res = len(ca_indices)
-        n_snap, steps = gui_main.LandscapeWorker._adaptive_depth(n_res)
-        print(f"  n_res={n_res}  adaptive depth: {n_snap} snapshots x {steps} steps/branch")
+        # Thread real IUPred scores through to _adaptive_depth/LandscapeWorker
+        # (2026-07-13 fix, IMPROVEMENTS.md item #2 re-test): this harness used
+        # to discard _parse_pdb's iupred_scores via `*_rest`, so every case --
+        # including 1XQ8, the one real IDP this suite is meant to validate --
+        # was tested at the un-boosted, size-only depth rather than the real
+        # disorder-aware depth _start_landscape actually uses in the GUI. A
+        # stale in-code comment on _adaptive_depth claimed this harness "has
+        # no sequence info at all" -- not true; _parse_pdb already computes
+        # real sequence-based IUPred scores from the parsed PDB, they just
+        # weren't being passed through.
+        disorder_frac = (gui_main._iupred.fraction_disordered(iupred_scores)
+                          if iupred_scores else 0.0)
+        n_snap, steps = gui_main.LandscapeWorker._adaptive_depth(n_res, disorder_frac)
+        print(f"  n_res={n_res}  disorder_frac={disorder_frac:.3f}  "
+              f"adaptive depth: {n_snap} snapshots x {steps} steps/branch")
 
         labels, funnels, times = [], [], []
         for i in range(n_repeats):
             idp_label, funnel, dt = run_one(
-                gui_main, protein_physics, QApplication, atoms, ca_indices, topo, seed=i)
+                gui_main, protein_physics, QApplication, atoms, ca_indices, topo, seed=i,
+                iupred_scores=iupred_scores)
             labels.append(idp_label)
             funnels.append(funnel)
             times.append(dt)
