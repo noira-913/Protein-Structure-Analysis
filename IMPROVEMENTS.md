@@ -203,6 +203,95 @@ stopped here per the same discipline rather than continuing to tune angle
 range/pivot count/relax style — a decisive go/no-go was reached, which is
 the actual goal of an exploratory pass like this one.
 
+**Follow-up (2026-07-13): fixed the diagnosed 1XQ8 regression mechanism —
+`USE_PIVOT_BRANCH` is now proven safe, but kept `False` since no ground-truth
+case actually needs it yet.** The joint investigation above diagnosed, but
+didn't fix, why enabling the pivot branch caused 1XQ8 to drop from 3/3 to
+2/3: pivot-branch snapshots were pooled indiscriminately into the same
+`all_snapshots`/`layout` used for the funnel/dominance measurement, so a
+pivot branch that partially relaxed back toward the dominant basin's cluster
+could inflate `funnel = len(best_comm) / N`, reading as artificially more
+"ordered" — the opposite of the intended effect. Of the three follow-up
+candidates this same investigation named (local-minimization quench,
+excluding pivot snapshots from the funnel/dominance denominator, isolating
+the `generate_ensemble`/`run_landscape_trajectory` move-mix discrepancy),
+only the second was attempted this pass: the first requires
+`minimize_torsion`, which no longer exists on this branch (it was just
+deliberately retired as part of closing out the unrelated
+`torsion-gradient-minimizer`/`alternating-gm-mc-relax` investigation, see
+`archive/torsion-gradient-minimizer` — re-implementing a C++ minimizer for a
+different use case is out of scope for a bounded fix); the third is a
+diagnostic, not a fix, and wasn't attempted this pass either — noted here as
+still open, not silently dropped.
+
+**Fix (`LandscapeWorker.run()`, `python/gui_main.py`):** pivot-branch
+snapshots are now tagged with a boolean `pivot_mask` while pooling, and a
+pivot-excluded population basis `N_core` is computed alongside `N`. `funnel`
+and `pop_dominant` (previously two independent computations of the same
+`len(best_comm)/N` formula — fixing only one would have left `pop_threshold`,
+which gates half of the `competitive` OR-test, still polluted) are now both
+computed on the `N_core`/`core_best` basis. The eps/step-displacement
+calibration and the R-hat computation also exclude the pivot branch's own
+internal steps/chain, since neither is "ordinary thermal jitter" or a
+like-for-like Gelman-Rubin comparison. `best_comm` selection, `sig`,
+`communities`/DBSCAN, `global_best_e`, and `competitive`/
+`competitive_structural` are deliberately left on the full pooled `N` —  a
+pivot-discovered basin can still count as evidence of disorder, it just
+can't dilute how dominant the dominant basin looks. When
+`USE_PIVOT_BRANCH=False` (the default both before and after this fix),
+`pivot_mask` is all-`False` and every changed line reduces algebraically to
+its old value — a built-in regression guard, not just a claim.
+
+**One real asymmetry, flagged rather than silently resolved:** a candidate
+basin's own population-ratio check (`len(c) / N`, unchanged) still uses the
+full `N`, while `pop_dominant` now uses the smaller `N_core` — so whenever
+`N_core < N`, `pop_threshold` ends up very slightly *higher* than before.
+This is a directionally conservative (safe) side effect, not a new bias
+toward false positives, but it's a real, deliberate asymmetry worth having
+on record.
+
+**Validation.** Step 1, regression guard: re-ran
+`tests/landscape_stability_test.py` unmodified (`USE_PIVOT_BRANCH` still
+`False`) — 1UBQ 3/3, 1LYZ 3/3, 1YPI 4/4, 1XQ8 3/3, all correct, funnel ranges
+consistent with prior documented baselines. Confirms the refactor is a true
+no-op on the existing default path. Step 2, targeted pivot-on re-test (via a
+runtime monkeypatch of `USE_PIVOT_BRANCH = True`, same technique the
+original smoke test used — not a permanent default change):
+
+| Protein | Repeats | Result | Funnel range | Avg time |
+|---|---|---|---|---|
+| 1XQ8 (the case that broke) | 3 | 3/3 POSSIBLY DISORDERED | 0.320–0.347 | 141.0s |
+| 1UBQ | 3 | 3/3 ORDERED | 0.489–1.000 | 40.6s |
+| 1LYZ | 2 | 2/2 ORDERED | 0.333–0.667 | 102.9s |
+| 1YPI | 1 | 1/1 ORDERED | 0.300 | 379.2s |
+
+1XQ8's pivot-on funnel range (0.320–0.347) now sits almost exactly on top of
+its own no-pivot baseline range from the same session (0.320–0.347) — a
+clean, decisive recovery from the previously-documented outlier (one run at
+funnel=0.720, never seen before or since). No ordered control regressed.
+1YPI's wall time (379.2s) is higher than the ~1.33x a 3→4 branch-count
+increase alone would suggest (its no-pivot baseline this session averaged
+157.5s) — real overhead from the pivot branch's own full relax phase at
+1YPI's scale, not a bug, and still well within a single-run budget.
+
+**Decision: keep `USE_PIVOT_BRANCH = False`, per this item's own
+pre-stated decision rule.** All three "adopt" conditions from the rule were
+individually met (1XQ8 recovers cleanly, no ordered control regresses, the
+~33% compute overhead is acceptable) — but the rule's own second clause
+applies here: **no ground-truth case in the current 4-protein roster
+actually flips from wrong-to-right because of the pivot branch.** The
+no-pivot baseline already passes all 4 cases 100% correctly this session:
+the pivot branch's real, now-proven contribution is that it no longer makes
+things *worse*, not that it's currently needed to make anything *better*.
+Per this item's own stated preference ("prefer conservative: keep off unless
+there's a clear win"), the honest call is to keep the flag off. The code fix
+itself is kept regardless — it's a real, independently-defensible
+measurement-precision correction, not contingent on the flag ever being
+flipped. This ties directly into finding a genuine, currently-uncovered
+large-IDP ground-truth case (tracked separately below): if such a case
+doesn't classify correctly without the pivot branch, that would be the clean
+win this decision is waiting for.
+
 **2. IDP/disorder landscape classification — real-IDP calibration in progress, multiple real bugs found and fixed, not yet closed**
 The population-weighted, multi-branch IDP classifier (see "Completed Work" →
 Analysis for the original design) was calibrated only against stable, ordered

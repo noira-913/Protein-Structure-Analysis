@@ -2413,7 +2413,21 @@ class LandscapeWorker(QThread):
                 rng_seed=n_seed_branches))
         pool.waitForDone()
 
-        all_snapshots, all_energies, branch_lengths = [], [], []
+        # Track which pooled branch (if any) is the pivot branch, so its
+        # snapshots can be excluded from the funnel/dominance denominator
+        # further below (IMPROVEMENTS.md item #1/#2: pivot-branch snapshots
+        # merging into the dominant DBSCAN cluster inflated apparent
+        # single-basin dominance on 1XQ8, the opposite of the intended
+        # effect) while still being eligible for DBSCAN clustering and the
+        # competitive/competitive_structural checks -- a pivot-discovered
+        # basin can still count as evidence of disorder, it just can't
+        # dilute how "dominant" the dominant basin looks. When
+        # USE_PIVOT_BRANCH is False (still the default), pivot_branch_idx
+        # is None and pivot_mask is all-False, making every use of it below
+        # a no-op -- this is the regression guard for the existing no-pivot
+        # path.
+        pivot_branch_idx = n_seed_branches if use_pivot else None
+        all_snapshots, all_energies, branch_lengths, pivot_mask_parts = [], [], [], []
         gpu_fallback_error = None
         for bi in range(n_branches):
             snaps, ens, err = branch_results[bi]
@@ -2424,6 +2438,9 @@ class LandscapeWorker(QThread):
             all_snapshots.extend(snaps)
             all_energies.extend(ens)
             branch_lengths.append(len(snaps))
+            pivot_mask_parts.append(np.full(len(snaps), bi == pivot_branch_idx, dtype=bool))
+        pivot_mask = (np.concatenate(pivot_mask_parts) if pivot_mask_parts
+                      else np.zeros(0, dtype=bool))
 
         if gpu_fallback_error is not None:
             self.progress.emit(
@@ -2435,6 +2452,10 @@ class LandscapeWorker(QThread):
         snapshots = all_snapshots
         energies  = np.array(all_energies, dtype=float)
         N = len(energies)
+        # Pivot-excluded population basis for the funnel/dominance measurement
+        # (see pivot_mask comment above). Falls back to N itself whenever no
+        # pivot branch ran.
+        N_core = int((~pivot_mask).sum()) if pivot_mask.size else N
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")
 
@@ -2504,14 +2525,23 @@ class LandscapeWorker(QThread):
         # have settled into different pictures of the landscape and haven't
         # mixed yet. R-hat near 1.0 means they agree. Conventional rule of
         # thumb: R-hat < 1.1 is considered converged.
+        # Exclude the pivot branch's chain from R-hat -- it deliberately
+        # starts from a different (kicked) state than the other branches, so
+        # including it isn't a like-for-like Gelman-Rubin comparison
+        # (IMPROVEMENTS.md item #1/#2). R-hat is already documented as
+        # informational only, not load-bearing in the classification
+        # decision, so this is a correctness nicety, not a critical fix.
         r_hat = None
-        if len(branch_lengths) >= 2 and min(branch_lengths) >= 2:
-            n_chain = min(branch_lengths)
+        core_branch_lengths = [length for bi, length in enumerate(branch_lengths)
+                                if bi != pivot_branch_idx]
+        if len(core_branch_lengths) >= 2 and min(core_branch_lengths) >= 2:
+            n_chain = min(core_branch_lengths)
             pc1 = layout[:, 0]
             chains = []
             offset = 0
-            for length in branch_lengths:
-                chains.append(pc1[offset:offset + n_chain])
+            for bi, length in enumerate(branch_lengths):
+                if bi != pivot_branch_idx:
+                    chains.append(pc1[offset:offset + n_chain])
                 offset += length
             chains = np.array(chains)  # shape (m branches, n_chain samples)
             m = chains.shape[0]
@@ -2562,9 +2592,15 @@ class LandscapeWorker(QThread):
         # seeds) -- they aren't real consecutive steps, and including them
         # would inject spurious "large jumps" into the eps calibration
         # whenever multi-branch seeds happen to be far apart structurally.
+        # Also exclude the pivot branch's own internal steps here (in addition
+        # to the ordinary inter-branch boundary exclusion above) -- its
+        # trajectory is a deliberate large kick + relax, not ordinary thermal
+        # jitter, and including it would inflate step_scale/eps, making
+        # DBSCAN more likely to merge the pivot branch's relaxed points into
+        # the dominant cluster (IMPROVEMENTS.md item #1/#2).
         diffs, offset = [], 0
-        for length in branch_lengths:
-            if length > 1:
+        for bi, length in enumerate(branch_lengths):
+            if length > 1 and bi != pivot_branch_idx:
                 diffs.append(np.linalg.norm(
                     np.diff(layout[offset:offset + length], axis=0), axis=1))
             offset += length
@@ -2671,7 +2707,17 @@ class LandscapeWorker(QThread):
         # anything representative -- population is the more meaningful
         # anchor either way.
         best_comm = max(sig, key=len) if sig else max(communities, key=len)
-        funnel    = len(best_comm) / N
+        # funnel measures how dominant the dominant basin is. Computed on the
+        # pivot-excluded N_core/core_best basis (falls back to the full N when
+        # no pivot branch ran, i.e. pivot_mask is all-False) -- otherwise a
+        # pivot branch that partially relaxes back into the dominant basin's
+        # cluster would inflate this and read as artificially more "ordered"
+        # (the diagnosed cause of the 1XQ8 regression, IMPROVEMENTS.md item
+        # #1/#2). best_comm/sig/communities themselves are left on the full
+        # pooled set -- a pivot-discovered basin still counts as a real basin.
+        core_best = (int(sum(1 for i in best_comm if not pivot_mask[i]))
+                     if pivot_mask.size else len(best_comm))
+        funnel = core_best / N_core if N_core else len(best_comm) / N
 
         # 지배적 분지의 대표 구조 — 분류 단계의 구조적 변위 필터(아래)와
         # 이후 동적 후보 탐색 단계 둘 다에서 쓰므로 여기서 한 번만 계산한다.
@@ -2752,7 +2798,16 @@ class LandscapeWorker(QThread):
         # landscape), the bar for a competitor drops right along with it; when
         # the dominant is sharply peaked, the bar rises correspondingly.
         POP_RATIO_THRESHOLD = 0.4
-        pop_dominant   = len(best_comm) / N
+        # Same quantity as funnel above (both were len(best_comm)/N
+        # independently before this fix) -- reuse it rather than recompute on
+        # a different basis, or pop_threshold below would stay polluted by
+        # pivot-branch snapshots even after funnel itself was fixed
+        # (IMPROVEMENTS.md item #1/#2). Note: candidate basins' own ratio
+        # check just below (len(c)/N) intentionally stays on the full N, not
+        # N_core -- so when N_core < N, pop_threshold ends up very slightly
+        # higher than before, a directionally conservative (safe) side
+        # effect, not a new bias toward false positives.
+        pop_dominant   = funnel
         pop_threshold  = SIG_FLOOR + POP_RATIO_THRESHOLD * (pop_dominant - SIG_FLOOR)
 
         competitive = [c for c in sig
