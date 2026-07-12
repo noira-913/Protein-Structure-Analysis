@@ -1664,6 +1664,117 @@ own ~31 atoms, not a blowup or NaN. Confirms the new charges are actually
 being read (1061/1079 particles carry non-zero charge) and integrate cleanly
 with the rest of the energy function.
 
+**Second re-test pass (2026-07-13, same session): ADP/GTP/GDP RESP charges
+sourced and shipped (closing the exact gap F1 above flagged as
+"decoupled from the RESP-charge blocker" — turns out it wasn't actually
+blocked, just never re-checked), plus HEM and NAD — 5 of the 6 remaining
+open cofactor-charge gaps closed in one pass. FAD/PLP/AMP charges remain
+genuinely blocked, documented rather than left silent.**
+
+**Corrected assumption from the prior pass: the Manchester index does list
+ADP/GTP/GDP, under ATP's own "revised phosphate parameters (Carlson)"
+family.** F1 above stated "no Manchester-DB source has ever been identified
+for these four's charges" for AMP/ADP/GTP/GDP — re-checking the live index
+directly (rather than trusting the prior session's characterization)
+overturned that for three of the four: `ADP.prep`, `GTP.prep`, `GDP.prep`
+are listed right alongside `ATP.prep`, all sharing the same `frcmod.phos`
+already cross-validated for ATP. Retrieved via the identical Wayback
+snapshot URL pattern, same host/date as ATP's own source. AMP has no entry
+in this family (or anywhere else in the index) — still genuinely blocked,
+not re-attempted beyond confirming that absence.
+
+**HEM (heme b) and NAD(+) charges also sourced, same index, different
+citation lineages** — HEM from the "all-atom heme" entry (`heme_all.in`,
+citing Giammona's original heme force field, further described in the file
+as "Yves names, Bayly-modified" — Bayly being a RESP-method co-author, a
+credible, checkable attribution). NAD from the Ryde-parameter entry
+(`nad+.prep`, "AMBER 5.0 compatible; U. Ryde, to be published, 22/4-98"). A
+second NAD candidate, the "Walker parameters" `NAD+.lib`, was fetched and
+**rejected** — its own internal residue label is `NDP` (RCSB's code for
+NADP+, a different molecule with an extra phosphate), not `NAD`, a real
+identity mismatch caught by actually reading the file's contents rather than
+trusting its listed filename. This is exactly the kind of failure mode this
+item's own established caution was written to catch.
+
+**Two real, nontrivial verification challenges, both resolved and both
+worth recording as method, not just result:**
+  - **HEM's charges are listed in a separate positional `CHARGE` block**,
+    not inline per atom-line like every other source file used so far —
+    mapped back onto atom names by counting position against the file's own
+    atom listing (verified: 73 charges for 73 real atoms, excluding the 3
+    `DUMM` placeholders). All 43 heavy-atom names matched
+    `physics_engine.cpp`'s existing HEM bond-template names exactly with no
+    remapping needed (both sources independently ended up using the same
+    "Yves names" convention).
+  - **NAD's source file uses a different atom-naming convention entirely**
+    from `physics_engine.cpp`'s RCSB-CCD-derived bond template (Ryde's
+    Z-matrix-walk names like `C'N1`/`C'A5` vs. the CCD's `*B`/`*D`
+    ribose-suffix convention) — unlike ATP/ADP/GTP/GDP's mechanical `*` → `'`
+    notation swap, this needed a real atom-by-atom correspondence built from
+    connectivity, not string similarity. Traced by matching each source
+    atom's bonded neighborhood (from the PREP file's Z-matrix bond column
+    plus its explicit `LOOP` ring-closure records) against
+    `physics_engine.cpp`'s bond graph. Notably, the nicotinamide-ring and
+    adenine-ring atom names turned out to already be identical between the
+    two sources — only the two ribose-sugar atom groups and the
+    phosphate-bridge atoms needed real remapping.
+
+**Verified, same bar as ATP, now automated instead of one-off manual
+checks.** New `tests/charge_validation_test.py` (previously nothing existed
+— `bridge_test.py`'s `test_charges` is unrelated arbitrary data,
+`accuracy_test.py` has no charge checks at all) runs three checks per
+ligand, for all 6 ligands with real charges (ATP, ADP, GTP, GDP, HEM, NAD):
+
+| Ligand | Charge sum | Expected | Atom coverage | A/B energy shift |
+|---|---|---|---|---|
+| ATP | -4.0000e | ATP4- | 31/31 exact | +0.355 kcal/mol/atom |
+| ADP | -3.0000e | ADP3- | 27/27 exact | +0.048 kcal/mol/atom |
+| GTP | -4.0000e | GTP4- | 32/32 exact | +0.404 kcal/mol/atom |
+| GDP | -3.0000e | GDP3- | 28/28 exact | +0.243 kcal/mol/atom |
+| HEM | -2.0000e | heme b, both propionates ionized | 43/43 exact | +0.406 kcal/mol/atom |
+| NAD | -1.0000e | NAD+ (pyridinium +1, 2 phosphodiesters -1 each) | 44/44 exact | +0.348 kcal/mol/atom |
+
+All 18 checks (6 ligands × 3 checks) pass. The charge-sum numbers are a
+strong independent signal beyond "the file looked plausible": every one is
+an exact round number matching a known, named formal-charge state (ADP3-,
+GTP4-, GDP3- all fit the same fully-deprotonated convention ATP4- already
+established; heme b's -2 matches the standard both-propionates-ionized
+convention; NAD+'s -1 matches the textbook pyridinium/phosphodiester
+accounting) — a transcription or atom-remapping error would be very unlikely
+to land on a clean integer by chance, especially for NAD's hand-traced
+cross-source remapping. Atom coverage is exact (no missing, no extra) for
+every ligand against a real deposited reference structure (ATP: 2P0X, ADP:
+1ATR, GTP: 2RAP, GDP: 1Q21, HEM: 1C53, NAD: 7YW4 — each confirmed via RCSB's
+public search/ligand APIs to genuinely contain the ligand before use, not
+guessed from memory). A/B energy shifts are all modest and physically sane
+(0.048-0.406 kcal/mol/atom), in the same range as ATP's own original
+validation, confirming the new charges integrate cleanly rather than
+blowing up. `tests/bridge_test.py` re-run clean after every wiring step.
+
+**FAD, PLP, and AMP charges remain blocked — documented, not silently
+skipped:**
+  - **FAD**: the Manchester index's only FAD-related entry is a
+    Stuchebrukhov "FADH-" (reduced anion) library. Fetched and inspected —
+    its own internal atom set includes generic peptide-like `N`/`C`/`O`
+    atoms, suggesting a covalently-linked residue variant, not a standalone
+    ligand. This is a real charge-state *and* likely structural-context
+    mismatch against `physics_engine.cpp`'s standalone oxidized-FAD bond
+    template, not just a naming inconvenience — stopped here rather than
+    risk shipping charges for the wrong redox/binding state.
+  - **PLP**: confirmed (again, directly re-checked rather than trusted from
+    the prior pass) to have no entry anywhere in the Manchester index.
+  - **AMP**: also confirmed to have no entry, including in the
+    ADP/GTP/GDP/ATP "revised phosphate parameters" family that unexpectedly
+    covered the other three nucleotides this pass.
+
+VDW radii/epsilon were **not** added for any of ADP/GTP/GDP/HEM/NAD this
+pass, same deliberate boundary as ATP (the source `frcmod.phos` only covers
+phosphate-linker atom types; HEM's Fe/porphyrin VDW and NAD's own atom types
+weren't independently verified this session) — charge and `(radius,
+epsilon)` are independent lookups in `get_atom_params()`, so this is not a
+regression, just an open remaining gap, same category as ATP's own
+still-open VDW note above.
+
 **5. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
 a low-ε bilayer-region model; no such model exists yet. Low priority — no membrane

@@ -646,6 +646,162 @@ for _a, _q in [
 ]:
     PARTIAL_CHARGES[("ATP",_a)] = _q
 
+# ── ADP/GTP/GDP (2026-07-13, IMPROVEMENTS.md item #4 re-test) ──────────────────
+#
+# Same Manchester AMBER Parameter Database / Wayback-recovery method as ATP
+# above, and the same "revised phosphate parameters (Carlson)" family --
+# ADP.prep/GTP.prep/GDP.prep share ATP's own frcmod.phos (already
+# cross-validated for ATP), each retrieved from the identical URL pattern
+# (web.archive.org/web/20251215142629/http://amber.manchester.ac.uk/cof/
+# <name>.prep). Atom names use the same "*"-notation as ATP's own source file,
+# translated to the modern prime notation to match physics_engine.cpp's
+# bond-template atom names, and hydrogens folded onto their heavy-atom parent
+# the same united-atom way (source PREP Z-matrix parent column, not inferred).
+#
+# Verified: ADP's 27 united-atom charges sum to exactly -3.0000e (ADP3-),
+# GTP's 32 sum to exactly -4.0000e (GTP4-), GDP's 28 sum to exactly -3.0000e
+# (GDP3-) -- all three the standard fully-deprotonated forms in this
+# force-field lineage, matching ATP4-'s own convention. VDW intentionally not
+# added, same reasoning/gap as ATP (frcmod.phos only covers the
+# phosphate-linker atom types, not the purine/ribose ones).
+for _a, _q in [
+    ("O1B",-0.9552),("PB",  1.3672),("O2B",-0.9552),("O3B",-0.9552),
+    ("O3A",-0.6346),("PA",  1.4929),("O1A",-0.9474),("O2A",-0.9474),
+    ("O5'",-0.6579),("C5'", 0.1916),("C4'", 0.2239),("O4'",-0.3548),
+    ("C1'", 0.2401),("N9", -0.0251),("C8",  0.3559),("N7", -0.6073),
+    ("C5",  0.0515),("C6",  0.7009),("N6", -0.0789),("N1", -0.7615),
+    ("C2",  0.6348),("N3", -0.6997),("C4",  0.3053),("C3'", 0.2637),
+    ("O3'",-0.2165),("C2'", 0.1642),("O2'",-0.1953),
+]:
+    PARTIAL_CHARGES[("ADP",_a)] = _q
+for _a, _q in [
+    ("O1G",-0.9526),("PG",  1.2650),("O2G",-0.9526),("O3G",-0.9526),
+    ("O3B",-0.5322),("PB",  1.3852),("O1B",-0.8894),("O2B",-0.8894),
+    ("O3A",-0.5689),("PA",  1.2532),("O1A",-0.8799),("O2A",-0.8799),
+    ("O5'",-0.5987),("C5'", 0.1916),("C4'", 0.2239),("O4'",-0.3548),
+    ("C1'", 0.2197),("N9",  0.0492),("C8",  0.3014),("N7", -0.5709),
+    ("C5",  0.1744),("C6",  0.4770),("O6", -0.5597),("N1", -0.1363),
+    ("C2",  0.7657),("N2", -0.0944),("N3", -0.6323),("C4",  0.1222),
+    ("C3'", 0.2637),("O3'",-0.2165),("C2'", 0.1642),("O2'",-0.1953),
+]:
+    PARTIAL_CHARGES[("GTP",_a)] = _q
+for _a, _q in [
+    ("O1B",-0.9552),("PB",  1.3672),("O2B",-0.9552),("O3B",-0.9552),
+    ("O3A",-0.6346),("PA",  1.4929),("O1A",-0.9474),("O2A",-0.9474),
+    ("O5'",-0.6579),("C5'", 0.1916),("C4'", 0.2239),("O4'",-0.3548),
+    ("C1'", 0.2197),("N9",  0.0492),("C8",  0.3014),("N7", -0.5709),
+    ("C5",  0.1744),("C6",  0.4770),("O6", -0.5597),("N1", -0.1363),
+    ("C2",  0.7657),("N2", -0.0944),("N3", -0.6323),("C4",  0.1222),
+    ("C3'", 0.2637),("C2'", 0.1642),("O2'",-0.1953),("O3'",-0.2165),
+]:
+    PARTIAL_CHARGES[("GDP",_a)] = _q
+
+# ── HEM (2026-07-13, IMPROVEMENTS.md item #4 re-test) ───────────────────────────
+#
+# Real RESP-style partial charges for heme b, sourced from the Manchester
+# AMBER Parameter Database's "all-atom heme" entry (heme_all.in, citing
+# Giammona's original 1984 heme force field, further described in the file
+# itself as "Yves names, Bayly-modified" -- Bayly is a co-author of the
+# original RESP method, a credible, independently-checkable attribution, not
+# just a plausible-looking name). Retrieved via the same live Wayback
+# snapshot as ATP/ADP/GTP/GDP above.
+#
+# Unlike ATP/ADP/GTP/GDP, this source file's charges are listed in a separate
+# sequential CHARGE block (not inline per atom-line) -- mapped back onto atom
+# names by position, in the same order as the file's own MAINCHAIN/branch
+# atom listing (verified: 73 charges for 73 real atoms, excluding the 3 DUMM
+# placeholders). All 43 heavy-atom names in the source file match
+# physics_engine.cpp's HEM bond-template names exactly (same "Yves names"
+# convention both independently ended up using), so no cross-source atom
+# remapping was needed here, unlike NAD below. Hydrogens (the propionate/
+# methyl/vinyl/meso CH's -- this is an "all atom" heme entry, i.e. it
+# includes explicit sidechain H's that real deposited HEM HETATM records
+# essentially never resolve) folded onto their bonded heavy-atom parent via
+# the source file's own Z-matrix bond column, same united-atom convention as
+# every other ligand in this file.
+#
+# Verified: all 43 united-atom charges sum to exactly -2.0000e, matching the
+# standard AMBER convention for heme b with both propionate groups
+# deprotonated (physiological pH) -- the Fe center's own charge (+0.25, a
+# partial/RESP-fit value, not a formal ionic charge) is consistent with a
+# six-coordinate ligand-bound heme, per the source file's own header note.
+# VDW intentionally not added (same reasoning as every other ligand here --
+# no independently-verified source found this pass for Fe/porphyrin VDW
+# radii specifically).
+for _a, _q in [
+    ("FE", 0.2500),("NA",-0.1800),("C1A",0.0300),("C2A",-0.0200),
+    ("CAA",0.0400),("CBA",-0.1000),("CGA",0.3000),("O1A",-0.5000),
+    ("O2A",-0.5000),("C3A",0.0200),("CMA",-0.0400),("C4A",0.0200),
+    ("CHB",0.0400),("C1B",0.0300),("NB",-0.1800),("C2B",0.0200),
+    ("CMB",-0.0400),("C3B",-0.0500),("CAB",0.0200),("CBB",-0.1000),
+    ("C4B",0.0200),("CHC",0.0400),("C1C",0.0300),("NC",-0.1800),
+    ("C2C",0.0200),("CMC",-0.0400),("C3C",-0.0500),("CAC",0.0300),
+    ("CBC",-0.1000),("C4C",0.0200),("CHD",0.0400),("C1D",0.0300),
+    ("ND",-0.1800),("C2D",0.0200),("CMD",-0.0400),("C3D",-0.0200),
+    ("C4D",0.0200),("CHA",0.0400),("CAD",0.0400),("CBD",-0.1000),
+    ("CGD",0.3000),("O1D",-0.5000),("O2D",-0.5000),
+]:
+    PARTIAL_CHARGES[("HEM",_a)] = _q
+
+# ── NAD (2026-07-13, IMPROVEMENTS.md item #4 re-test) ───────────────────────────
+#
+# Real RESP partial charges for NAD+, sourced from the Manchester AMBER
+# Parameter Database's Ryde-parameter entry (nad+.prep/nad.frcmod, "AMBER 5.0
+# compatible; U. Ryde, to be published, 22/4-98"), same Wayback-recovery
+# method as the ligands above. A second Manchester entry ("Walker
+# parameters", NAD+.lib) was checked and rejected -- its own internal residue
+# label is "NDP" (RCSB's code for NADP+, a different molecule with an extra
+# ribose phosphate), not "NAD", a real identity mismatch caught by reading
+# the file rather than trusting its listed filename.
+#
+# Ryde's file uses a different atom-naming convention than
+# physics_engine.cpp's RCSB-CCD-derived NAD bond template (Z-matrix walk
+# names like C'N1/C'A5 vs. the CCD's B/D ribose-suffix convention) -- unlike
+# ATP/ADP/GTP/GDP's trivial "*" to "'" notation swap, this needed a real
+# atom-by-atom correspondence built from connectivity, not string similarity.
+# Traced by matching each source atom's bonded neighborhood (from the PREP
+# file's own Z-matrix bond column, plus its explicit LOOP ring-closure
+# records) against physics_engine.cpp's bond graph -- notably, the
+# nicotinamide-ring and adenine-ring atom names (N1N/C2N/.../C7N/O7N/N7N and
+# N9A/C8A/.../C4A) turned out to be identical in both sources already, so
+# only the two ribose-sugar atom groups (Ryde's C'N*/O'N* -> this file's
+# *D-suffix; Ryde's C'A*/O'A* -> this file's *B-suffix) and the
+# phosphate-bridge atoms needed real remapping. Hydrogens folded onto their
+# bonded heavy-atom parent the same united-atom way as every ligand above.
+#
+# Verified two independent ways: the remapping produces exactly the 44 heavy
+# atom names physics_engine.cpp's own NAD bond template uses (44/44, no
+# extras, no gaps), and the 44 united-atom charges sum to exactly -1.0000e --
+# matching NAD+'s standard literature net charge (a +1 pyridinium nicotinamide
+# ring, two singly-ionized phosphodiester linkages at -1 each, net
+# +1-1-1=-1). Getting a clean round-number match on a manually-traced,
+# cross-source atom remapping is real, independent evidence the mapping
+# itself is correct, not just plausible-looking. VDW intentionally not added,
+# same reasoning as the ligands above.
+for _a, _q in [
+    ("PA", 1.3729),("O1A",-0.8558),("O2A",-0.8558),("O5B",-0.5661),
+    ("O3",-0.5760),("C5B", 0.1916),("C4B", 0.2239),("O4B",-0.3548),
+    ("C3B", 0.2637),("O3B",-0.2165),("C2B", 0.1642),("O2B",-0.1953),
+    ("C1B", 0.2401),("N9A",-0.0251),("C8A", 0.3559),("N7A",-0.6073),
+    ("C5A", 0.0515),("C6A", 0.7009),("N6A",-0.0789),("N1A",-0.7615),
+    ("C2A", 0.6348),("N3A",-0.6997),("C4A", 0.3053),
+    ("PN",  1.3729),("O1N",-0.8558),("O2N",-0.8558),("O5D",-0.5661),
+    ("C5D", 0.1916),("C4D", 0.2239),("O4D",-0.3548),("C3D", 0.2637),
+    ("O3D",-0.2165),("C2D", 0.1642),("O2D",-0.1953),("C1D", 0.3995),
+    ("N1N", 0.0831),("C2N", 0.1914),("C6N", 0.2613),("C3N",-0.2345),
+    ("C7N", 0.8217),("O7N",-0.5428),("N7N",-0.1066),("C4N", 0.2968),
+    ("C5N",-0.0539),
+]:
+    PARTIAL_CHARGES[("NAD",_a)] = _q
+
+# FAD/PLP/AMP RESP charges: still blocked, same pass. The Manchester DB's
+# only FAD entry is a Stuchebrukhov "FADH-" (reduced anion) library whose own
+# internal atom set includes generic peptide-like N/C/O atoms suggesting a
+# covalently-linked residue variant -- a real charge-state/identity mismatch
+# against physics_engine.cpp's standalone oxidized-FAD template, not
+# attempted. PLP and AMP have no entry in the Manchester DB index at all.
+# See IMPROVEMENTS.md item #4 for the full writeup.
+
 # ── 금속 이온 파라미터 (Common metal/ion params, P2.1) ───────────────────────
 #
 # PDB HETATM 레코드에 등장하는 일반적인 금속 이온과 단원자 이온에 대한
