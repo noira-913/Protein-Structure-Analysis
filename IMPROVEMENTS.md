@@ -1441,6 +1441,88 @@ costs ~200s/run × 4) since the isolated 1XQ8 re-run already isolates and
 confirms the fix; re-running the full suite is cheap to do in any future
 session that touches `LandscapeWorker` again.
 
+**Large single-chain IDP calibration gap (2026-07-13): a real, bounded,
+database-driven search — no qualifying candidate found, gap stays open.**
+The calibration roster has exactly one real IDP (1XQ8, 140 res); every prior
+note on this gap ("genuine large IDPs mostly have no single deposited
+structure at all") was a general impression, never backed by an actual
+search of a disorder-specific database. This pass ran one.
+
+**Method: DisProt's full region-level dataset (3,337 curated disorder
+regions), queried programmatically, not eyeballed.** Fetched
+`disprot.org/api/search` (region_content=disorder, current release) and
+filtered for regions with (a) a real PDB cross-reference, (b) NMR-based
+evidence (`nuclear magnetic resonance ... evidence used in manual
+assertion`, DisProt's own evidence-code text), (c) region length ≥100
+residues, then separately re-ran without the NMR-evidence-code filter (in
+case a real NMR structure existed under a differently-worded evidence
+annotation) for any region ≥140 residues with any PDB cross-reference at
+all, to avoid missing a candidate due to DisProt's own annotation
+completeness.
+
+**Result: the NMR-evidenced query surfaced only sub-140-residue fragments**
+(the largest, PopZ's N-terminal domain at 133 residues via PDB 6XRY, sits
+just under this suite's own 140-residue floor) — no genuinely large,
+NMR-backed, single continuous disordered region exists in DisProt's curated
+set. **The broader, evidence-code-agnostic query surfaced ~200 regions
+≥140 residues with a PDB cross-reference, but essentially all of them are
+"disordered because unresolved" fragments inside much larger ordered
+assemblies** (spliceosome subunits, RNA Pol II C-terminal domains,
+nucleoporins, huntingtin-HAP40 complex fragments, membrane-protein
+intracellular loops) — crystallographic/cryo-EM missing-density annotations
+within a folded macromolecular complex, not standalone free-chain disorder
+of the kind this test roster needs. Applying the disqualification checklist
+(free/monomeric, not complex-bound; genuinely literature-documented
+disorder, not just "missing density"; full claimed chain length, not a
+fragment; multi-model NMR) eliminated every one of them.
+
+**Individually investigated, named candidates — each disqualified for a
+concrete, checkable reason:**
+  - **apoE3 (PDB 2L7B, 307 res)**: an ordered four-helix-bundle N-domain +
+    defined hinge helix + C-domain, per its own structural description —
+    real IDR character in specific regions, not genuine free-chain disorder
+    across the molecule. A plausible-by-size-alone candidate that fails on
+    inspection.
+  - **TDP-43 C-terminal low-complexity domain (PDB 2N2C, DisProt-annotated
+    region 263-414, 152 res)**: the actual deposited structure is titled
+    "NMR Structure of TDP-43 prion-like hydrophobic helix **in DPC**"
+    (dodecylphosphocholine, a micelle-forming detergent) — the same
+    micelle-induced-order caveat 1XQ8 itself already carries, not an
+    improvement on the existing case, and likely covers only a short
+    helical sub-segment of the full 152-residue DisProt-annotated span, not
+    the whole region as a free ensemble.
+  - **Alpha-synuclein via PDB 2KKW (140 res)**: same protein, same length as
+    the existing 1XQ8 case — doesn't extend the roster's size coverage even
+    if it were adopted.
+  - **Tau (largest isoform, 441 res) — the most obvious "famous large IDP"
+    candidate, checked explicitly and ruled out**: confirmed via literature
+    search that full-length free-monomer tau has **no PDB deposit at all**
+    — "full-length tau monomeric structures are not typically deposited in
+    the PDB... complete high-resolution structures of the free full-length
+    monomer remain elusive due to tau's intrinsic disorder" (its NMR
+    chemical-shift data lives in BMRB, entry 50701, not as a PDB structure).
+    Existing PDB entries for tau are fragments bound to microtubules or
+    other partners, not the free full-length chain — disqualified on the
+    same "needs a real PDB deposit of the free form" ground as tau's own
+    literature already states plainly.
+
+**Conclusion: the gap remains open, and this is now a verified, not
+assumed, negative result.** A bounded, database-driven search (DisProt's
+full curated set, ~200+ size-qualifying PDB cross-references individually
+categorized, plus 4 explicitly-named candidates checked one by one) found
+no single-chain, free-form, real-PDB-backed IDP larger than the existing
+140-residue 1XQ8 case. This confirms rather than merely repeats the prior
+impression: genuinely large IDPs overwhelmingly lack a deposited structure
+of their free form precisely because they're disordered — the same property
+that makes them scientifically interesting to this classifier is also what
+keeps them out of the PDB. No new test case was added to
+`tests/landscape_stability_test.py`'s `CASES` list this pass, since adding
+a wrong or borderline ground-truth label would be worse than leaving the
+gap open (a coin-flip label the suite would then trust as ground truth).
+Revisit if a genuine candidate surfaces later — the search method above
+(DisProt's region-level API, filtered and cross-checked the way described)
+is reusable and cheap to re-run.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
