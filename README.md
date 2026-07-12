@@ -245,6 +245,12 @@ Non-amino-acid HETATM records are not silently discarded:
 - **Other ligands/cofactors** are kept, using element-symbol-based
   fallback VDW parameters (full GAFF2 small-molecule parameterization is
   not yet implemented — see [Known Limitations](#known-limitations)).
+  ATP is the exception: it carries real AMBER-derived RESP partial
+  charges (Manchester AMBER parameter database, verified against the
+  source paper, summing to the exact ATP4− formal charge), and
+  AMP/ADP/GTP/GDP have RCSB CCD-sourced bond-connectivity templates —
+  though these four still fall back to element-based VDW/charge
+  parameters rather than their own RESP charges.
 
 ### Disulfide Bonds
 
@@ -343,10 +349,11 @@ established protein-topology tools (KnotProt, Topoly):
    Vandermonde-solve approach was found to be numerically unstable past
    ~15 crossings).
 5. **Classification** against a small table of known Alexander
-   polynomials — currently the unknot, trefoil (3₁), and figure-eight
-   (4₁) are named with confidence; anything else is reported as
-   "unidentified" along with its crossing number and raw polynomial
-   rather than risk a mislabeled result.
+   polynomials — currently the unknot, trefoil (3₁), figure-eight (4₁),
+   5₂, 6₁, 6₂, and 6₃ are named with confidence (cross-verified against
+   the Knot Atlas); anything else is reported as "unidentified" along
+   with its crossing number and raw polynomial rather than risk a
+   mislabeled result.
 
 This is scoped to the Alexander polynomial only. The chirality-sensitive
 **Jones polynomial** (needs a Kauffman bracket recursion) and **Khovanov
@@ -385,6 +392,12 @@ log (no dedicated visualization panel yet).
 │   src/physics_engine_cuda.cu — optional GPU backend                │
 │     • Compiled separately by nvcc as protein_physics_cuda          │
 │     • gui_main.py imports it opportunistically, falls back to CPU  │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  protein_analysis  (pybind11 C++ extension)                       │
+│     • src/analysis_ext.cpp — ensemble-metrics + knot-topology      │
+│       hot loops (internal scaling, contact maps, KMT reduction,    │
+│       crossing detection) ported from Python for large speedups    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -439,6 +452,12 @@ device memory — see [Known Limitations](#known-limitations).
    spread. Also produces per-residue RMSF (root-mean-square
    fluctuation across the trajectory) as a trajectory-based disorder
    signal, shown alongside the sequence-based IUPred prediction.
+   For proteins flagged as disordered, it additionally computes
+   polymer-physics ensemble descriptors — radius of gyration (Rg),
+   end-to-end distance, an internal scaling-law fit (ν, from Rg vs.
+   sequence separation), and a per-residue contact-frequency map —
+   shown in a dedicated 4-panel figure, plus a per-basin 3D ensemble
+   overlay view colored by RMSF.
 ```
 
 ---
@@ -497,8 +516,9 @@ python tests/bridge_test.py
 ```
 src/physics_engine.cpp        C++ CPU physics engine (pybind11 module: protein_physics)
 src/physics_engine_cuda.cu    Optional CUDA GPU backend (protein_physics_cuda)
+src/analysis_ext.cpp          C++ ensemble-metrics/knot-topology hot loops (pybind11 module: protein_analysis)
 src/main.cpp                  Minimal pybind11 example/sanity module
-python/gui_main.py            PyQt6 desktop application
+python/gui_main.py            PyQt6 desktop application (vendors 3Dmol.js locally for all 3D views)
 python/amber_params.py        AMBER ff14SB atom-type / charge / ion parameter tables
 python/iupred.py              Sequence-based disorder predictor
 python/knot_analysis.py       Backbone knot topology classification (Alexander polynomial)
@@ -530,8 +550,10 @@ items:
   the full particle array between Python and the GPU on every snapshot,
   rather than keeping the trajectory resident in device memory.
 - **Small-molecule ligands**: non-ion HETATM records use element-based
-  fallback parameters rather than a full GAFF2 force field; common
-  cofactors (ATP, heme, NAD⁺, FAD, PLP) are not specially parameterized.
+  fallback parameters rather than a full GAFF2 force field. ATP has real
+  RESP charges and heme/NAD⁺/FAD/PLP/AMP/ADP/GTP/GDP have bond
+  connectivity templates, but AMP/ADP/GTP/GDP still use fallback
+  VDW/charge parameters rather than their own RESP charges.
 - **No membrane/lipid environment**: the implicit-solvent model assumes
   uniform bulk water everywhere, so membrane protein regions are not
   treated with a lower-dielectric slab.
@@ -541,9 +563,10 @@ items:
   current move set.
 - **Knot classification is Alexander-polynomial-only**: chirality
   (left/right-handed knots) is indistinguishable without the Jones
-  polynomial, and only 3 knot types (unknot, 3₁, 4₁) are named
-  explicitly — deeper knots are reported as "unidentified" with their
-  correct-but-unnamed polynomial rather than a possibly-wrong label.
+  polynomial, and only 7 knot types (unknot, 3₁, 4₁, 5₂, 6₁, 6₂, 6₃) are
+  named explicitly — deeper knots are reported as "unidentified" with
+  their correct-but-unnamed polynomial rather than a possibly-wrong
+  label.
 
 ## References
 
