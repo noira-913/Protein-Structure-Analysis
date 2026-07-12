@@ -1523,6 +1523,66 @@ Revisit if a genuine candidate surfaces later — the search method above
 (DisProt's region-level API, filtered and cross-checked the way described)
 is reusable and cheap to re-run.
 
+**Follow-up (2026-07-13, same day): PED's real query backend investigated
+(inconclusive, documented rather than abandoned silently), and the
+disqualification criteria re-examined — a real second IDP found and
+adopted, though it doesn't close the "large" gap above.**
+
+Tried to reach PED (Protein Ensemble Database)'s actual browse/search API,
+since PED is purpose-built for exactly this and the search above only
+covered DisProt. PED's frontend is a client-rendered Angular SPA; found a
+real backend host (`deposition.proteinensemble.org`, discovered via the
+frontend's own JS bundle) but it returns proper 404s for every guessed
+`/api/...` route rather than serving data — reading the bundle further
+identified this host as PED's *deposition* (submission) service, not the
+browse/search index; the actual query endpoint was not found via
+server-side route-guessing alone (would need a browser's network inspector
+to observe the real call, not available in this session). Documented as
+"tried, not reachable this way" rather than left unmentioned.
+
+**Re-examined the disqualification checklist itself and found the
+140-residue floor had been applied too rigidly** to one genuinely strong
+candidate surfaced by the DisProt search but discarded earlier purely on
+size: **PopZΔ134-177** (PDB 6XRY), the N-terminal domain of *Caulobacter
+vibrioides* polar organizing protein Z. Re-reading the source paper (Holmes
+et al. 2020, PMC7736533) directly rather than trusting the DisProt
+region-length number: this is a deliberately truncated construct studied
+*because* it doesn't self-assemble (the genuine free/unbound monomer state,
+not induced by a micelle or binding partner — a stronger claim than 1XQ8's
+own deposit, which is micelle-bound), described as "unstructured in
+solution, with the exception of a small amphipathic α-helix" spanning only
+~8 residues (M10-I17) — i.e. almost the entire construct is genuinely
+disordered, not just a region within it. Passes every substantive item on
+the disqualification checklist (free/monomeric, literature-documented,
+whole-construct not a fragment-within-a-complex, multi-model solution NMR).
+**Re-checked the actual deposited file directly rather than trusting the
+paper's construct name**: `SEQRES` in the fetched PDB confirms chain A is
+**141 residues**, not the 133 implied by "Δ134-177" naming alone — this
+does clear the 140-residue floor, by one residue, though only barely; it
+should not be read as meaningfully extending size coverage toward the
+"large" (200-300+ residue) gap this item is actually about.
+
+**Added as a second IDP calibration case, `tests/landscape_stability_test.py`
+`CASES`, and validated: 3/3 correctly POSSIBLY DISORDERED, funnel = 0.333
+in all three runs** — an unusually tight, fully reproducible result (tighter
+than 1XQ8's own 0.320-0.347 range this session). `data/6XRY.pdb` fetched
+from RCSB and bundled alongside the other 4 structures (no internet access
+needed to run the suite). This is the calibration roster's first addition
+to the real-IDP side since 1XQ8 — previously every disorder-detection
+finding rested on a single example; a second, independent, differently-
+folded real IDP gives the "detects real disorder" side of this classifier's
+validation the same N≥2 redundancy the ordered side already had (1UBQ,
+1LYZ, 1YPI).
+
+**The genuinely large (>200-300 res) gap remains open** — PopZ doesn't
+close it, and the structural reason named in the search above (NMR spectral
+crowding scaling unfavorably with disordered chain length, making full-chain
+assignment progressively harder exactly where coverage is most wanted)
+still applies. This is now two independent, real-database-driven search
+passes (DisProt region-level + an attempted PED backend probe) that found
+nothing at that scale — treated as a stable, not provisional, conclusion
+absent a new deposited structure appearing.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer

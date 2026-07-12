@@ -48,6 +48,16 @@ CASES = [
     ("1LYZ (lysozyme, 129 res)",        "1LYZ.pdb", "ORDERED", 3),
     ("1YPI (triosephosphate isomerase, 494 res)", "1YPI.pdb", "ORDERED", 4),
     ("1XQ8 (alpha-synuclein, 140 res, real IDP)", "1XQ8.pdb", "POSSIBLY DISORDERED", 3),
+    # Added 2026-07-13 (IMPROVEMENTS.md item #2 follow-up): a second real IDP,
+    # found via a database-driven DisProt search after 1XQ8 was the only real
+    # IDP in the calibration roster. PopZ-Delta134-177 (Caulobacter vibrioides
+    # polar organizing protein Z, N-terminal domain, PDB 6XRY, 141 res per
+    # SEQRES) -- solution NMR of the truncated, non-self-assembling construct,
+    # i.e. the genuine free/unbound state (not induced by a micelle or binding
+    # partner, unlike 1XQ8's own micelle-bound deposit). Literature-documented
+    # as unstructured except one ~8-residue amphipathic MoRF helix (M10-I17)
+    # (Holmes et al. 2020, J Mol Biol, PMC7736533).
+    ("6XRY (PopZ N-terminal domain, 141 res, real IDP)", "6XRY.pdb", "POSSIBLY DISORDERED", 3),
 ]
 
 
