@@ -5049,14 +5049,17 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         """Load the MC best structure into 3Dmol colored by per-residue RMSF (B-factor).
         MC 최저 에너지 구조를 잔기별 RMSF(B-인수)로 색칠해 3Dmol로 렌더링.
 
-        RMSF 값을 PDB B-인수(온도 인수) 필드에 저장해 3Dmol의 bwr 그래디언트로 표시:
+        RMSF 값을 PDB B-인수(온도 인수) 필드에 저장해 3Dmol의 rwb 그래디언트로 표시:
           파란색(blue) = RMSF 낮음 = 딱딱한(rigid) 구조 영역
           흰색(white)  = 중간 유연성
           빨간색(red)  = RMSF 높음 = 유연/무질서 영역
 
-        RMSF stored in PDB B-factor field; 3Dmol's bwr gradient maps:
+        RMSF stored in PDB B-factor field; 3Dmol's rwb gradient maps:
           blue → rigid (low RMSF), white → intermediate, red → flexible/disordered.
-        Colour scale: 0 → 4.0 Å (clamped).
+        Colour scale: 0 → 4.0 Å (clamped). (Gradient name is "rwb" -- matching the
+        vendored 3Dmol.js's actual registered builtin gradient key, confirmed
+        2026-07-13 after a live GUI run surfaced "bwr" as invalid -- see
+        IMPROVEMENTS.md item #7.)
         """
         if self._rmsf is None or not self._ensemble:
             return
@@ -5113,11 +5116,11 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   var m=v.addModel(`{pdb_esc}`,"pdb");
   m.setStyle({{}},{{
     cartoon:{{
-      colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
       thickness:0.8,opacity:1.0
     }},
     sphere:{{
-      colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
       radius:0.55,opacity:1.0
     }}
   }});
@@ -5148,7 +5151,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         genuinely rigid core would look just as scattered as a real
         disordered tail, since torsion-angle MC has no reason to keep a
         fixed absolute pose across a trajectory. Frames are colored by the
-        same per-residue RMSF (b-factor, bwr gradient) already used for
+        same per-residue RMSF (b-factor, rwb gradient) already used for
         COLOR BY FLEXIBILITY, so the rigid core stays visibly steady/blue
         while a real disordered region visibly frays red across frames.
         The lowest-energy dominant structure is drawn on top as an opaque
@@ -5208,7 +5211,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             models_js.append(
                 f'  var m{k}=v.addModel(`{pdb_esc}`,"pdb");\n'
                 f'  m{k}.setStyle({{}},{{cartoon:{{'
-                f'colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},'
+                f'colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},'
                 f'thickness:0.5,opacity:0.30}}}});\n')
 
         ref_js = ""
