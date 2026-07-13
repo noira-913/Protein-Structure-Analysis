@@ -1,4 +1,4 @@
-name: Release portable ALMA.exe
+name: Release portable ALMA builds
 
 on:
   push:
@@ -174,4 +174,86 @@ jobs:
           files: |
             dist/ALMA.exe
             ALMA-windows-portable.zip
+          generate_release_notes: true
+
+  # Added 2026-07-13 -- there was no macOS build at all before this (the
+  # released .exe is a Windows-only PyInstaller build; running it on a Mac
+  # needs Wine/CrossOver, which isn't tested or supported). setup.py's
+  # CUDA/OpenMP auto-detection was already fully cross-platform (find_cuda()
+  # simply finds nothing on macOS; has_openmp() correctly detects Apple
+  # clang's lack of -fopenmp support and falls back to a single-threaded
+  # build) -- confirmed by reading setup.py before writing this job, not
+  # assumed. alma.spec needed real fixes first (see its own history): the
+  # extension-file glob only matched Windows .pyd files, and the SSL-DLL
+  # bundling logic assumed a Windows-only DLLs directory layout -- both
+  # fixed to be platform-conditional before this job was added.
+  #
+  # No GPU backend here: CUDA is NVIDIA/Windows-only, not applicable to any
+  # Mac. Only covers Apple Silicon (macos-latest, arm64) -- an Intel Mac job
+  # (macos-13) would be a separate addition if that's ever needed, not
+  # covered here.
+  #
+  # Unsigned and not notarized (no Apple Developer account configured in
+  # this project) -- Gatekeeper will block the downloaded binary on first
+  # launch ("cannot be opened because the developer cannot be verified").
+  # Users need to right-click -> Open (or `xattr -d com.apple.quarantine
+  # ALMA` from Terminal) to run it the first time. Same category of
+  # tradeoff already accepted for the unsigned Windows .exe (SmartScreen
+  # warning), not a new compromise introduced here.
+  build-macos-app:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime + build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build protein_physics/protein_analysis extensions (CPU only)
+        run: python setup.py build_ext --inplace
+
+      # Basic build-sanity check -- this platform has never been built on
+      # before, so verify both the file and that it actually loads (catches
+      # a real dynamic-linking issue, e.g. a bad rpath, that a bare
+      # existence check would miss) rather than only discovering a problem
+      # once PyInstaller packages it or, worse, only when a real user runs
+      # the shipped app.
+      - name: Verify extensions were built and import cleanly
+        run: |
+          ls protein_physics.cpython-312-*.so
+          ls protein_analysis.cpython-312-*.so
+          python -c "import protein_physics, protein_analysis; protein_physics.PhysicsEngine(); print('Both extensions import and construct cleanly.')"
+
+      - name: Build portable ALMA app
+        run: pyinstaller alma.spec --noconfirm --clean
+
+      - name: Package release zip
+        run: |
+          chmod +x dist/ALMA
+          zip -j ALMA-macos-portable.zip dist/ALMA
+
+      # continue-on-error: matches the same reasoning as the Windows job's
+      # identical step -- this upload is a convenience artifact only, not a
+      # dependency of the real release step below.
+      - name: Upload build artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ALMA-macos-portable
+          path: ALMA-macos-portable.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ALMA
+            ALMA-macos-portable.zip
           generate_release_notes: true
