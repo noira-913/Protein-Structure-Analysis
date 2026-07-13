@@ -147,7 +147,21 @@ jobs:
       - name: Package release zip
         run: Compress-Archive -Path dist/ALMA.exe -DestinationPath ALMA-windows-portable.zip
 
+      # continue-on-error (2026-07-13): this step's only purpose is a
+      # downloadable workflow artifact for manual workflow_dispatch runs
+      # without a tag -- the "Create GitHub Release" step below reads
+      # dist/ALMA.exe and the zip directly from the runner's local
+      # filesystem, not from this uploaded artifact, so it has never
+      # actually depended on this step succeeding. Found the hard way: a
+      # v0.8.0 tag push hit "Artifact storage quota has been hit" here
+      # (account-wide Actions artifact storage, recalculated only every
+      # 6-12 hours per GitHub's own error message, so even freeing quota
+      # by deleting old artifacts doesn't clear it immediately) and it
+      # failed the whole job, silently skipping the real release two
+      # steps later even though every file needed for it already existed
+      # on disk.
       - name: Upload build artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ALMA-windows-portable
