@@ -1574,6 +1574,43 @@ folded real IDP gives the "detects real disorder" side of this classifier's
 validation the same N≥2 redundancy the ordered side already had (1UBQ,
 1LYZ, 1YPI).
 
+**Correction (2026-07-13, same day, merge-readiness audit): the "3/3, tight
+and reproducible" claim above did not hold up under further independent
+re-runs — genuinely unstable, not a coin-flip fluke of a small sample.**
+Re-ran the identical, unmodified test 9 more times across two independent
+batches while auditing this branch for a merge into `main`: **6/9 correct
+(67%)**, funnel range **0.272-0.358** — noticeably wider than, and
+overlapping, the original 0.320-0.347 claim, and straddling right across
+the classifier's own ORDERED/POSSIBLY-DISORDERED boundary. Concretely,
+funnel=0.296 produced the correct label in one run and the wrong label in
+another — the funnel score alone doesn't cleanly separate these two labels
+for this protein at this sampling depth, the same failure mode
+`COMPETITIVE_KT`/pop-ratio tuning and the structural-displacement gate were
+built to catch for other cases, but evidently not fully closed here. First
+confirmed this wasn't a seed-reproducibility bug in the test harness itself:
+`PhysicsEngine()` seeds its internal `std::mt19937` from
+`std::random_device{}()` (`physics_engine.cpp:2236`), not from anything
+`np.random.seed()`-controlled, so every "repeat run" in this entire test
+suite — and every repeat-run investigation in this file's history — was
+always a genuinely independent stochastic draw; that's the correct,
+intended design (matches real unseeded GUI usage), not something to fix.
+**This means the original commit's 3/3 result was real but was drawn from
+too small a sample (n=3) to characterize a case that sits this close to the
+decision boundary** — the same category of already-documented issue as
+pre-fix 1LYZ (a genuine coin-flip case, root-caused to insufficient MC
+sampling depth, not a classification-logic bug) and the still-open
+non-stationary-MC-chain finding from item #1's history. Not treated as a
+reason to revert the PopZ addition (6XRY is still a real, literature-
+documented, correctly-parsed IDP structure, and the classifier gets it right
+more often than not), but the roster entry's reliability should be read as
+"real IDP, borderline-stable detection" rather than "solidly validated" —
+and `tests/landscape_stability_test.py`'s own `CASES` entry for 6XRY is a
+known-flaky assertion (currently still asserts 3/3), not a green,
+trustworthy gate, until the same sampling-depth work already scoped
+elsewhere in this item lands. Flagging here rather than leaving the
+overclaim standing, per this file's own established practice of correcting
+prior entries when new evidence contradicts them.
+
 **The genuinely large (>200-300 res) gap remains open** — PopZ doesn't
 close it, and the structural reason named in the search above (NMR spectral
 crowding scaling unfavorably with disordered chain length, making full-chain

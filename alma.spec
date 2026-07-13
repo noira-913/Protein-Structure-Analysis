@@ -19,9 +19,16 @@ repo_root = os.path.abspath(SPECPATH)
 # Bundle whichever compiled physics extensions match the build interpreter.
 # The CUDA variant is optional — only picked up if present (e.g. built
 # locally with the CUDA toolkit installed); CI builds are CPU-only.
+# protein_analysis (2026-07-13, IMPROVEMENTS.md item #7 performance follow-up)
+# was missing from this list until merge-readiness audit found it: gui_main.py
+# imports it for accelerated ensemble-metrics/knot-classification code and
+# falls back to pure Python silently if absent, so the gap never crashed —
+# it would have just silently shipped every portable .exe build without the
+# 14x-1628x speedup this extension exists for.
 extension_binaries = [
     (path, ".")
-    for pattern in ("protein_physics*.pyd", "protein_physics_cuda*.pyd")
+    for pattern in ("protein_physics*.pyd", "protein_physics_cuda*.pyd",
+                     "protein_analysis*.pyd")
     for path in glob.glob(os.path.join(repo_root, pattern))
 ]
 

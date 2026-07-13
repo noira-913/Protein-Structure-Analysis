@@ -57,6 +57,19 @@ CASES = [
     # partner, unlike 1XQ8's own micelle-bound deposit). Literature-documented
     # as unstructured except one ~8-residue amphipathic MoRF helix (M10-I17)
     # (Holmes et al. 2020, J Mol Biol, PMC7736533).
+    #
+    # KNOWN FLAKY (2026-07-13, merge-readiness audit): the original 3/3
+    # result this case shipped with did not reproduce -- 9 further
+    # independent repeats (two batches, unmodified code) landed at 6/9
+    # correct (67%), funnel range 0.272-0.358 straddling the classifier's
+    # own decision boundary (the *same* funnel value produced both labels
+    # in different runs). Root cause is the same already-documented,
+    # already-deferred short-MC-chain sampling-depth limitation as pre-fix
+    # 1LYZ, not a bug in this test or the classification logic -- see
+    # IMPROVEMENTS.md item #2's 2026-07-13 correction note. A FAIL on this
+    # one case alone is expected/known, not necessarily a new regression --
+    # check whether 1UBQ/1LYZ/1YPI/1XQ8 also regressed before concluding
+    # something broke.
     ("6XRY (PopZ N-terminal domain, 141 res, real IDP)", "6XRY.pdb", "POSSIBLY DISORDERED", 3),
 ]
 
