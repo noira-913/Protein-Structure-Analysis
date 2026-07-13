@@ -82,6 +82,17 @@ from amber_params import missing_hydrogen_charge as _amber_missing_h_charge
 import iupred as _iupred
 import knot_analysis as _knot
 
+# Optional C++/OpenMP-accelerated backend for the two O(n_ca^2)-per-snapshot
+# ensemble metrics (_compute_internal_scaling's mean-distance matrix,
+# _compute_contact_map's contact-frequency matrix) -- see
+# IMPROVEMENTS.md item #7. Falls back to the pure-Python loops in this file
+# when the extension has not been built (same fallback convention as
+# protein_physics_cuda's optional GPU backend).
+try:
+    import protein_analysis as _analysis_ext
+except ImportError:
+    _analysis_ext = None
+
 
 def _app_base_dir():
     """Root directory for locating the sibling ``data`` folder.
@@ -93,6 +104,30 @@ def _app_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _vendor_asset_path(name):
+    """Absolute filesystem path to a locally-vendored third-party web asset.
+
+    Added 2026-07-13 (IMPROVEMENTS.md item #7 re-test) to replace the CDN
+    <script src="https://3Dmol.org/..."> tag every 3D view used to embed:
+    that external fetch intermittently failed inside this app's embedded
+    QWebEngineView ($3Dmol is not defined -- root-caused as specific to
+    constructing the full ProteinApp window, not a code bug in any one
+    view), and vendoring removes the external-network dependency entirely.
+    Source lives at python/vendor/ in dev; PyInstaller (alma.spec) bundles
+    the same folder as vendor/ under sys._MEIPASS in a frozen build.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.join(sys._MEIPASS, "vendor")
+    else:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+    return os.path.join(base, name)
+
+
+# file:// URL for the vendored 3Dmol.js build, embedded via <script src="...">
+# in every 3D-view HTML page generated below (see _vendor_asset_path above).
+_3DMOL_JS_URL = QUrl.fromLocalFile(_vendor_asset_path("3Dmol-min.js")).toString()
 
 
 def _try_gpu_backend():
@@ -683,7 +718,7 @@ def _ensemble_ca_map(ref_ca_map, ca_indices, particles):
                 ca_map[key] = np.array([p.x, p.y, p.z])
     return ca_map
 
-def _kabsch_align_points(ref_pts, mobile_pts):
+def _kabsch_align_points(ref_pts, mobile_pts, fit_mask=None):
     """ref_pts, mobile_pts: (n,3) arrays of the same points in
     correspondence (same order, no keys needed). Returns mobile_pts
     optimally Kabsch-rotated/translated onto ref_pts' frame.
@@ -697,9 +732,25 @@ def _kabsch_align_points(ref_pts, mobile_pts):
     coordinates without this conflates "real conformational difference"
     with "same shape, different orientation" -- exactly the bug already
     fixed once for the external layered 3D view (see _render_external_layered).
+
+    fit_mask: optional boolean array (same length as ref_pts/mobile_pts)
+    selecting which points determine the fitted rotation -- e.g. an
+    IUPred-predicted rigid "core" subset. The rotation is still APPLIED to
+    every point in mobile_pts; only the least-squares fit itself is
+    restricted. Needed whenever part of the point set is genuinely mobile
+    (a disordered region): fitting on the full set lets that motion
+    contaminate the rotation itself ("the alignment chases the tail"),
+    which can both inflate apparent RMSF in the truly rigid part and mask
+    the disordered region's own real motion. Falls back to using every
+    point if fit_mask is None or selects fewer than 3 points (Kabsch needs
+    >=3 non-degenerate points to define a rotation).
     """
-    ref_c, mob_c = ref_pts.mean(0), mobile_pts.mean(0)
-    p0, q0 = ref_pts - ref_c, mobile_pts - mob_c
+    if fit_mask is not None and np.count_nonzero(fit_mask) >= 3:
+        fit_ref, fit_mob = ref_pts[fit_mask], mobile_pts[fit_mask]
+    else:
+        fit_ref, fit_mob = ref_pts, mobile_pts
+    ref_c, mob_c = fit_ref.mean(0), fit_mob.mean(0)
+    p0, q0 = fit_ref - ref_c, fit_mob - mob_c
     H = q0.T @ p0
     U, _, Vt = np.linalg.svd(H)
     d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
@@ -848,7 +899,7 @@ def _aligned_pdb_text(path, ref_ca_map):
     writer.save(buf, select=_NotNucleicAcidOrWater())
     return buf.getvalue()
 
-def _compute_rmsf(snapshots, ca_indices):
+def _compute_rmsf(snapshots, ca_indices, iupred_scores=None, core_threshold=0.5):
     """Per-Cα root-mean-square fluctuation (Å) across all trajectory snapshots.
     궤적 스냅샷 전체에 걸친 잔기별 Cα RMSF (Å).
 
@@ -856,6 +907,12 @@ def _compute_rmsf(snapshots, ca_indices):
                   LandscapeWorker의 MC 스냅샷 목록 (각 원소 = 입자 목록)
     ca_indices  — index of each Cα atom inside each particle list
                   각 Cα 원자의 입자 목록 내 인덱스
+    iupred_scores — optional, per-residue IUPred disorder score (same order/
+                  length as ca_indices). When given, the Kabsch alignment fit
+                  is restricted to the IUPred-predicted-ordered "core"
+                  (score < core_threshold) -- see _kabsch_align_points'
+                  fit_mask docstring for why. None (default) aligns on every
+                  Cα, matching the original behavior.
 
     Returns a 1-D array of length len(ca_indices).  High RMSF values indicate
     flexible or disordered regions.
@@ -899,15 +956,250 @@ def _compute_rmsf(snapshots, ca_indices):
     # "highly flexible" even when the actual fold barely changes. Same
     # principle as the layered-view/basin-comparison Kabsch fixes
     # elsewhere in this file.
+    #
+    # Fitting the rotation itself on ALL Cα atoms has a second, separate
+    # problem when a real disordered region is present: the least-squares
+    # fit gets dragged around by that region's motion ("the alignment
+    # chases the tail"), contaminating the reference frame used to measure
+    # every residue's fluctuation -- including the genuinely rigid core.
+    # Restrict the fit to IUPred-predicted-ordered residues when available
+    # (a signal available pre-MC, purely sequence-derived, so it can't be
+    # circularly biased by the RMSF it's used to compute), then apply that
+    # fitted rotation to all Cα atoms via _kabsch_align_points' fit_mask.
+    fit_mask = None
+    if iupred_scores is not None and len(iupred_scores) == n_ca:
+        fit_mask = np.asarray(iupred_scores) < core_threshold
     ref = coords[0]
     aligned = np.empty_like(coords)
     aligned[0] = ref
     for si in range(1, n_snaps):
-        aligned[si] = _kabsch_align_points(ref, coords[si])
+        aligned[si] = _kabsch_align_points(ref, coords[si], fit_mask=fit_mask)
 
     mean_pos = aligned.mean(axis=0)                          # [n_ca, 3]
     diff     = aligned - mean_pos[np.newaxis]                # [n_snaps, n_ca, 3]
     return np.sqrt((diff ** 2).sum(axis=2).mean(axis=0))   # [n_ca]
+
+
+def _compute_radius_of_gyration(snapshots, ca_indices):
+    """Per-snapshot Cα radius of gyration (Å):
+    Rg_t = sqrt( mean_i |r_i(t) - r_mean(t)|^2 ).
+
+    Unweighted Cα-based, matching this codebase's other residue-level
+    ensemble metrics (RMSF). Rotation/translation-invariant by
+    construction -- unlike RMSF, no Kabsch alignment is needed (Rg only
+    depends on each snapshot's own internal shape, not its absolute pose).
+
+    A compact, ordered fold should show a tight Rg distribution; a real
+    IDP's more open, fluctuating ensemble should show a wider one -- see
+    _compute_internal_scaling for the more discriminating polymer-scaling
+    companion metric.
+
+    Returns a 1-D array of length len(snapshots).
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca == 0:
+        return np.array([])
+    rg = np.empty(n_snaps)
+    for si, particles in enumerate(snapshots):
+        coords = np.array([[particles[pidx].x, particles[pidx].y, particles[pidx].z]
+                            for pidx in ca_indices if pidx < len(particles)])
+        if len(coords) == 0:
+            rg[si] = np.nan
+            continue
+        centroid = coords.mean(0)
+        rg[si] = np.sqrt(((coords - centroid) ** 2).sum(1).mean())
+    return rg
+
+
+def _compute_end_to_end(snapshots, ca_indices):
+    """Per-snapshot N-to-C terminal Cα-Cα distance (Å) -- the other classic
+    polymer-physics ensemble descriptor alongside Rg. Rotation/translation-
+    invariant, no alignment needed.
+
+    Returns a 1-D array of length len(snapshots).
+    """
+    n_snaps = len(snapshots)
+    if n_snaps == 0 or len(ca_indices) < 2:
+        return np.array([])
+    i0, i1 = ca_indices[0], ca_indices[-1]
+    dist = np.empty(n_snaps)
+    for si, particles in enumerate(snapshots):
+        if i0 < len(particles) and i1 < len(particles):
+            p0, p1 = particles[i0], particles[i1]
+            dist[si] = np.sqrt((p0.x - p1.x) ** 2 + (p0.y - p1.y) ** 2 + (p0.z - p1.z) ** 2)
+        else:
+            dist[si] = np.nan
+    return dist
+
+
+def _snapshots_to_coord_array(snapshots, ca_indices):
+    """Build the (n_snaps, n_ca, 3) float64 array both accelerated ensemble
+    metrics (below) need as input to protein_analysis's C++ functions --
+    factored out once rather than duplicated in both fallback loops."""
+    n_snaps, n_ca = len(snapshots), len(ca_indices)
+    coords = np.zeros((n_snaps, n_ca, 3), dtype=float)
+    for si, particles in enumerate(snapshots):
+        for ci, pidx in enumerate(ca_indices):
+            if pidx < len(particles):
+                p = particles[pidx]
+                coords[si, ci] = [p.x, p.y, p.z]
+    return coords
+
+
+def _compute_internal_scaling(snapshots, ca_indices, min_sep=3):
+    """Ensemble-averaged internal distance scaling law: <R_ij> ~ |i-j|^nu,
+    the standard polymer-physics descriptor for distinguishing compact
+    globules (nu ~ 0.33), ideal/random-coil chains (nu ~ 0.5), and
+    expanded/self-avoiding disordered chains (nu ~ 0.6) -- computed from a
+    SINGLE protein's own conformational ensemble via its internal residue-
+    pair separations (Marsh & Forman-Kay 2010, Biophys J), unlike an
+    Rg-vs-chain-length scaling fit, which would need many different-length
+    proteins' ensembles to fit at all.
+
+    Computes the ensemble-mean Cα-Cα distance for every residue pair via
+    protein_analysis.compute_mean_dist_matrix (C++/OpenMP) when that
+    extension is built, else a pure-Python per-snapshot loop (bounding
+    memory to O(n_ca^2) rather than O(n_snaps * n_ca^2) -- this codebase's
+    larger cases, e.g. 1YPI at n_ca~500, would otherwise need a multi-GB
+    broadcast array). Bins by sequence separation |i-j|, then fits
+    log<R_ij> = log(R0) + nu*log(|i-j|) via ordinary least squares over
+    separations >= min_sep (excludes the shortest separations, where local
+    bond/dihedral geometry rather than long-range chain statistics
+    dominates the mean distance).
+
+    Returns (seps, mean_dists, nu, log_r0, r_squared) -- seps/mean_dists are
+    1-D arrays (one entry per distinct |i-j| present), nu/log_r0 are the
+    fitted scaling exponent/prefactor, r_squared is the fit's goodness of
+    fit on the log-log data. Returns (array([]), array([]), None, None,
+    None) if there aren't enough residues or snapshots to fit.
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca < min_sep + 2:
+        return np.array([]), np.array([]), None, None, None
+
+    if _analysis_ext is not None:
+        coord_arr = _snapshots_to_coord_array(snapshots, ca_indices)
+        mean_dist_matrix = _analysis_ext.compute_mean_dist_matrix(coord_arr)
+    else:
+        mean_dist_matrix = np.zeros((n_ca, n_ca), dtype=float)
+        for particles in snapshots:
+            coords = np.zeros((n_ca, 3), dtype=float)
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[ci] = [p.x, p.y, p.z]
+            diff = coords[:, None, :] - coords[None, :, :]         # [n_ca, n_ca, 3]
+            mean_dist_matrix += np.sqrt((diff ** 2).sum(-1))
+        mean_dist_matrix /= n_snaps
+
+    # Bin by separation via np.diagonal rather than a full-matrix boolean
+    # mask per separation. mean_dist_matrix is symmetric, so the old
+    # `mean_dist_matrix[seps_all == sep]` approach summed BOTH the upper
+    # and lower diagonal at each offset -- two copies of the same (i,i+sep)
+    # values, which doesn't change the mean but costs an O(n_ca^2) mask
+    # comparison per separation (O(n_ca^3) total over the whole loop).
+    # np.diagonal(matrix, offset=sep) reads the same numbers directly in
+    # O(n_ca-sep) with no comparison pass at all -- O(n_ca^2) total,
+    # mathematically identical output (verified: max diff ~5e-17 on a
+    # synthetic symmetric matrix, floating-point noise). This was the
+    # actual bottleneck at large n_ca once the matrix build itself moved
+    # to C++ (IMPROVEMENTS.md item #7): at n_ca=1500 the old binning loop
+    # alone took 2.18s, ~9x longer than the C++-accelerated matrix build.
+    seps, mean_dists = [], []
+    for sep in range(min_sep, n_ca):
+        diag = np.diagonal(mean_dist_matrix, offset=sep)
+        if diag.size > 0:
+            seps.append(sep)
+            mean_dists.append(diag.mean())
+    seps = np.array(seps, dtype=float)
+    mean_dists = np.array(mean_dists, dtype=float)
+
+    if len(seps) < 3:
+        return seps, mean_dists, None, None, None
+
+    log_sep, log_dist = np.log(seps), np.log(mean_dists)
+    A = np.vstack([log_sep, np.ones_like(log_sep)]).T
+    (nu, log_r0), _residuals, *_rest = np.linalg.lstsq(A, log_dist, rcond=None)
+    pred = A @ np.array([nu, log_r0])
+    ss_res = float(np.sum((log_dist - pred) ** 2))
+    ss_tot = float(np.sum((log_dist - log_dist.mean()) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else None
+
+    return seps, mean_dists, float(nu), float(log_r0), r_squared
+
+
+def _compute_contact_map(snapshots, ca_indices, cutoff=8.0):
+    """Per-residue-pair contact frequency across the ensemble (Cα-Cα
+    distance < cutoff Å), plus a per-residue "contact variance" summary --
+    a structural-promiscuity metric complementary to RMSF.
+
+    RMSF measures how far a residue's POSITION strays from its mean in a
+    fixed (Kabsch-aligned) reference frame, which becomes shakier the more
+    genuinely disordered a region is -- a residue sampling many unrelated
+    environments doesn't have a well-defined "mean position" even after the
+    core-restricted alignment fix above. Contact frequency instead asks
+    "which residues is this one near," which stays meaningful without any
+    global alignment at all (only relative Cα-Cα distances, computed per
+    snapshot, are used) -- a residue that contacts a shifting, inconsistent
+    set of partners across the ensemble is a real disorder signal even when
+    RMSF's alignment-dependent answer for it is noisy.
+
+    Computed via protein_analysis.compute_contact_freq_matrix (C++/OpenMP)
+    when that extension is built, else a pure-Python per-snapshot loop
+    (same O(n_ca^2)-at-a-time pattern as _compute_internal_scaling, to
+    avoid an O(n_snaps * n_ca^2) broadcast array).
+
+    Returns (contact_freq, per_residue_variance):
+    - contact_freq: [n_ca, n_ca] array, fraction of snapshots each residue
+      pair is in contact.
+    - per_residue_variance: [n_ca] array. For each residue i, treats each
+      partner j's contact_freq[i,j] as a Bernoulli probability and averages
+      p_ij*(1-p_ij) over partners -- high when a residue's contacts are
+      inconsistent across the ensemble (near 0.25 per partner at p=0.5),
+      low when contacts are reliably present or reliably absent (p near 0
+      or 1). Excludes the diagonal and immediate sequence neighbors
+      (i±1, i±2), which are always in contact by covalent-bond construction
+      and would otherwise dilute every residue's score toward "consistent"
+      regardless of real disorder.
+    """
+    n_snaps = len(snapshots)
+    n_ca = len(ca_indices)
+    if n_snaps == 0 or n_ca == 0:
+        return np.zeros((0, 0)), np.array([])
+
+    if _analysis_ext is not None:
+        coord_arr = _snapshots_to_coord_array(snapshots, ca_indices)
+        contact_freq = _analysis_ext.compute_contact_freq_matrix(coord_arr, cutoff)
+    else:
+        contact_freq = np.zeros((n_ca, n_ca), dtype=float)
+        for particles in snapshots:
+            coords = np.zeros((n_ca, 3), dtype=float)
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[ci] = [p.x, p.y, p.z]
+            diff = coords[:, None, :] - coords[None, :, :]
+            dist = np.sqrt((diff ** 2).sum(-1))
+            contact_freq += (dist < cutoff)
+        contact_freq /= n_snaps
+        np.fill_diagonal(contact_freq, 0.0)
+
+    bernoulli_var = contact_freq * (1.0 - contact_freq)
+    mask = np.ones((n_ca, n_ca), dtype=bool)
+    np.fill_diagonal(mask, False)
+    for offset in (1, 2):
+        if offset < n_ca:
+            idx = np.arange(n_ca - offset)
+            mask[idx, idx + offset] = False
+            mask[idx + offset, idx] = False
+    per_residue_variance = np.array([
+        bernoulli_var[i][mask[i]].mean() if mask[i].any() else 0.0
+        for i in range(n_ca)
+    ])
+    return contact_freq, per_residue_variance
+
 
 def _extract_ca_residues(pdb_path):
     """Return [(chain_id, res_seq, res_name3)] for Cα residues in parse order."""
@@ -1113,7 +1405,7 @@ class PipelineWorker(QThread):
                         f"classifying topology for chain {primary_chain} only "
                         f"(knot type isn't well-defined across separate, non-bonded chains)")
                 ca_coords = np.array(ca_coords_by_chain[primary_chain], dtype=float)
-                knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=12)
+                knot_result = _knot.classify_backbone_knot(ca_coords, n_trials=24)
                 self.progress.emit(
                     f"  Topology: {knot_result.name} "
                     f"({knot_result.crossing_number} crossings, "
@@ -1863,8 +2155,9 @@ class LandscapeWorker(QThread):
     WORK_BUDGET_MULT   = 3.0     # allow ~3x the anchor's total MC-step work
 
     @classmethod
-    def _adaptive_depth(cls, n_res):
-        """Per-branch (n_snapshots, steps_per_snap) scaled for protein size.
+    def _adaptive_depth(cls, n_res, disorder_frac=0.0):
+        """Per-branch (n_snapshots, steps_per_snap) scaled for protein size
+        and (optionally) IUPred-predicted disorder fraction.
 
         n_snapshots grows with sqrt(n_res/ANCHOR_N_RES) so DBSCAN still has enough
         pooled points to resolve real basins as the PCA feature space grows with
@@ -1873,9 +2166,31 @@ class LandscapeWorker(QThread):
         per-step cost is ~O(n_res)) would exceed WORK_BUDGET_MULT times the
         anchor's work -- see class-level comment above for why this isn't tau-
         derived.
+
+        disorder_frac (IMPROVEMENTS.md item #7, "disorder-aware sampling"):
+        the fraction of residues IUPred predicts disordered (0.0 if
+        unavailable -- e.g. a caller that never computed IUPred scores at
+        all; tests/landscape_stability_test.py DOES have real sequence info
+        from the parsed PDB and passes real scores through as of the
+        2026-07-13 fix, see that file). A genuinely
+        disordered region is, by construction, sampling a heterogeneous mix
+        of sub-populations rather than fluctuating around one well -- the
+        same "DBSCAN needs more pooled points to resolve what's really
+        there" argument that already motivates the size-based sqrt scaling
+        above, just along a second axis. Scaled linearly (not sqrt, unlike
+        the size term): more disordered residues means proportionally more
+        distinct heterogeneous states to resolve, not a spread-of-noise
+        argument the central-limit-style sqrt reasoning applies to. Modest,
+        bounded first-pass constant (DISORDER_DEPTH_MULT=1.0, i.e. a fully
+        IUPred-disordered protein gets up to 2x depth) -- applied before the
+        existing N_SNAPSHOTS_CAP clamp, so it can't runaway past the
+        already-validated cost ceiling; not yet independently tuned beyond
+        that cap, same "reasoned starting value, not a fitted optimum"
+        posture as every other constant introduced this way in this file.
         """
         r = max(n_res, 1) / cls.ANCHOR_N_RES
-        n_snap = int(round(cls.N_SNAPSHOTS * r ** 0.5))
+        disorder_mult = 1.0 + cls.DISORDER_DEPTH_MULT * max(0.0, min(1.0, disorder_frac))
+        n_snap = int(round(cls.N_SNAPSHOTS * r ** 0.5 * disorder_mult))
         n_snap = max(cls.N_SNAPSHOTS, min(n_snap, cls.N_SNAPSHOTS_CAP))
 
         steps = cls.STEPS_PER_SNAP
@@ -1967,8 +2282,16 @@ class LandscapeWorker(QThread):
     USE_PIVOT_BRANCH = False
     PIVOT_N_PIVOTS   = 1
 
+    # Disorder-aware sampling depth (IMPROVEMENTS.md item #7) -- see
+    # _adaptive_depth's docstring for the full derivation. Always active
+    # (not an opt-in toggle like USE_REPLICA_EXCHANGE/USE_PIVOT_BRANCH):
+    # disorder_frac defaults to 0.0 when no IUPred scores are supplied, so
+    # this is a pure no-op extension of the already-shipped size-based
+    # depth scaling, not a new behavior that needs its own off-switch.
+    DISORDER_DEPTH_MULT = 1.0
+
     def __init__(self, engine, init_atoms, ca_indices, topo, physics_mod=None, T=0.6, max_angle=0.12,
-                 extra_seeds=None, backbone_ncac=None):
+                 extra_seeds=None, backbone_ncac=None, iupred_scores=None):
         super().__init__()
         self.engine      = engine
         self.init_atoms  = init_atoms
@@ -1977,6 +2300,11 @@ class LandscapeWorker(QThread):
         self.physics_mod = physics_mod if physics_mod is not None else protein_physics
         self.T           = T
         self.max_angle   = max_angle
+        # IUPred per-residue disorder scores (same order as ca_indices),
+        # used only to scale sampling depth via _adaptive_depth -- see
+        # DISORDER_DEPTH_MULT above. None/empty -> disorder_frac=0.0,
+        # identical to the pre-existing size-only behavior.
+        self.iupred_scores = iupred_scores
         # 다중 분지 탐색용 추가 시드 (예: 상위 K개 MC 후보) — 없으면 기존처럼
         # 단일 궤적으로 동작한다.
         # Extra seeds for multi-branch exploration (e.g. the next-best K MC
@@ -2005,7 +2333,9 @@ class LandscapeWorker(QThread):
         use_pivot = self.USE_PIVOT_BRANCH and len(self.topo.concerted_pairs) > 0
         n_branches = n_seed_branches + (1 if use_pivot else 0)
         n_res = len(self.ca_indices)
-        N_per, S = self._adaptive_depth(n_res)  # per-branch target -- see class-level comment above
+        disorder_frac = (_iupred.fraction_disordered(self.iupred_scores)
+                          if self.iupred_scores else 0.0)
+        N_per, S = self._adaptive_depth(n_res, disorder_frac)  # per-branch target -- see class-level comment above
 
         # ── 다중 분지 탐색 (Multi-branch exploration) ────────────────────
         # 시드 하나(최적 후보)에서만 뻗으면, 안정 단백질에서는 문제없다
@@ -2083,7 +2413,21 @@ class LandscapeWorker(QThread):
                 rng_seed=n_seed_branches))
         pool.waitForDone()
 
-        all_snapshots, all_energies, branch_lengths = [], [], []
+        # Track which pooled branch (if any) is the pivot branch, so its
+        # snapshots can be excluded from the funnel/dominance denominator
+        # further below (IMPROVEMENTS.md item #1/#2: pivot-branch snapshots
+        # merging into the dominant DBSCAN cluster inflated apparent
+        # single-basin dominance on 1XQ8, the opposite of the intended
+        # effect) while still being eligible for DBSCAN clustering and the
+        # competitive/competitive_structural checks -- a pivot-discovered
+        # basin can still count as evidence of disorder, it just can't
+        # dilute how "dominant" the dominant basin looks. When
+        # USE_PIVOT_BRANCH is False (still the default), pivot_branch_idx
+        # is None and pivot_mask is all-False, making every use of it below
+        # a no-op -- this is the regression guard for the existing no-pivot
+        # path.
+        pivot_branch_idx = n_seed_branches if use_pivot else None
+        all_snapshots, all_energies, branch_lengths, pivot_mask_parts = [], [], [], []
         gpu_fallback_error = None
         for bi in range(n_branches):
             snaps, ens, err = branch_results[bi]
@@ -2094,6 +2438,9 @@ class LandscapeWorker(QThread):
             all_snapshots.extend(snaps)
             all_energies.extend(ens)
             branch_lengths.append(len(snaps))
+            pivot_mask_parts.append(np.full(len(snaps), bi == pivot_branch_idx, dtype=bool))
+        pivot_mask = (np.concatenate(pivot_mask_parts) if pivot_mask_parts
+                      else np.zeros(0, dtype=bool))
 
         if gpu_fallback_error is not None:
             self.progress.emit(
@@ -2105,6 +2452,10 @@ class LandscapeWorker(QThread):
         snapshots = all_snapshots
         energies  = np.array(all_energies, dtype=float)
         N = len(energies)
+        # Pivot-excluded population basis for the funnel/dominance measurement
+        # (see pivot_mask comment above). Falls back to N itself whenever no
+        # pivot branch ran.
+        N_core = int((~pivot_mask).sum()) if pivot_mask.size else N
 
         self.progress.emit("  [LANDSCAPE] Building conformational graph…")
 
@@ -2174,14 +2525,23 @@ class LandscapeWorker(QThread):
         # have settled into different pictures of the landscape and haven't
         # mixed yet. R-hat near 1.0 means they agree. Conventional rule of
         # thumb: R-hat < 1.1 is considered converged.
+        # Exclude the pivot branch's chain from R-hat -- it deliberately
+        # starts from a different (kicked) state than the other branches, so
+        # including it isn't a like-for-like Gelman-Rubin comparison
+        # (IMPROVEMENTS.md item #1/#2). R-hat is already documented as
+        # informational only, not load-bearing in the classification
+        # decision, so this is a correctness nicety, not a critical fix.
         r_hat = None
-        if len(branch_lengths) >= 2 and min(branch_lengths) >= 2:
-            n_chain = min(branch_lengths)
+        core_branch_lengths = [length for bi, length in enumerate(branch_lengths)
+                                if bi != pivot_branch_idx]
+        if len(core_branch_lengths) >= 2 and min(core_branch_lengths) >= 2:
+            n_chain = min(core_branch_lengths)
             pc1 = layout[:, 0]
             chains = []
             offset = 0
-            for length in branch_lengths:
-                chains.append(pc1[offset:offset + n_chain])
+            for bi, length in enumerate(branch_lengths):
+                if bi != pivot_branch_idx:
+                    chains.append(pc1[offset:offset + n_chain])
                 offset += length
             chains = np.array(chains)  # shape (m branches, n_chain samples)
             m = chains.shape[0]
@@ -2232,9 +2592,15 @@ class LandscapeWorker(QThread):
         # seeds) -- they aren't real consecutive steps, and including them
         # would inject spurious "large jumps" into the eps calibration
         # whenever multi-branch seeds happen to be far apart structurally.
+        # Also exclude the pivot branch's own internal steps here (in addition
+        # to the ordinary inter-branch boundary exclusion above) -- its
+        # trajectory is a deliberate large kick + relax, not ordinary thermal
+        # jitter, and including it would inflate step_scale/eps, making
+        # DBSCAN more likely to merge the pivot branch's relaxed points into
+        # the dominant cluster (IMPROVEMENTS.md item #1/#2).
         diffs, offset = [], 0
-        for length in branch_lengths:
-            if length > 1:
+        for bi, length in enumerate(branch_lengths):
+            if length > 1 and bi != pivot_branch_idx:
                 diffs.append(np.linalg.norm(
                     np.diff(layout[offset:offset + length], axis=0), axis=1))
             offset += length
@@ -2341,7 +2707,17 @@ class LandscapeWorker(QThread):
         # anything representative -- population is the more meaningful
         # anchor either way.
         best_comm = max(sig, key=len) if sig else max(communities, key=len)
-        funnel    = len(best_comm) / N
+        # funnel measures how dominant the dominant basin is. Computed on the
+        # pivot-excluded N_core/core_best basis (falls back to the full N when
+        # no pivot branch ran, i.e. pivot_mask is all-False) -- otherwise a
+        # pivot branch that partially relaxes back into the dominant basin's
+        # cluster would inflate this and read as artificially more "ordered"
+        # (the diagnosed cause of the 1XQ8 regression, IMPROVEMENTS.md item
+        # #1/#2). best_comm/sig/communities themselves are left on the full
+        # pooled set -- a pivot-discovered basin still counts as a real basin.
+        core_best = (int(sum(1 for i in best_comm if not pivot_mask[i]))
+                     if pivot_mask.size else len(best_comm))
+        funnel = core_best / N_core if N_core else len(best_comm) / N
 
         # 지배적 분지의 대표 구조 — 분류 단계의 구조적 변위 필터(아래)와
         # 이후 동적 후보 탐색 단계 둘 다에서 쓰므로 여기서 한 번만 계산한다.
@@ -2422,7 +2798,16 @@ class LandscapeWorker(QThread):
         # landscape), the bar for a competitor drops right along with it; when
         # the dominant is sharply peaked, the bar rises correspondingly.
         POP_RATIO_THRESHOLD = 0.4
-        pop_dominant   = len(best_comm) / N
+        # Same quantity as funnel above (both were len(best_comm)/N
+        # independently before this fix) -- reuse it rather than recompute on
+        # a different basis, or pop_threshold below would stay polluted by
+        # pivot-branch snapshots even after funnel itself was fixed
+        # (IMPROVEMENTS.md item #1/#2). Note: candidate basins' own ratio
+        # check just below (len(c)/N) intentionally stays on the full N, not
+        # N_core -- so when N_core < N, pop_threshold ends up very slightly
+        # higher than before, a directionally conservative (safe) side
+        # effect, not a new bias toward false positives.
+        pop_dominant   = funnel
         pop_threshold  = SIG_FLOOR + POP_RATIO_THRESHOLD * (pop_dominant - SIG_FLOOR)
 
         competitive = [c for c in sig
@@ -2632,6 +3017,14 @@ class LandscapeWorker(QThread):
                 "energy_min": min(e_vals), "energy_max": max(e_vals),
                 "particles": snapshots[rep_idx],
                 "is_dominant": c is best_comm,
+                # Pooled-snapshot indices belonging to this basin (2026-07-13,
+                # IMPROVEMENTS.md item #7 re-test) -- lets the ensemble overlay
+                # show only this basin's conformers instead of always the whole
+                # pooled trajectory. Stored here (not reconstructed from the
+                # raw `communities` list) because basin_summary is built from
+                # `sig` and then population-sorted, so its index order doesn't
+                # match `communities`' original order.
+                "member_indices": list(c),
             })
         basin_summary.sort(key=lambda b: -b["population"])
 
@@ -2900,6 +3293,12 @@ class ProteinApp(QMainWindow):
         self.disorder_toggle_btn.setFixedHeight(24)
         self.disorder_toggle_btn.setEnabled(False)
         vh_layout.addWidget(self.disorder_toggle_btn)
+        self.ensemble_toggle_btn = QPushButton("⊚  ENSEMBLE")
+        self.ensemble_toggle_btn.setObjectName("sec-btn")
+        self.ensemble_toggle_btn.clicked.connect(self._toggle_ensemble)
+        self.ensemble_toggle_btn.setFixedHeight(24)
+        self.ensemble_toggle_btn.setEnabled(False)
+        vh_layout.addWidget(self.ensemble_toggle_btn)
         self._candidate_btns = []
         viewer_v.addWidget(viewer_header)
 
@@ -3044,6 +3443,49 @@ class ProteinApp(QMainWindow):
         dp_v.addWidget(self._disorder_canvas)
 
         self._view_stack.addWidget(disorder_page)    # index 2
+
+        # Page 3: IDP ensemble metrics (Rg, end-to-end, internal scaling
+        # law, contact-map) -- see IMPROVEMENTS.md item #7. Deliberately a
+        # separate page from the disorder/RMSF profile above rather than
+        # folded into it: these are whole-ensemble/pairwise descriptors
+        # (Rg is one value per snapshot, contact frequency is per residue
+        # PAIR), a different data shape from the disorder page's per-
+        # residue-only line plots.
+        ensemble_page = QWidget()
+        ep_v = QVBoxLayout(ensemble_page)
+        ep_v.setContentsMargins(0, 0, 0, 0); ep_v.setSpacing(0)
+
+        ep_hdr = QWidget(); ep_hdr.setFixedHeight(30)
+        ep_hdr.setStyleSheet("background:#ffffff;border-bottom:1px solid #e2e8f0;")
+        ep_h = QHBoxLayout(ep_hdr); ep_h.setContentsMargins(16, 0, 16, 0)
+        ep_title = QLabel("IDP ENSEMBLE METRICS")
+        ep_title.setStyleSheet("color:#64748b;font-size:10px;letter-spacing:2px;")
+        ep_h.addWidget(ep_title); ep_h.addStretch()
+        self.ensemble_stats_lbl = QLabel("—")
+        self.ensemble_stats_lbl.setStyleSheet("color:#94a3b8;font-size:9px;letter-spacing:1px;")
+        ep_h.addWidget(self.ensemble_stats_lbl)
+        ep_h.addSpacing(16)
+        self.ensemble_overlay_btn = QPushButton("SHOW ENSEMBLE OVERLAY")
+        self.ensemble_overlay_btn.setObjectName("sec-btn")
+        self.ensemble_overlay_btn.setFixedHeight(22)
+        self.ensemble_overlay_btn.setStyleSheet(
+            "background:transparent;color:#7c3aed;border:1.5px solid #7c3aed;"
+            "border-radius:4px;padding:2px 10px;font-size:9px;letter-spacing:1px;")
+        # NOT `.connect(self._render_ensemble_overlay)` directly -- QPushButton.clicked
+        # emits a `checked: bool` positional arg, which would land in
+        # _render_ensemble_overlay's `basin_idx` parameter (`False` is not `None`,
+        # so it silently rendered basin 0 only every time instead of the full
+        # pooled ensemble -- found 2026-07-13 via a live GUI click-through).
+        self.ensemble_overlay_btn.clicked.connect(lambda: self._render_ensemble_overlay())
+        ep_h.addWidget(self.ensemble_overlay_btn)
+        ep_v.addWidget(ep_hdr)
+
+        self._ensemble_fig    = Figure(facecolor="#f8fafc", tight_layout=True)
+        self._ensemble_canvas = FigureCanvas(self._ensemble_fig)
+        self._ensemble_canvas.setStyleSheet("border:none;")
+        ep_v.addWidget(self._ensemble_canvas)
+
+        self._view_stack.addWidget(ensemble_page)    # index 3
         viewer_v.addWidget(self._view_stack)
 
         # Candidate energy bar
@@ -3134,6 +3576,7 @@ class ProteinApp(QMainWindow):
         self.landscape_start_btn.setEnabled(False)
         self.landscape_toggle_btn.setEnabled(False)
         self.disorder_toggle_btn.setEnabled(False)
+        self.ensemble_toggle_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.status_lbl.setText("RUNNING")
         self.status_lbl.setStyleSheet("color:#d97706;font-size:11px;font-weight:bold;")
@@ -3144,6 +3587,7 @@ class ProteinApp(QMainWindow):
         self.idp_status_lbl.setText("—")
         self.idp_status_lbl.setStyleSheet("font-size:10px;font-weight:bold;color:#94a3b8;")
         self.disorder_stats_lbl.setText("—")
+        self.ensemble_stats_lbl.setText("—")
         self._rmsf = None
 
         # Reset view to structure page and fix button labels
@@ -3153,6 +3597,7 @@ class ProteinApp(QMainWindow):
             "⊞  LAYERED" if self._view_mode == "sidebyside" else "◧  SIDE-BY-SIDE")
         self.landscape_toggle_btn.setText("◈  LANDSCAPE")
         self.disorder_toggle_btn.setText("⊛  DISORDER")
+        self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
 
         self.landscape_start_btn.setText("◈  EXPLORE LANDSCAPE")
         self._log(f"[{target}] Analysis initiated")
@@ -3446,7 +3891,7 @@ class ProteinApp(QMainWindow):
                       f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -3518,7 +3963,7 @@ class ProteinApp(QMainWindow):
             right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
@@ -3683,7 +4128,8 @@ class ProteinApp(QMainWindow):
 
         self._landscape_worker = LandscapeWorker(
             ls_engine, start_atoms, self._ca_indices, self._topo, self._physics_mod,
-            extra_seeds=extra_seeds, backbone_ncac=backbone_ncac)
+            extra_seeds=extra_seeds, backbone_ncac=backbone_ncac,
+            iupred_scores=self._iupred_scores)
         self._landscape_worker.progress.connect(self._log)
         self._landscape_worker.result.connect(self._on_landscape_done)
         self._landscape_worker.gpu_fallback.connect(self._on_gpu_fallback)
@@ -3712,13 +4158,24 @@ class ProteinApp(QMainWindow):
 
         # Compute RMSF from trajectory and draw disorder profile
         if self._ca_indices and self._pdb_path:
-            rmsf     = _compute_rmsf(data["snapshots"], self._ca_indices)
+            rmsf     = _compute_rmsf(data["snapshots"], self._ca_indices,
+                                      iupred_scores=self._iupred_scores)
             residues = _extract_ca_residues(self._pdb_path)
             self._rmsf          = rmsf
             self._rmsf_residues = residues
             self._draw_disorder_profile(rmsf=rmsf, residues=residues,
                                         iupred_scores=self._iupred_scores)
             self.disorder_toggle_btn.setEnabled(True)
+
+            rg = _compute_radius_of_gyration(data["snapshots"], self._ca_indices)
+            end_to_end = _compute_end_to_end(data["snapshots"], self._ca_indices)
+            seps, mean_dists, nu, log_r0, r_squared = _compute_internal_scaling(
+                data["snapshots"], self._ca_indices)
+            contact_freq, _contact_var = _compute_contact_map(
+                data["snapshots"], self._ca_indices)
+            self._draw_ensemble_metrics(rg, end_to_end, seps, mean_dists, nu, log_r0,
+                                        r_squared, contact_freq)
+            self.ensemble_toggle_btn.setEnabled(True)
 
         self._log(f"[LANDSCAPE] Classification: {lbl}  ·  "
                   f"{data['n_sig']} metastable basins  ·  "
@@ -3806,6 +4263,17 @@ class ProteinApp(QMainWindow):
                 "font-size:9px;padding:2px 10px;")
             btn.clicked.connect(lambda _, bi=bi: self._render_basin(bi))
             h.addWidget(btn)
+            # OVERLAY button (2026-07-13, item #7 re-test): spaghetti-plot
+            # view of just this basin's own conformers, reusing
+            # _render_ensemble_overlay's existing rendering via basin_idx --
+            # see _render_basin_overlay.
+            overlay_btn = QPushButton("OVERLAY")
+            overlay_btn.setFixedHeight(20)
+            overlay_btn.setStyleSheet(
+                "background:#7c3aed;color:#fff;border:none;border-radius:3px;"
+                "font-size:9px;padding:2px 10px;")
+            overlay_btn.clicked.connect(lambda _, bi=bi: self._render_basin_overlay(bi))
+            h.addWidget(overlay_btn)
             self._basinpool_v.addWidget(row)
             self._basinpool_rows.append(row)
 
@@ -3819,7 +4287,7 @@ class ProteinApp(QMainWindow):
         n_atoms = len(basin["particles"])
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -3898,7 +4366,7 @@ E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
         resi_list = list(range(lo + 1, hi + 2))
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4061,7 +4529,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         n_atoms   = len(particles)
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4288,7 +4756,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             legend = ('<div id="legend">'
                       '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE</div>')
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4367,7 +4835,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             right_info   = f"&#9733; C{best_idx+1} (BEST) &nbsp;&middot;&nbsp; {best_e} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
             right_legend = '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE'
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden;display:flex;width:100vw;height:100vh; }}
@@ -4548,18 +5016,110 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
 
         self._disorder_canvas.draw()
 
+    def _draw_ensemble_metrics(self, rg, end_to_end, seps, mean_dists, nu, log_r0, r_squared,
+                                contact_freq):
+        """Draw the 4-panel IDP ensemble-characterization figure (Rg
+        histogram, end-to-end histogram, internal-distance scaling-law fit,
+        contact-map heatmap) -- see IMPROVEMENTS.md item #7 for the design
+        rationale of each metric. Any panel is skipped if its data is empty
+        (e.g. the scaling-law fit needs >=3 distinct sequence separations
+        and returns None for nu/r_squared when there aren't enough).
+        """
+        have_rg      = rg is not None and len(rg) > 0
+        have_e2e     = end_to_end is not None and len(end_to_end) > 0
+        have_scaling = seps is not None and len(seps) > 0 and nu is not None
+        have_contact = contact_freq is not None and contact_freq.size > 0
+
+        if not (have_rg or have_e2e or have_scaling or have_contact):
+            return
+
+        self._ensemble_fig.clear()
+        self._ensemble_fig.patch.set_facecolor("#f8fafc")
+        axes = self._ensemble_fig.subplots(2, 2)
+
+        def _style(ax_obj):
+            ax_obj.set_facecolor("#f8fafc")
+            ax_obj.tick_params(colors="#94a3b8", labelsize=6)
+            for sp in ax_obj.spines.values():
+                sp.set_edgecolor("#e2e8f0"); sp.set_linewidth(0.7)
+
+        # ── Rg histogram ─────────────────────────────────────────
+        ax = axes[0][0]; _style(ax)
+        if have_rg:
+            ax.hist(rg, bins=min(20, max(5, len(rg) // 2)), color="#7c3aed", alpha=0.6,
+                    edgecolor="#5b21b6")
+            ax.set_xlabel("Rg (Å)", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("count", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"Radius of gyration  ·  {rg.mean():.2f}±{rg.std():.2f} Å",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── End-to-end histogram ─────────────────────────────────
+        ax = axes[0][1]; _style(ax)
+        if have_e2e:
+            ax.hist(end_to_end, bins=min(20, max(5, len(end_to_end) // 2)),
+                    color="#0891b2", alpha=0.6, edgecolor="#0e7490")
+            ax.set_xlabel("N-to-C distance (Å)", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("count", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title(f"End-to-end distance  ·  {end_to_end.mean():.2f}±{end_to_end.std():.2f} Å",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── Internal scaling law: <R_ij> ~ |i-j|^nu ──────────────
+        ax = axes[1][0]; _style(ax)
+        if have_scaling:
+            ax.scatter(seps, mean_dists, s=10, color="#ea580c", alpha=0.7, zorder=3)
+            fit_x = np.array([seps.min(), seps.max()])
+            fit_y = np.exp(nu * np.log(fit_x) + log_r0)
+            ax.plot(fit_x, fit_y, color="#1e293b", lw=1.2, linestyle="--", zorder=2)
+            ax.set_xscale("log"); ax.set_yscale("log")
+            ax.set_xlabel("sequence separation |i-j|", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("<R_ij> (Å)", fontsize=7, color="#64748b", labelpad=3)
+            r2_str = f"{r_squared:.2f}" if r_squared is not None else "n/a"
+            ax.set_title(f"Internal scaling  ·  ν={nu:.3f}  (R²={r2_str})",
+                         fontsize=8, color="#1e293b", fontweight="bold", pad=5)
+        else:
+            ax.axis("off")
+
+        # ── Contact-map heatmap ───────────────────────────────────
+        ax = axes[1][1]; _style(ax)
+        if have_contact:
+            im = ax.imshow(contact_freq, cmap="viridis", vmin=0, vmax=1, origin="lower")
+            ax.set_xlabel("residue", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_ylabel("residue", fontsize=7, color="#64748b", labelpad=3)
+            ax.set_title("Contact frequency", fontsize=8, color="#1e293b",
+                         fontweight="bold", pad=5)
+            cbar = self._ensemble_fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=6, colors="#94a3b8")
+        else:
+            ax.axis("off")
+
+        stats_bits = []
+        if have_rg:
+            stats_bits.append(f"Rg {rg.mean():.1f}±{rg.std():.1f} Å")
+        if have_scaling:
+            stats_bits.append(f"ν={nu:.2f}")
+        self.ensemble_stats_lbl.setText("  ·  ".join(stats_bits) if stats_bits else "—")
+
+        self._ensemble_canvas.draw()
+
     def _render_colored_by_rmsf(self):
         """Load the MC best structure into 3Dmol colored by per-residue RMSF (B-factor).
         MC 최저 에너지 구조를 잔기별 RMSF(B-인수)로 색칠해 3Dmol로 렌더링.
 
-        RMSF 값을 PDB B-인수(온도 인수) 필드에 저장해 3Dmol의 bwr 그래디언트로 표시:
+        RMSF 값을 PDB B-인수(온도 인수) 필드에 저장해 3Dmol의 rwb 그래디언트로 표시:
           파란색(blue) = RMSF 낮음 = 딱딱한(rigid) 구조 영역
           흰색(white)  = 중간 유연성
           빨간색(red)  = RMSF 높음 = 유연/무질서 영역
 
-        RMSF stored in PDB B-factor field; 3Dmol's bwr gradient maps:
+        RMSF stored in PDB B-factor field; 3Dmol's rwb gradient maps:
           blue → rigid (low RMSF), white → intermediate, red → flexible/disordered.
-        Colour scale: 0 → 4.0 Å (clamped).
+        Colour scale: 0 → 4.0 Å (clamped). (Gradient name is "rwb" -- matching the
+        vendored 3Dmol.js's actual registered builtin gradient key, confirmed
+        2026-07-13 after a live GUI run surfaced "bwr" as invalid -- see
+        IMPROVEMENTS.md item #7.)
         """
         if self._rmsf is None or not self._ensemble:
             return
@@ -4585,7 +5145,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         pdb_esc = pdb_str.replace("\\", "\\\\").replace("`", "\\`")
 
         html = f"""<!DOCTYPE html><html><head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<script src="{_3DMOL_JS_URL}"></script>
 <style>
   * {{ margin:0;padding:0;box-sizing:border-box; }}
   body {{ background:#f8fafc;overflow:hidden; }}
@@ -4616,11 +5176,11 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   var m=v.addModel(`{pdb_esc}`,"pdb");
   m.setStyle({{}},{{
     cartoon:{{
-      colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
       thickness:0.8,opacity:1.0
     }},
     sphere:{{
-      colorscheme:{{prop:"b",gradient:"bwr",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
       radius:0.55,opacity:1.0
     }}
   }});
@@ -4637,6 +5197,148 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         self.view_mode_btn.setVisible(True)
         self.disorder_toggle_btn.setText("⊛  DISORDER")
 
+    def _render_ensemble_overlay(self, basin_idx=None):
+        """Overlay a sample of MC trajectory snapshots in one 3Dmol viewer --
+        the classic NMR-ensemble "spaghetti plot" view of what the sampled
+        conformational ensemble actually looks like in 3D, rather than only
+        the scalar Rg/nu/contact-map summaries already on the ENSEMBLE page
+        (see IMPROVEMENTS.md item #7 -- this is the third, previously-
+        unstarted "GUI/visualization" direction).
+
+        Each overlay frame is Kabsch-superposed onto the first snapshot,
+        with the fit restricted to the IUPred-predicted ordered core when
+        available (same rationale/mask as _compute_rmsf) -- otherwise a
+        genuinely rigid core would look just as scattered as a real
+        disordered tail, since torsion-angle MC has no reason to keep a
+        fixed absolute pose across a trajectory. Frames are colored by the
+        same per-residue RMSF (b-factor, rwb gradient) already used for
+        COLOR BY FLEXIBILITY, so the rigid core stays visibly steady/blue
+        while a real disordered region visibly frays red across frames.
+        The lowest-energy dominant structure is drawn on top as an opaque
+        solid reference.
+
+        basin_idx (2026-07-13, IMPROVEMENTS.md item #7 re-test): when given,
+        restricts the overlay to only that basin_summary entry's member
+        snapshots (via its "member_indices", see run()'s basin_summary
+        construction) instead of the whole pooled multi-branch trajectory --
+        lets a user compare one basin's conformers in isolation rather than
+        always seeing every basin superimposed. None (default) reproduces
+        the original always-pooled behavior unchanged.
+        """
+        snaps = self._landscape_snaps
+        if basin_idx is not None:
+            if basin_idx >= len(self._basin_summary):
+                return
+            member_indices = self._basin_summary[basin_idx]["member_indices"]
+            snaps = [snaps[i] for i in member_indices if i < len(snaps)]
+        if not snaps or not self._ca_indices:
+            return
+        ca_indices = self._ca_indices
+        n_ca = len(ca_indices)
+        n_snaps = len(snaps)
+
+        coords = np.zeros((n_snaps, n_ca, 3), dtype=float)
+        for si, particles in enumerate(snaps):
+            for ci, pidx in enumerate(ca_indices):
+                if pidx < len(particles):
+                    p = particles[pidx]
+                    coords[si, ci] = [p.x, p.y, p.z]
+
+        fit_mask = None
+        if self._iupred_scores is not None and len(self._iupred_scores) == n_ca:
+            fit_mask = np.asarray(self._iupred_scores) < 0.5
+
+        ref = coords[0]
+        MAX_OVERLAY = 20
+        sample_idx = sorted(set(
+            np.linspace(0, n_snaps - 1, min(n_snaps, MAX_OVERLAY)).astype(int).tolist()))
+
+        bfac = (self._rmsf if self._rmsf is not None and len(self._rmsf) == n_ca
+                else None)
+
+        models_js = []
+        for k, si in enumerate(sample_idx):
+            frame = coords[si] if si == 0 else _kabsch_align_points(
+                ref, coords[si], fit_mask=fit_mask)
+            lines = []
+            for i in range(n_ca):
+                x, y, z = frame[i]
+                b = float(bfac[i]) if bfac is not None else 0.5
+                lines.append(
+                    f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b:6.2f}           C")
+            pdb_esc = "\n".join(lines).replace("\\", "\\\\").replace("`", "\\`")
+            models_js.append(
+                f'  var m{k}=v.addModel(`{pdb_esc}`,"pdb");\n'
+                f'  m{k}.setStyle({{}},{{cartoon:{{'
+                f'colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},'
+                f'thickness:0.5,opacity:0.30}}}});\n')
+
+        ref_js = ""
+        if self._landscape_dominant_particles:
+            dom_pdb = self._build_ca_pdb_str(self._landscape_dominant_particles)
+            dom_esc = dom_pdb.replace("\\", "\\\\").replace("`", "\\`")
+            ref_js = (
+                f'  var mRef=v.addModel(`{dom_esc}`,"pdb");\n'
+                f'  mRef.setStyle({{}},{{cartoon:{{color:"#1d4ed8",'
+                f'thickness:0.9,opacity:1.0}}}});\n')
+
+        html = f"""<!DOCTYPE html><html><head>
+<script src="{_3DMOL_JS_URL}"></script>
+<style>
+  * {{ margin:0;padding:0;box-sizing:border-box; }}
+  body {{ background:#f8fafc;overflow:hidden; }}
+  #v {{ width:100vw;height:100vh; }}
+  #info {{
+    position:absolute;top:12px;left:16px;font-family:monospace;font-size:11px;
+    letter-spacing:1px;color:#1e293b;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;
+  }}
+  #legend {{
+    position:absolute;bottom:12px;left:16px;font-family:monospace;font-size:10px;
+    letter-spacing:1px;color:#475569;pointer-events:none;
+    background:rgba(255,255,255,0.88);padding:5px 10px;
+    border-radius:5px;border:1px solid #e2e8f0;
+  }}
+</style></head><body>
+<div id="v"></div>
+<div id="info">ENSEMBLE OVERLAY{f' &nbsp;&middot;&nbsp; BASIN {basin_idx+1}' if basin_idx is not None else ''} \
+&nbsp;&middot;&nbsp; {len(sample_idx)} sampled conformers \
+&nbsp;&middot;&nbsp; {n_ca} C&alpha; atoms</div>
+<div id="legend">
+  <span style="color:#1d4ed8">&#9632;</span> DOMINANT (reference)
+  &nbsp;&middot;&middot;&middot;&middot;&middot;&nbsp;
+  <span style="color:#2563eb">&#9632;</span> RIGID
+  &nbsp;&middot;&nbsp;
+  <span style="color:#dc2626">&#9632;</span> FLEXIBLE (per-conformer overlay)
+</div>
+<script>
+(function(){{
+  var v=$3Dmol.createViewer("v",{{backgroundColor:"#f8fafc"}});
+{''.join(models_js)}{ref_js}
+  v.zoomTo(); v.zoom(0.85); v.render();
+  (function spin(){{ v.rotate(1,'y'); v.render(); requestAnimationFrame(spin); }})();
+}})();
+</script></body></html>"""
+
+        basin_tag = f' (basin {basin_idx+1})' if basin_idx is not None else ''
+        self.viewer_cand_lbl.setText(
+            f'<span style="color:#7c3aed;font-weight:bold;">ENSEMBLE OVERLAY{basin_tag}</span>'
+            f' &nbsp;·&nbsp; {len(sample_idx)} conformers &nbsp;·&nbsp; '
+            'blue=rigid · red=disordered')
+        self._set_html(html)
+        self._view_stack.setCurrentIndex(0)
+        self.view_mode_btn.setVisible(True)
+        self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
+
+    def _render_basin_overlay(self, basin_idx):
+        """OVERLAY button in the basin pool (2026-07-13, item #7 re-test) --
+        same spaghetti-plot view as _render_ensemble_overlay, restricted to
+        one basin's own conformers via its member_indices (see run()'s
+        basin_summary construction)."""
+        self._render_ensemble_overlay(basin_idx=basin_idx)
+
     def _toggle_disorder(self):
         if self._view_stack.currentIndex() == 2:
             self._view_stack.setCurrentIndex(0)
@@ -4647,6 +5349,18 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             self._view_stack.setCurrentIndex(2)
             self.view_mode_btn.setVisible(False)
             self.disorder_toggle_btn.setText("⊡  STRUCTURE")
+            self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+
+    def _toggle_ensemble(self):
+        if self._view_stack.currentIndex() == 3:
+            self._view_stack.setCurrentIndex(0)
+            self.view_mode_btn.setVisible(True)
+            self.ensemble_toggle_btn.setText("⊚  ENSEMBLE")
+            self.landscape_toggle_btn.setText("◈  LANDSCAPE")
+        else:
+            self._view_stack.setCurrentIndex(3)
+            self.view_mode_btn.setVisible(False)
+            self.ensemble_toggle_btn.setText("⊡  STRUCTURE")
             self.landscape_toggle_btn.setText("◈  LANDSCAPE")
 
 

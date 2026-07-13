@@ -19,9 +19,16 @@ repo_root = os.path.abspath(SPECPATH)
 # Bundle whichever compiled physics extensions match the build interpreter.
 # The CUDA variant is optional — only picked up if present (e.g. built
 # locally with the CUDA toolkit installed); CI builds are CPU-only.
+# protein_analysis (2026-07-13, IMPROVEMENTS.md item #7 performance follow-up)
+# was missing from this list until merge-readiness audit found it: gui_main.py
+# imports it for accelerated ensemble-metrics/knot-classification code and
+# falls back to pure Python silently if absent, so the gap never crashed —
+# it would have just silently shipped every portable .exe build without the
+# 14x-1628x speedup this extension exists for.
 extension_binaries = [
     (path, ".")
-    for pattern in ("protein_physics*.pyd", "protein_physics_cuda*.pyd")
+    for pattern in ("protein_physics*.pyd", "protein_physics_cuda*.pyd",
+                     "protein_analysis*.pyd")
     for path in glob.glob(os.path.join(repo_root, pattern))
 ]
 
@@ -48,11 +55,21 @@ ssl_binaries = [
     for path in glob.glob(os.path.join(ssl_dll_dir, pattern))
 ]
 
+# Vendored 3Dmol.js build (2026-07-13, IMPROVEMENTS.md item #7): replaces the
+# CDN <script src="https://3Dmol.org/..."> tag every 3D view used to embed,
+# which intermittently failed to load inside the embedded QWebEngineView.
+# gui_main._vendor_asset_path() looks for this under sys._MEIPASS/vendor/ in
+# a frozen build, matching the "vendor" destination folder given here.
+vendor_datas = [
+    (path, "vendor")
+    for path in glob.glob(os.path.join(repo_root, "python", "vendor", "*"))
+]
+
 a = Analysis(
     ["python/gui_main.py"],
     pathex=[repo_root, os.path.join(repo_root, "python")],
     binaries=extension_binaries + ssl_binaries,
-    datas=[],
+    datas=vendor_datas,
     hiddenimports=["amber_params", "iupred"],
     hookspath=[],
     hooksconfig={},

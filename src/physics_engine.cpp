@@ -922,6 +922,63 @@ bond_templates() {
             {"C4A","O4A"},{"C5","C6"},{"C5","C5A"},{"C5A","O4P"},
             {"O4P","P"},{"P","O1P"},{"P","O2P"},{"P","O3P"},
         }},
+
+        // AMP/ADP/GTP/GDP (2026-07-13, IMPROVEMENTS.md item #4 F1) — same
+        // RCSB CCD _chem_comp_bond extraction method as HEM/NAD/FAD/PLP
+        // above, not hand-adapted from ATP's template (a hand adaptation
+        // risks exactly the kind of subtle atom-naming slip the HEM/NAD/
+        // FAD/PLP entry's own comment already flagged as the reason to move
+        // off memory-transcription for connectivity). Verified the same two
+        // ways: extracted heavy-atom count matches each ligand's
+        // _chem_comp.formula exactly (AMP 23/23, ADP 27/27, GTP 32/32, GDP
+        // 28/28), and each bond graph is a single connected component (no
+        // isolated fragments). Purely additive connectivity data -- charges/
+        // VDW still go through amber_params.py's element-based fallback,
+        // same open gap as every other ligand in this table. No CUDA-side
+        // change needed: BondTopology is a CPU-only pybind11 type shared
+        // with the GPU module via cross-module type registration (see
+        // physics_engine_cuda.cu's own comment on this), so a topology built
+        // here is usable by either engine already.
+        {"AMP", {
+            {"P","O1P"},{"P","O2P"},{"P","O3P"},{"P","O5'"},
+            {"O5'","C5'"},{"C5'","C4'"},{"C4'","O4'"},{"C4'","C3'"},
+            {"O4'","C1'"},{"C3'","O3'"},{"C3'","C2'"},{"C2'","O2'"},
+            {"C2'","C1'"},{"C1'","N9"},{"N9","C8"},{"N9","C4"},
+            {"C8","N7"},{"N7","C5"},{"C5","C6"},{"C5","C4"},
+            {"C6","N6"},{"C6","N1"},{"N1","C2"},{"C2","N3"},
+            {"N3","C4"},
+        }},
+        {"ADP", {
+            {"PB","O1B"},{"PB","O2B"},{"PB","O3B"},{"PB","O3A"},
+            {"PA","O1A"},{"PA","O2A"},{"PA","O3A"},{"PA","O5'"},
+            {"O5'","C5'"},{"C5'","C4'"},{"C4'","O4'"},{"C4'","C3'"},
+            {"O4'","C1'"},{"C3'","O3'"},{"C3'","C2'"},{"C2'","O2'"},
+            {"C2'","C1'"},{"C1'","N9"},{"N9","C8"},{"N9","C4"},
+            {"C8","N7"},{"N7","C5"},{"C5","C6"},{"C5","C4"},
+            {"C6","N6"},{"C6","N1"},{"N1","C2"},{"C2","N3"},
+            {"N3","C4"},
+        }},
+        {"GTP", {
+            {"PG","O1G"},{"PG","O2G"},{"PG","O3G"},{"PG","O3B"},
+            {"O3B","PB"},{"PB","O1B"},{"PB","O2B"},{"PB","O3A"},
+            {"O3A","PA"},{"PA","O1A"},{"PA","O2A"},{"PA","O5'"},
+            {"O5'","C5'"},{"C5'","C4'"},{"C4'","O4'"},{"C4'","C3'"},
+            {"O4'","C1'"},{"C3'","O3'"},{"C3'","C2'"},{"C2'","O2'"},
+            {"C2'","C1'"},{"C1'","N9"},{"N9","C8"},{"N9","C4"},
+            {"C8","N7"},{"N7","C5"},{"C5","C6"},{"C5","C4"},
+            {"C6","O6"},{"C6","N1"},{"N1","C2"},{"C2","N2"},
+            {"C2","N3"},{"N3","C4"},
+        }},
+        {"GDP", {
+            {"PB","O1B"},{"PB","O2B"},{"PB","O3B"},{"PB","O3A"},
+            {"O3A","PA"},{"PA","O1A"},{"PA","O2A"},{"PA","O5'"},
+            {"O5'","C5'"},{"C5'","C4'"},{"C4'","O4'"},{"C4'","C3'"},
+            {"O4'","C1'"},{"C3'","O3'"},{"C3'","C2'"},{"C2'","O2'"},
+            {"C2'","C1'"},{"C1'","N9"},{"N9","C8"},{"N9","C4"},
+            {"C8","N7"},{"N7","C5"},{"C5","C6"},{"C5","C4"},
+            {"C6","O6"},{"C6","N1"},{"N1","C2"},{"C2","N2"},
+            {"C2","N3"},{"N3","C4"},
+        }},
     };
     return t;
 }

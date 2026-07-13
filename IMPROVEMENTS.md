@@ -83,6 +83,215 @@ wrong* for the cases tested. Concretely still open:
   rigid-body backbone-segment perturbation, or fragment-threading — none of
   which existed in the move-set inventory checked this session.
 
+**Baseline re-validation (2026-07-13): re-ran the full 15-protein accuracy
+suite before any new work — 14/15 still pass, no regression** (2CI2 still
+correctly N/A on the same numbering-offset limitation, not a new failure).
+See the joint Item #1/#2 basin-hopping investigation below for the actual
+follow-up on the divergent-decoy generator this item calls for — the
+`_coarse_pivot` mechanism already built for Item #2 turned out to be
+directly applicable here too.
+
+**Joint Item #1/#2 investigation (2026-07-13): the divergent-decoy-generator
+gap and the disabled `USE_PIVOT_BRANCH` mechanism are the same underlying
+question — investigated together. Real, decisive positive signal on
+structural divergence; real, decisive negative signal on safety as a
+default. Kept off.**
+
+Both open items pointed at the same untried mechanism:
+`_coarse_pivot`/`_PivotBranchRunnable` (`python/gui_main.py`,
+`USE_PIVOT_BRANCH=False`) was built for a different purpose (`2836cbe`) but
+never evaluated against either this item's "no move type can produce a
+divergent decoy" finding or Item #2's "explicit basin-hopping jumps between
+discovered basins" named-but-untried candidate. Rather than run two separate
+validation sweeps on the same code path, investigated once.
+
+**Read-verified before running anything**: `_coarse_pivot` rotates strictly
+around an existing `topo.rot_bonds` axis — `origin = atoms[rb.i]`,
+`axis = normalize(atoms[rb.j] - atoms[rb.i])` — cross-checked against
+`try_torsion`'s identical axis convention in `physics_engine.cpp:2271-2290`
+(`axis = normalize(st[rb.j] - st[rb.i])`, same rotated `side` atom set). The
+kick is geometrically pure torsion, just larger (1.0-3.0 rad vs.
+`ANGLE_MAX=0.50`) and unconditional (no Metropolis judgment on the raw
+post-kick energy) — confirms it preserves bond length/angle by construction,
+same as every existing move type (relevant to Item #3's deferral, see below).
+
+**Smoke test (1UBQ, via the real `LandscapeWorker`/`run_landscape_trajectory`
+path): dramatic, clean success.** Flipped `USE_PIVOT_BRANCH=True` at runtime
+(not a permanent default change) and ran a real landscape job. The pivot
+branch's per-snapshot energy trajectory is the textbook basin-hopping
+signature: 86,059 kcal/mol immediately after the kick (a large transient
+clash), then monotonic relaxation over the branch's 15 snapshots down to
+2,981 kcal/mol — fully comparable to the three ordinary branches' own energy
+range (2,550-3,199 kcal/mol) — while settling at **11-15 Å Cα RMSD** from the
+seed structure, roughly 20-40x further than every prior decoy attempt's
+0.4-1.0 Å ceiling (Item #1's documented failure mode). The classifier's own
+structural-displacement gate independently flagged this basin as
+`"structural"` (residues 68-76 differing by up to 38.3 Å), confirming this
+reads as a genuine alternate basin to the existing pipeline, not noise.
+
+**Scale-up, arm 1 (Item #1's actual code path — `generate_ensemble` via
+`tests/accuracy_test.py --decoy-discrimination`, extended with a third
+pivot-branch-decoy comparison arm): mixed, and surfaced a real, unresolved
+mechanistic discrepancy.** Same-budget discipline preserved (pivot kick then
+`relax_steps`-budget relax at native T=0.6, compared against the existing
+same-budget relaxed-native reference). On 1UBQ and 1LYZ (20,000-step budget,
+matching the existing hot-MC-decoy arm):
+
+| Protein | Pivot-decoy Cα RMSD | Margin vs. relaxed-native | Verdict |
+|---|---|---|---|
+| 1UBQ | 3.03 Å | +0.61 kcal/mol/atom | OK — native scores lower (sensible) |
+| 1LYZ | 2.41 Å | **-9.79 kcal/mol/atom** | FLAG — decoy scores much better than native |
+
+Real improvement over the hot-MC decoy (which only reached 0.36-0.56 Å on
+these same two proteins) — the pivot mechanism does produce a more divergent
+decoy. But two things keep this from being a clean win: (1) only 1/2
+proteins ranked correctly, and 1LYZ's -9.79 kcal/mol/atom margin is a much
+larger gap than the hot-MC decoy's own -5.26 on the same protein, an
+uncomfortable result worth naming rather than explaining away — it's
+consistent with either a genuine force-field ranking gap (echoing this
+item's still-open central question) or an incompletely-controlled-for
+crystal-strain artifact, not distinguished this session; (2) **the RMSD
+achieved here (2.4-3.0 Å) is far smaller than the smoke test's 11-15 Å for
+the same kick mechanism on the same protein (1UBQ)** — the two code paths
+differ in both move mix (`generate_ensemble`: 25% crankshaft/75% torsion,
+no concerted-sidechain; `run_landscape_trajectory`: 15% concerted-sidechain,
+then crankshaft/torsion split) and relax budget (one continuous 20,000-step
+run here vs. 15×600=9,000 steps via intermediate snapshots in the smoke
+test) — which dominates the difference was not isolated this session, and is
+a real open mechanistic question, not a settled one.
+
+**Scale-up, arm 2 (Item #2's actual code path — repeat-run classification
+stability with `USE_PIVOT_BRANCH=True`, matching
+`tests/landscape_stability_test.py`'s methodology): a real regression on the
+one case that matters most.** 1UBQ stayed safe: 3/3 correctly ORDERED,
+funnel 0.500-0.750 (comparable to the existing no-pivot baseline). **1XQ8 (the
+one real IDP in the ground-truth set) dropped from the just-fixed 3/3 to
+2/3** — one run misclassified ORDERED at funnel=**0.720**, a value never
+seen for this protein anywhere in this item's entire history (every prior
+run, buggy-depth or fixed-depth, landed in the 0.240-0.383 range). Mechanism
+not root-caused in depth this session, but the plausible explanation is
+straightforward: adding one pivot branch's relaxed-and-partially-recovered
+snapshots to the pool can reinforce/merge into the dominant basin rather than
+forming a genuinely separate one, inflating the apparent single-basin
+dominance (funnel) the classifier reads as "ordered" — the opposite of the
+intended effect.
+
+**Verdict: `USE_PIVOT_BRANCH` stays `False` (this session made no permanent
+default change).** Per this repo's own established bar for this exact kind
+of decision (replica exchange, simulated annealing before it): implemented,
+smoke-tested, scaled up on real ground-truth cases, real mixed-to-negative
+evidence, not adopted. This is genuinely a partial result, not a clean
+failure: the underlying mechanism (`_coarse_pivot` + MC relax) is now
+*proven* capable of escaping the 0.4-1.0 Å band that blocked Item #1
+entirely before this session (the smoke test's 11-15 Å result is real and
+reproducible) — but naively pooling its output into the existing
+branch-averaging pipeline is not safe as a drop-in default, evidenced
+concretely by the 1XQ8 regression. **Not yet attempted, real candidates for
+whoever picks this up next**: relaxing the pivot branch with a
+local-minimization-style quench instead of full thermal MC (the standard
+basin-hopping design, which this implementation deliberately doesn't do —
+it reuses the same `run_landscape_trajectory` thermal relax every other
+branch uses); excluding pivot-branch snapshots from the funnel/dominance
+calculation while still including them in the competitive-basin check (so
+they can only ever add evidence of disorder, never dilute it); and isolating
+the `generate_ensemble` vs. `run_landscape_trajectory` move-mix/budget
+discrepancy directly (arm 1 above) before trusting either code path's decoy
+RMSD numbers as representative of the mechanism's real ceiling. Given this
+repo's own documented history of 3+ shelved multi-day investigations for
+Item #2 already (R-hat, replica exchange, simulated annealing), this session
+stopped here per the same discipline rather than continuing to tune angle
+range/pivot count/relax style — a decisive go/no-go was reached, which is
+the actual goal of an exploratory pass like this one.
+
+**Follow-up (2026-07-13): fixed the diagnosed 1XQ8 regression mechanism —
+`USE_PIVOT_BRANCH` is now proven safe, but kept `False` since no ground-truth
+case actually needs it yet.** The joint investigation above diagnosed, but
+didn't fix, why enabling the pivot branch caused 1XQ8 to drop from 3/3 to
+2/3: pivot-branch snapshots were pooled indiscriminately into the same
+`all_snapshots`/`layout` used for the funnel/dominance measurement, so a
+pivot branch that partially relaxed back toward the dominant basin's cluster
+could inflate `funnel = len(best_comm) / N`, reading as artificially more
+"ordered" — the opposite of the intended effect. Of the three follow-up
+candidates this same investigation named (local-minimization quench,
+excluding pivot snapshots from the funnel/dominance denominator, isolating
+the `generate_ensemble`/`run_landscape_trajectory` move-mix discrepancy),
+only the second was attempted this pass: the first requires
+`minimize_torsion`, which no longer exists on this branch (it was just
+deliberately retired as part of closing out the unrelated
+`torsion-gradient-minimizer`/`alternating-gm-mc-relax` investigation, see
+`archive/torsion-gradient-minimizer` — re-implementing a C++ minimizer for a
+different use case is out of scope for a bounded fix); the third is a
+diagnostic, not a fix, and wasn't attempted this pass either — noted here as
+still open, not silently dropped.
+
+**Fix (`LandscapeWorker.run()`, `python/gui_main.py`):** pivot-branch
+snapshots are now tagged with a boolean `pivot_mask` while pooling, and a
+pivot-excluded population basis `N_core` is computed alongside `N`. `funnel`
+and `pop_dominant` (previously two independent computations of the same
+`len(best_comm)/N` formula — fixing only one would have left `pop_threshold`,
+which gates half of the `competitive` OR-test, still polluted) are now both
+computed on the `N_core`/`core_best` basis. The eps/step-displacement
+calibration and the R-hat computation also exclude the pivot branch's own
+internal steps/chain, since neither is "ordinary thermal jitter" or a
+like-for-like Gelman-Rubin comparison. `best_comm` selection, `sig`,
+`communities`/DBSCAN, `global_best_e`, and `competitive`/
+`competitive_structural` are deliberately left on the full pooled `N` —  a
+pivot-discovered basin can still count as evidence of disorder, it just
+can't dilute how dominant the dominant basin looks. When
+`USE_PIVOT_BRANCH=False` (the default both before and after this fix),
+`pivot_mask` is all-`False` and every changed line reduces algebraically to
+its old value — a built-in regression guard, not just a claim.
+
+**One real asymmetry, flagged rather than silently resolved:** a candidate
+basin's own population-ratio check (`len(c) / N`, unchanged) still uses the
+full `N`, while `pop_dominant` now uses the smaller `N_core` — so whenever
+`N_core < N`, `pop_threshold` ends up very slightly *higher* than before.
+This is a directionally conservative (safe) side effect, not a new bias
+toward false positives, but it's a real, deliberate asymmetry worth having
+on record.
+
+**Validation.** Step 1, regression guard: re-ran
+`tests/landscape_stability_test.py` unmodified (`USE_PIVOT_BRANCH` still
+`False`) — 1UBQ 3/3, 1LYZ 3/3, 1YPI 4/4, 1XQ8 3/3, all correct, funnel ranges
+consistent with prior documented baselines. Confirms the refactor is a true
+no-op on the existing default path. Step 2, targeted pivot-on re-test (via a
+runtime monkeypatch of `USE_PIVOT_BRANCH = True`, same technique the
+original smoke test used — not a permanent default change):
+
+| Protein | Repeats | Result | Funnel range | Avg time |
+|---|---|---|---|---|
+| 1XQ8 (the case that broke) | 3 | 3/3 POSSIBLY DISORDERED | 0.320–0.347 | 141.0s |
+| 1UBQ | 3 | 3/3 ORDERED | 0.489–1.000 | 40.6s |
+| 1LYZ | 2 | 2/2 ORDERED | 0.333–0.667 | 102.9s |
+| 1YPI | 1 | 1/1 ORDERED | 0.300 | 379.2s |
+
+1XQ8's pivot-on funnel range (0.320–0.347) now sits almost exactly on top of
+its own no-pivot baseline range from the same session (0.320–0.347) — a
+clean, decisive recovery from the previously-documented outlier (one run at
+funnel=0.720, never seen before or since). No ordered control regressed.
+1YPI's wall time (379.2s) is higher than the ~1.33x a 3→4 branch-count
+increase alone would suggest (its no-pivot baseline this session averaged
+157.5s) — real overhead from the pivot branch's own full relax phase at
+1YPI's scale, not a bug, and still well within a single-run budget.
+
+**Decision: keep `USE_PIVOT_BRANCH = False`, per this item's own
+pre-stated decision rule.** All three "adopt" conditions from the rule were
+individually met (1XQ8 recovers cleanly, no ordered control regresses, the
+~33% compute overhead is acceptable) — but the rule's own second clause
+applies here: **no ground-truth case in the current 4-protein roster
+actually flips from wrong-to-right because of the pivot branch.** The
+no-pivot baseline already passes all 4 cases 100% correctly this session:
+the pivot branch's real, now-proven contribution is that it no longer makes
+things *worse*, not that it's currently needed to make anything *better*.
+Per this item's own stated preference ("prefer conservative: keep off unless
+there's a clear win"), the honest call is to keep the flag off. The code fix
+itself is kept regardless — it's a real, independently-defensible
+measurement-precision correction, not contingent on the flag ever being
+flipped. This ties directly into finding a genuine, currently-uncovered
+large-IDP ground-truth case (tracked separately below): if such a case
+doesn't classify correctly without the pivot branch, that would be the clean
+win this decision is waiting for.
+
 **2. IDP/disorder landscape classification — real-IDP calibration in progress, multiple real bugs found and fixed, not yet closed**
 The population-weighted, multi-branch IDP classifier (see "Completed Work" →
 Analysis for the original design) was calibrated only against stable, ordered
@@ -1195,10 +1404,236 @@ the one pre-existing parsing bug the same test run exposed:
   turns out to have a hard ceiling regardless of budget or acceptance
   temperature.
 
+**Re-test pass (2026-07-13): baseline re-validation surfaced a real gap —
+`tests/landscape_stability_test.py` was silently testing 1XQ8 (the one real
+IDP in the ground-truth set) at the wrong sampling depth the whole time, not
+the depth the shipped disorder-aware feature actually uses in the real GUI.**
+Re-ran the full stability suite as a first-principles check before touching
+any code: 1UBQ 3/3, 1LYZ 3/3, 1YPI 4/4 all correct, matching the documented
+baseline — but **1XQ8 came back 2/3 correct** (one run misclassified
+ORDERED, funnel 0.633, well outside the previously-documented 0.320-0.383
+range), breaking the previously-validated 3/3.
+
+Root-caused rather than dismissed as noise: `tests/landscape_stability_test.py`
+unpacked `_parse_pdb`'s return tuple as `atoms, ca_indices, ca_map, topo,
+*_rest = ...`, silently discarding `iupred_scores` (the 5th element) via
+`*_rest`. This meant the harness never passed `iupred_scores` to
+`LandscapeWorker`, so `disorder_frac` defaulted to `0.0` for every case —
+including 1XQ8, the one protein the disorder-aware sampling-depth feature
+(this item's own "disorder-aware sampling" sub-section above) was built for.
+The harness was testing 1XQ8 at the un-boosted `20×600` depth instead of the
+real `25×586` depth `_start_landscape` actually uses in the GUI (confirmed by
+printing `_adaptive_depth`'s output both ways) — a stale in-code comment on
+`_adaptive_depth` even claimed this harness "has no sequence info at all,"
+which was never true; `_parse_pdb` already computes real IUPred scores from
+the parsed PDB's real sequence, they just weren't being threaded through.
+
+**Fixed by threading `iupred_scores` through the harness** (`run_one()` now
+takes an `iupred_scores` parameter and passes it to `LandscapeWorker`; `main()`
+unpacks it explicitly instead of discarding it, and prints the real
+`disorder_frac`/depth for visibility). Corrected the stale `_adaptive_depth`
+docstring claim. **Re-validated 1XQ8 alone, 3 fresh runs at the corrected
+depth: 3/3 correctly POSSIBLY DISORDERED** (funnel 0.280-0.333, matching the
+historically-documented range) — confirms this was a test-harness gap, not a
+regression in the actual shipped classifier or sampling logic, and the fix
+closes it. Full 4-protein suite re-run not repeated this session (1YPI alone
+costs ~200s/run × 4) since the isolated 1XQ8 re-run already isolates and
+confirms the fix; re-running the full suite is cheap to do in any future
+session that touches `LandscapeWorker` again.
+
+**Large single-chain IDP calibration gap (2026-07-13): a real, bounded,
+database-driven search — no qualifying candidate found, gap stays open.**
+The calibration roster has exactly one real IDP (1XQ8, 140 res); every prior
+note on this gap ("genuine large IDPs mostly have no single deposited
+structure at all") was a general impression, never backed by an actual
+search of a disorder-specific database. This pass ran one.
+
+**Method: DisProt's full region-level dataset (3,337 curated disorder
+regions), queried programmatically, not eyeballed.** Fetched
+`disprot.org/api/search` (region_content=disorder, current release) and
+filtered for regions with (a) a real PDB cross-reference, (b) NMR-based
+evidence (`nuclear magnetic resonance ... evidence used in manual
+assertion`, DisProt's own evidence-code text), (c) region length ≥100
+residues, then separately re-ran without the NMR-evidence-code filter (in
+case a real NMR structure existed under a differently-worded evidence
+annotation) for any region ≥140 residues with any PDB cross-reference at
+all, to avoid missing a candidate due to DisProt's own annotation
+completeness.
+
+**Result: the NMR-evidenced query surfaced only sub-140-residue fragments**
+(the largest, PopZ's N-terminal domain at 133 residues via PDB 6XRY, sits
+just under this suite's own 140-residue floor) — no genuinely large,
+NMR-backed, single continuous disordered region exists in DisProt's curated
+set. **The broader, evidence-code-agnostic query surfaced ~200 regions
+≥140 residues with a PDB cross-reference, but essentially all of them are
+"disordered because unresolved" fragments inside much larger ordered
+assemblies** (spliceosome subunits, RNA Pol II C-terminal domains,
+nucleoporins, huntingtin-HAP40 complex fragments, membrane-protein
+intracellular loops) — crystallographic/cryo-EM missing-density annotations
+within a folded macromolecular complex, not standalone free-chain disorder
+of the kind this test roster needs. Applying the disqualification checklist
+(free/monomeric, not complex-bound; genuinely literature-documented
+disorder, not just "missing density"; full claimed chain length, not a
+fragment; multi-model NMR) eliminated every one of them.
+
+**Individually investigated, named candidates — each disqualified for a
+concrete, checkable reason:**
+  - **apoE3 (PDB 2L7B, 307 res)**: an ordered four-helix-bundle N-domain +
+    defined hinge helix + C-domain, per its own structural description —
+    real IDR character in specific regions, not genuine free-chain disorder
+    across the molecule. A plausible-by-size-alone candidate that fails on
+    inspection.
+  - **TDP-43 C-terminal low-complexity domain (PDB 2N2C, DisProt-annotated
+    region 263-414, 152 res)**: the actual deposited structure is titled
+    "NMR Structure of TDP-43 prion-like hydrophobic helix **in DPC**"
+    (dodecylphosphocholine, a micelle-forming detergent) — the same
+    micelle-induced-order caveat 1XQ8 itself already carries, not an
+    improvement on the existing case, and likely covers only a short
+    helical sub-segment of the full 152-residue DisProt-annotated span, not
+    the whole region as a free ensemble.
+  - **Alpha-synuclein via PDB 2KKW (140 res)**: same protein, same length as
+    the existing 1XQ8 case — doesn't extend the roster's size coverage even
+    if it were adopted.
+  - **Tau (largest isoform, 441 res) — the most obvious "famous large IDP"
+    candidate, checked explicitly and ruled out**: confirmed via literature
+    search that full-length free-monomer tau has **no PDB deposit at all**
+    — "full-length tau monomeric structures are not typically deposited in
+    the PDB... complete high-resolution structures of the free full-length
+    monomer remain elusive due to tau's intrinsic disorder" (its NMR
+    chemical-shift data lives in BMRB, entry 50701, not as a PDB structure).
+    Existing PDB entries for tau are fragments bound to microtubules or
+    other partners, not the free full-length chain — disqualified on the
+    same "needs a real PDB deposit of the free form" ground as tau's own
+    literature already states plainly.
+
+**Conclusion: the gap remains open, and this is now a verified, not
+assumed, negative result.** A bounded, database-driven search (DisProt's
+full curated set, ~200+ size-qualifying PDB cross-references individually
+categorized, plus 4 explicitly-named candidates checked one by one) found
+no single-chain, free-form, real-PDB-backed IDP larger than the existing
+140-residue 1XQ8 case. This confirms rather than merely repeats the prior
+impression: genuinely large IDPs overwhelmingly lack a deposited structure
+of their free form precisely because they're disordered — the same property
+that makes them scientifically interesting to this classifier is also what
+keeps them out of the PDB. No new test case was added to
+`tests/landscape_stability_test.py`'s `CASES` list this pass, since adding
+a wrong or borderline ground-truth label would be worse than leaving the
+gap open (a coin-flip label the suite would then trust as ground truth).
+Revisit if a genuine candidate surfaces later — the search method above
+(DisProt's region-level API, filtered and cross-checked the way described)
+is reusable and cheap to re-run.
+
+**Follow-up (2026-07-13, same day): PED's real query backend investigated
+(inconclusive, documented rather than abandoned silently), and the
+disqualification criteria re-examined — a real second IDP found and
+adopted, though it doesn't close the "large" gap above.**
+
+Tried to reach PED (Protein Ensemble Database)'s actual browse/search API,
+since PED is purpose-built for exactly this and the search above only
+covered DisProt. PED's frontend is a client-rendered Angular SPA; found a
+real backend host (`deposition.proteinensemble.org`, discovered via the
+frontend's own JS bundle) but it returns proper 404s for every guessed
+`/api/...` route rather than serving data — reading the bundle further
+identified this host as PED's *deposition* (submission) service, not the
+browse/search index; the actual query endpoint was not found via
+server-side route-guessing alone (would need a browser's network inspector
+to observe the real call, not available in this session). Documented as
+"tried, not reachable this way" rather than left unmentioned.
+
+**Re-examined the disqualification checklist itself and found the
+140-residue floor had been applied too rigidly** to one genuinely strong
+candidate surfaced by the DisProt search but discarded earlier purely on
+size: **PopZΔ134-177** (PDB 6XRY), the N-terminal domain of *Caulobacter
+vibrioides* polar organizing protein Z. Re-reading the source paper (Holmes
+et al. 2020, PMC7736533) directly rather than trusting the DisProt
+region-length number: this is a deliberately truncated construct studied
+*because* it doesn't self-assemble (the genuine free/unbound monomer state,
+not induced by a micelle or binding partner — a stronger claim than 1XQ8's
+own deposit, which is micelle-bound), described as "unstructured in
+solution, with the exception of a small amphipathic α-helix" spanning only
+~8 residues (M10-I17) — i.e. almost the entire construct is genuinely
+disordered, not just a region within it. Passes every substantive item on
+the disqualification checklist (free/monomeric, literature-documented,
+whole-construct not a fragment-within-a-complex, multi-model solution NMR).
+**Re-checked the actual deposited file directly rather than trusting the
+paper's construct name**: `SEQRES` in the fetched PDB confirms chain A is
+**141 residues**, not the 133 implied by "Δ134-177" naming alone — this
+does clear the 140-residue floor, by one residue, though only barely; it
+should not be read as meaningfully extending size coverage toward the
+"large" (200-300+ residue) gap this item is actually about.
+
+**Added as a second IDP calibration case, `tests/landscape_stability_test.py`
+`CASES`, and validated: 3/3 correctly POSSIBLY DISORDERED, funnel = 0.333
+in all three runs** — an unusually tight, fully reproducible result (tighter
+than 1XQ8's own 0.320-0.347 range this session). `data/6XRY.pdb` fetched
+from RCSB and bundled alongside the other 4 structures (no internet access
+needed to run the suite). This is the calibration roster's first addition
+to the real-IDP side since 1XQ8 — previously every disorder-detection
+finding rested on a single example; a second, independent, differently-
+folded real IDP gives the "detects real disorder" side of this classifier's
+validation the same N≥2 redundancy the ordered side already had (1UBQ,
+1LYZ, 1YPI).
+
+**Correction (2026-07-13, same day, merge-readiness audit): the "3/3, tight
+and reproducible" claim above did not hold up under further independent
+re-runs — genuinely unstable, not a coin-flip fluke of a small sample.**
+Re-ran the identical, unmodified test 9 more times across two independent
+batches while auditing this branch for a merge into `main`: **6/9 correct
+(67%)**, funnel range **0.272-0.358** — noticeably wider than, and
+overlapping, the original 0.320-0.347 claim, and straddling right across
+the classifier's own ORDERED/POSSIBLY-DISORDERED boundary. Concretely,
+funnel=0.296 produced the correct label in one run and the wrong label in
+another — the funnel score alone doesn't cleanly separate these two labels
+for this protein at this sampling depth, the same failure mode
+`COMPETITIVE_KT`/pop-ratio tuning and the structural-displacement gate were
+built to catch for other cases, but evidently not fully closed here. First
+confirmed this wasn't a seed-reproducibility bug in the test harness itself:
+`PhysicsEngine()` seeds its internal `std::mt19937` from
+`std::random_device{}()` (`physics_engine.cpp:2236`), not from anything
+`np.random.seed()`-controlled, so every "repeat run" in this entire test
+suite — and every repeat-run investigation in this file's history — was
+always a genuinely independent stochastic draw; that's the correct,
+intended design (matches real unseeded GUI usage), not something to fix.
+**This means the original commit's 3/3 result was real but was drawn from
+too small a sample (n=3) to characterize a case that sits this close to the
+decision boundary** — the same category of already-documented issue as
+pre-fix 1LYZ (a genuine coin-flip case, root-caused to insufficient MC
+sampling depth, not a classification-logic bug) and the still-open
+non-stationary-MC-chain finding from item #1's history. Not treated as a
+reason to revert the PopZ addition (6XRY is still a real, literature-
+documented, correctly-parsed IDP structure, and the classifier gets it right
+more often than not), but the roster entry's reliability should be read as
+"real IDP, borderline-stable detection" rather than "solidly validated" —
+and `tests/landscape_stability_test.py`'s own `CASES` entry for 6XRY is a
+known-flaky assertion (currently still asserts 3/3), not a green,
+trustworthy gate, until the same sampling-depth work already scoped
+elsewhere in this item lands. Flagging here rather than leaving the
+overclaim standing, per this file's own established practice of correcting
+prior entries when new evidence contradicts them.
+
+**The genuinely large (>200-300 res) gap remains open** — PopZ doesn't
+close it, and the structural reason named in the search above (NMR spectral
+crowding scaling unfavorably with disordered chain length, making full-chain
+assignment progressively harder exactly where coverage is most wanted)
+still applies. This is now two independent, real-database-driven search
+passes (DisProt region-level + an attempted PED backend probe) that found
+nothing at that scale — treated as a stable, not provisional, conclusion
+absent a new deposited structure appearing.
+
 **3. Bond stretching + angle bending energy terms (P1.4c)**
 Torsion moves preserve bond lengths/angles by construction, so these terms sit at
 their equilibrium minima and contribute < 0.1 kcal/mol/step — safe to defer
 indefinitely unless a future move type (e.g. bond-length perturbation) needs them.
+
+**Re-audited (2026-07-13) following this session's basin-hopping investigation
+(Item #1/#2 joint work above) — deferral remains valid, no code changes.**
+The new `_coarse_pivot` mechanism explored this session was the one candidate
+worth checking: read-verified (and cross-checked against `physics_engine.cpp`'s
+`try_torsion`) that it rotates strictly around existing `topo.rot_bonds` axes,
+identical geometry to ordinary torsion moves, just at a larger unconditional
+angle — it does not perturb bond length or angle. No other new move type was
+introduced this session. This item's precondition — every move type in this
+codebase preserves bond geometry by construction — still holds.
 
 **4. Full GAFF2 force field for organic ligands/cofactors — bond connectivity
 done for ATP/heme/NAD⁺/FAD/PLP, partial charges still deliberately unfixed**
@@ -1310,10 +1745,249 @@ entries touched). Charges/VDW for all four still go through
 rotatable-bond classification also not added (out of scope, same boundary
 as ATP: these ligands stay static during MC torsion sampling).
 
+**Re-test pass (2026-07-13): bond-template coverage extended (AMP/ADP/GTP/GDP,
+decoupled from the RESP-charge blocker), and ATP's real partial charges finally
+sourced and shipped — both closed as real wins, not dead ends.**
+
+**F1 — AMP/ADP/GTP/GDP bond connectivity, same RCSB CCD extraction method as
+HEM/NAD/FAD/PLP.** These four were the obvious remaining gap in `bond_templates()`
+(ATP/HEM/NAD/FAD/PLP covered, the adenine/guanine mono-/di-phosphate relatives
+not). Rather than hand-adapt ATP's template (a real risk of a subtle atom-naming
+slip — exactly the failure mode the HEM/NAD/FAD/PLP entry's own comment already
+flagged as the reason to stop hand-transcribing connectivity from memory),
+fetched each ligand's `_chem_comp_bond` record directly from
+`files.rcsb.org/ligands/view/<CODE>.cif` and extracted heavy-atom (non-hydrogen)
+pairs programmatically, same as before. Verified two ways, same bar as HEM/NAD/
+FAD/PLP: extracted heavy-atom count matches each ligand's `_chem_comp.formula`
+exactly (AMP 23/23, ADP 27/27, GTP 32/32, GDP 28/28), and each bond graph forms
+a single connected component (no isolated fragments). Added to `bond_templates()`
+in `physics_engine.cpp`. **No CUDA-side change needed** — confirmed by reading
+`physics_engine_cuda.cu`'s own comment before assuming: `BondTopology` is a
+pybind11 type registered only in the CPU module and shared with the GPU module
+via cross-module type registration, so a topology built via `bond_templates()`
+is already usable by either engine. Charges/VDW for these four still go through
+the element-based fallback, same open gap as every other ligand in this table.
+
+**F2 — ATP's real RESP partial charges sourced and shipped (the gap this item
+explicitly flagged as blocked, and re-confirmed blocked by two more failed
+routes in a 2026-07-09 follow-up).** A bounded, capped re-search this session
+tried genuinely new avenues (not re-litigating the already-exhausted Manchester-
+database/paper-paywall/GitHub-`.mol2` search from before): checking whether the
+Manchester AMBER Parameter Database's *index* was reachable even if the
+previously-tried main domain wasn't. It was — `personalpages.manchester.ac.uk/
+staff/Richard.Bryce/amber/index.html` is a live mirror of the same index, still
+listing ATP's PREP/FRCMOD files under a "revised phosphate parameters (Carlson)"
+entry. The listed download links themselves (`pdrives.manchester.ac.uk/horde/
+gollem/cof/...`) turned out to be dead — that whole subdomain has been
+repurposed to a Horde webmail login and returns 404 for every direct file
+request, a more precise root cause than the earlier session's plain
+"unreachable" note. **Recovered instead via a live Wayback Machine snapshot**
+(dated 2025-12-15, `web.archive.org/web/20251215142629/http://amber.manchester.
+ac.uk/cof/ATP.prep` and the companion `frcmod.phos`) — confirmed genuine, not
+just plausible-looking, because `frcmod.phos`'s own NONBON section cites
+"J Comp Chem 2003, 24, 1016-1025", the *exact* Meagher/Redman/Carlson reference
+this module's own bond-connectivity comment had already named as the target
+before this session, when it was unreachable. Independent cross-validation:
+`frcmod.phos`'s phosphate-linker VDW values (H1, O2, CT) match this file's own
+pre-existing `VDW_PARAMS` entries exactly — not a coincidence, both trace back
+to the same AMBER force-field lineage, and it confirms the recovered file is
+consistent with parameters already trusted in this codebase.
+
+Wired into `amber_params.py`'s `PARTIAL_CHARGES["ATP", ...]` as **united-atom**
+charges (this codebase only creates Particles for heavy atoms actually present
+in a PDB file, and real deposited ATP HETATM records essentially never resolve
+hydrogens) — each hydrogen's RESP charge from the source PREP file was folded
+onto its bonded heavy-atom parent, using the PREP file's own internal Z-matrix
+parent-atom column to determine H-to-heavy bonding directly from the source,
+not inferred. Same convention already used for every standard amino acid via
+`missing_hydrogen_charge()`, applied to a ligand for the first time. **Verified
+two ways**: the 31 heavy-atom names produced this way match `physics_engine.cpp`'s
+existing ATP bond-template atom names exactly (31/31, confirmed programmatically,
+zero mismatches either direction); and summing all 31 united-atom charges gives
+exactly **-4.0000e**, matching ATP's expected ATP⁴⁻ formal charge (the standard
+fully-deprotonated form used in this force-field lineage) — a real
+internal-consistency check a transcription error would very likely have broken.
+
+**VDW radii/epsilon deliberately NOT added this round.** `frcmod.phos` only
+covers the phosphate-linker atom types (H1, O2, O3, CT, P, OS) — ATP's several
+purine/ribose atom types (N*, CK, CQ, ...) live in the base AMBER94/99 force
+field, not this phosphate-specific frcmod, and weren't independently verified
+this session. Rather than transcribe those from memory (the same risk already
+declined for ATP's charges before this session), ATP's VDW still goes through
+the existing element-based fallback — unchanged, not a regression; `charge` and
+`(radius, epsilon)` are independent lookups in `get_atom_params()`, so real
+charges could ship without needing real VDW at the same time.
+
+**Remaining for this item**: same real partial charges for HEM/NAD/FAD/PLP,
+following the same Wayback-recovery method now that it's known to work (the
+Manchester database's live index lists sourced entries for all four — Giammona
+heme, Walker/Ryde/Gready NAD(H)/NADP(H) variants — not fetched this round,
+out of the F2 time-box); and the several missing nucleic-acid VDW atom types
+noted above.
+
+**Rebuilt and functionally validated (2026-07-13).** `python setup.py
+build_ext --inplace` rebuilt all three extensions (`protein_physics`,
+`protein_physics_cuda`, `protein_analysis`) with the new AMP/ADP/GTP/GDP bond
+templates and ATP charges live. `tests/bridge_test.py` and `tests/knot_test.py`
+(4/4, including the new UCH-L1 case from item #6's re-test) both clean —
+confirms the rebuild didn't regress anything outside this item's own scope.
+**A/B-validated the ATP charge addition specifically isn't just "doesn't
+crash" but behaves sanely**: re-fetched the real deposited structure 2P0X
+(same one used for the original bond-template validation) and computed its
+full potential energy with the new charges active vs. forced back to the
+pre-session zero-charge state (`PARTIAL_CHARGES` entries removed at runtime,
+same structure, same bond template) — **+383.3 kcal/mol total (+0.36
+kcal/mol/atom averaged over the whole 1079-atom structure) from adding real
+ATP electrostatics**, a modest, physically sane shift concentrated on ATP's
+own ~31 atoms, not a blowup or NaN. Confirms the new charges are actually
+being read (1061/1079 particles carry non-zero charge) and integrate cleanly
+with the rest of the energy function.
+
+**Second re-test pass (2026-07-13, same session): ADP/GTP/GDP RESP charges
+sourced and shipped (closing the exact gap F1 above flagged as
+"decoupled from the RESP-charge blocker" — turns out it wasn't actually
+blocked, just never re-checked), plus HEM and NAD — 5 of the 6 remaining
+open cofactor-charge gaps closed in one pass. FAD/PLP/AMP charges remain
+genuinely blocked, documented rather than left silent.**
+
+**Corrected assumption from the prior pass: the Manchester index does list
+ADP/GTP/GDP, under ATP's own "revised phosphate parameters (Carlson)"
+family.** F1 above stated "no Manchester-DB source has ever been identified
+for these four's charges" for AMP/ADP/GTP/GDP — re-checking the live index
+directly (rather than trusting the prior session's characterization)
+overturned that for three of the four: `ADP.prep`, `GTP.prep`, `GDP.prep`
+are listed right alongside `ATP.prep`, all sharing the same `frcmod.phos`
+already cross-validated for ATP. Retrieved via the identical Wayback
+snapshot URL pattern, same host/date as ATP's own source. AMP has no entry
+in this family (or anywhere else in the index) — still genuinely blocked,
+not re-attempted beyond confirming that absence.
+
+**HEM (heme b) and NAD(+) charges also sourced, same index, different
+citation lineages** — HEM from the "all-atom heme" entry (`heme_all.in`,
+citing Giammona's original heme force field, further described in the file
+as "Yves names, Bayly-modified" — Bayly being a RESP-method co-author, a
+credible, checkable attribution). NAD from the Ryde-parameter entry
+(`nad+.prep`, "AMBER 5.0 compatible; U. Ryde, to be published, 22/4-98"). A
+second NAD candidate, the "Walker parameters" `NAD+.lib`, was fetched and
+**rejected** — its own internal residue label is `NDP` (RCSB's code for
+NADP+, a different molecule with an extra phosphate), not `NAD`, a real
+identity mismatch caught by actually reading the file's contents rather than
+trusting its listed filename. This is exactly the kind of failure mode this
+item's own established caution was written to catch.
+
+**Two real, nontrivial verification challenges, both resolved and both
+worth recording as method, not just result:**
+  - **HEM's charges are listed in a separate positional `CHARGE` block**,
+    not inline per atom-line like every other source file used so far —
+    mapped back onto atom names by counting position against the file's own
+    atom listing (verified: 73 charges for 73 real atoms, excluding the 3
+    `DUMM` placeholders). All 43 heavy-atom names matched
+    `physics_engine.cpp`'s existing HEM bond-template names exactly with no
+    remapping needed (both sources independently ended up using the same
+    "Yves names" convention).
+  - **NAD's source file uses a different atom-naming convention entirely**
+    from `physics_engine.cpp`'s RCSB-CCD-derived bond template (Ryde's
+    Z-matrix-walk names like `C'N1`/`C'A5` vs. the CCD's `*B`/`*D`
+    ribose-suffix convention) — unlike ATP/ADP/GTP/GDP's mechanical `*` → `'`
+    notation swap, this needed a real atom-by-atom correspondence built from
+    connectivity, not string similarity. Traced by matching each source
+    atom's bonded neighborhood (from the PREP file's Z-matrix bond column
+    plus its explicit `LOOP` ring-closure records) against
+    `physics_engine.cpp`'s bond graph. Notably, the nicotinamide-ring and
+    adenine-ring atom names turned out to already be identical between the
+    two sources — only the two ribose-sugar atom groups and the
+    phosphate-bridge atoms needed real remapping.
+
+**Verified, same bar as ATP, now automated instead of one-off manual
+checks.** New `tests/charge_validation_test.py` (previously nothing existed
+— `bridge_test.py`'s `test_charges` is unrelated arbitrary data,
+`accuracy_test.py` has no charge checks at all) runs three checks per
+ligand, for all 6 ligands with real charges (ATP, ADP, GTP, GDP, HEM, NAD):
+
+| Ligand | Charge sum | Expected | Atom coverage | A/B energy shift |
+|---|---|---|---|---|
+| ATP | -4.0000e | ATP4- | 31/31 exact | +0.355 kcal/mol/atom |
+| ADP | -3.0000e | ADP3- | 27/27 exact | +0.048 kcal/mol/atom |
+| GTP | -4.0000e | GTP4- | 32/32 exact | +0.404 kcal/mol/atom |
+| GDP | -3.0000e | GDP3- | 28/28 exact | +0.243 kcal/mol/atom |
+| HEM | -2.0000e | heme b, both propionates ionized | 43/43 exact | +0.406 kcal/mol/atom |
+| NAD | -1.0000e | NAD+ (pyridinium +1, 2 phosphodiesters -1 each) | 44/44 exact | +0.348 kcal/mol/atom |
+
+All 18 checks (6 ligands × 3 checks) pass. The charge-sum numbers are a
+strong independent signal beyond "the file looked plausible": every one is
+an exact round number matching a known, named formal-charge state (ADP3-,
+GTP4-, GDP3- all fit the same fully-deprotonated convention ATP4- already
+established; heme b's -2 matches the standard both-propionates-ionized
+convention; NAD+'s -1 matches the textbook pyridinium/phosphodiester
+accounting) — a transcription or atom-remapping error would be very unlikely
+to land on a clean integer by chance, especially for NAD's hand-traced
+cross-source remapping. Atom coverage is exact (no missing, no extra) for
+every ligand against a real deposited reference structure (ATP: 2P0X, ADP:
+1ATR, GTP: 2RAP, GDP: 1Q21, HEM: 1C53, NAD: 7YW4 — each confirmed via RCSB's
+public search/ligand APIs to genuinely contain the ligand before use, not
+guessed from memory). A/B energy shifts are all modest and physically sane
+(0.048-0.406 kcal/mol/atom), in the same range as ATP's own original
+validation, confirming the new charges integrate cleanly rather than
+blowing up. `tests/bridge_test.py` re-run clean after every wiring step.
+
+**FAD, PLP, and AMP charges remain blocked — documented, not silently
+skipped:**
+  - **FAD**: the Manchester index's only FAD-related entry is a
+    Stuchebrukhov "FADH-" (reduced anion) library. Fetched and inspected —
+    its own internal atom set includes generic peptide-like `N`/`C`/`O`
+    atoms, suggesting a covalently-linked residue variant, not a standalone
+    ligand. This is a real charge-state *and* likely structural-context
+    mismatch against `physics_engine.cpp`'s standalone oxidized-FAD bond
+    template, not just a naming inconvenience — stopped here rather than
+    risk shipping charges for the wrong redox/binding state.
+  - **PLP**: confirmed (again, directly re-checked rather than trusted from
+    the prior pass) to have no entry anywhere in the Manchester index.
+  - **AMP**: also confirmed to have no entry, including in the
+    ADP/GTP/GDP/ATP "revised phosphate parameters" family that unexpectedly
+    covered the other three nucleotides this pass.
+
+VDW radii/epsilon were **not** added for any of ADP/GTP/GDP/HEM/NAD this
+pass, same deliberate boundary as ATP (the source `frcmod.phos` only covers
+phosphate-linker atom types; HEM's Fe/porphyrin VDW and NAD's own atom types
+weren't independently verified this session) — charge and `(radius,
+epsilon)` are independent lookups in `get_atom_params()`, so this is not a
+regression, just an open remaining gap, same category as ATP's own
+still-open VDW note above.
+
 **5. Membrane/lipid slab model**
 Implicit solvent assumes uniform water (ε=78.5) everywhere. Membrane proteins need
 a low-ε bilayer-region model; no such model exists yet. Low priority — no membrane
 protein test cases in current use.
+
+**Re-test pass (2026-07-13): re-confirmed zero motivation, scoped a minimal
+design without building it.** Independently re-ran the repo-wide search
+(`membrane|lipid|bilayer|slab`, case-insensitive, across `src/`, `python/`,
+`tests/`) rather than trusting the prior finding at face value — still zero
+hits (one pre-existing false-positive substring match inside the word
+"mislabeled" in `knot_analysis.py`, not a real mention). Also checked whether
+any of `tests/accuracy_test.py`'s 15 ground-truth proteins or the 4 bundled
+`data/` structures used elsewhere in this file are membrane proteins — none
+are (lysozyme, ubiquitin, myoglobin, ribonuclease A, barnase, chymotrypsin
+inhibitor 2, IL-1β, α-lactalbumin, TIM barrel, carbonic anhydrase II, aldolase
+A, firefly luciferase, serum albumin, catalase, β-galactosidase, plus 1XQ8 —
+all soluble/cytosolic), so there's still no motivating test case even after
+this session's broader validation work touched most of them.
+
+**Minimal design sketch (not implemented — no test case to validate it
+against, and this codebase's own methodology requires every physics claim be
+backed by a concrete measurement, which an untested energy term can't be):**
+a z-dependent dielectric term would need to modify the existing Generalized
+Born (`egb`) and SASA nonpolar (`sasa_nonpolar`) terms in `total_e()`
+(`physics_engine.cpp`) to transition from ε=78.5 (water) to a low-ε bilayer
+core based on each atom's position along a user- or auto-detected membrane
+normal (e.g. the IMM1/EEF1 implicit-membrane approach used in the wider MD
+literature), touching both `physics_engine.cpp` and `physics_engine_cuda.cu`
+for parity, plus a way to orient/place the slab relative to an arbitrary input
+structure (nontrivial on its own — real membrane-protein depositions don't
+carry that orientation in the PDB file itself; the OPM database is the
+standard external source for it). None of this was started. **Decision
+unchanged**: deliberately deferred, not blocking, not forgotten — revisit if
+a real membrane-protein use case appears.
 
 **6. False-positive knot detection on larger backbones — root-caused and
 fixed (2026-07-09)**
@@ -1367,6 +2041,698 @@ chain-pooling bug (harmless before now, since both existing cases — 1LYZ,
 whose crystal numbering doesn't correspond linearly to full-length UniProt numbering
 at any single offset — hit once, for chymotrypsin inhibitor 2 (2CI2). This is a
 limitation of that test harness's alignment heuristic, not the physics engine.)*
+
+**Re-test pass (2026-07-13): audited the undocumented `n_trials` halving, added
+a real deep-knot positive control, extended `KNOWN_KNOTS`; searched for and
+did not find a multi-chain gap.**
+
+**`n_trials` audit.** Three different values existed in this codebase for
+`classify_backbone_knot`: the module default (24, `knot_analysis.py:407`),
+`tests/knot_test.py`'s own value (32), and the real GUI call site's value
+(12, `gui_main.py:1384`, undocumented why halved). Probed all three × 3 seeds
+on 1LYZ/1J85/1YPI: **9/9 classifications at n_trials=12 matched the correct
+knot type** (zero misclassifications), but confidence was consistently lower
+and noisier than at 24 (e.g. 1YPI: 0.75-0.83 at 12 vs. 0.71-0.92 at 24 —
+comparable range, but a real per-run variance cost). Since every run in this
+probe completed in under 0.02s regardless of trial count (the C++-accelerated
+`kmt_reduce`/`find_crossings` port already makes this negligible — see the
+performance work above), there was no real reason to keep the halved value
+just to save time. **Bumped the GUI call site to `n_trials=24`**, matching the
+module default; re-ran `tests/knot_test.py` and `tests/bridge_test.py`, both
+clean.
+
+**Deep-knot positive control added: UCH-L1 (PDB 2ETL), a real, literature-
+documented 5₂ ("Gordian") knot.** All three prior test cases (unknot ×2,
+trefoil ×1) only exercised the two simplest table entries. Extended
+`KNOWN_KNOTS` with four deeper knots (5₂, 6₁, 6₂, 6₃) — cross-verified against
+the primary Knot Atlas table (`katlas.org/wiki/<name>`), not recalled from
+memory, matching this module's own stated bar ("only entries this module's
+author verified with confidence"): 5₂ `Δ(t)=2t-3+2/t` → `(2,-3,2)`; 6₁
+`Δ(t)=-2t+5-2/t` → `(2,-5,2)`; 6₂ `Δ(t)=-t²+3t-3+3/t-1/t²` → `(1,-3,3,-3,1)`;
+6₃ `Δ(t)=t²-3t+5-3/t+1/t²` → `(1,-3,5,-3,1)` (coefficients shown after this
+module's existing leading-sign normalization). Added ubiquitin C-terminal
+hydrolase L1 (PDB 2ETL, 223 residues) to `tests/knot_test.py` as a new
+positive control — UCH-L1's 5₂ knot is well-documented in the literature as
+one of the most complex knotted folds found in a eukaryotic protein, giving a
+real deposited structure to validate the new table entries against, not just
+the module's existing synthetic-curve coverage. **Result: correctly classified
+as 5₂ (6 crossings, 69% closure-vote confidence)** — full suite now 4/4 PASS.
+The lower confidence than the unknot/trefoil cases (88-97%) is expected, not a
+red flag: deeper knots are inherently harder to call consistently under
+stochastic closure, a real characteristic worth having on record now that this
+suite covers one.
+
+**Multi-chain stress test: searched, not found — documented as checked rather
+than skipped.** Looked for a real heteromeric complex (different chains, not a
+homodimer like 1YPI) where a *smaller* chain is the knotted one — the current
+fix always classifies the largest chain, so this would be the case it could
+still miss. Two targeted searches plus a KnotProt navigation check found no
+documented example of this specific pattern (methyltransferase SPOUT-family
+knots, the most common real case, occur as either monomers or homodimers with
+matched-size knotted chains, not asymmetric heteromers). Per the bounded-search
+principle already established elsewhere in this file, stopping here rather
+than continuing an open-ended literature search — if a concrete example
+surfaces later, it's a cheap addition to `tests/knot_test.py` using the
+existing multi-chain infrastructure, not a design change.
+
+**7. IDP ensemble characterization — all three scoped directions shipped
+and validated (2026-07-12, branch `idp-handling`)**
+Item #2's classifier only ever produces a binary ORDERED/POSSIBLY-DISORDERED/
+IDP label plus a funnel score — once something is flagged disordered, there's
+no further description of *what the ensemble actually looks like*. This item
+is the first of three originally-scoped directions (ensemble characterization,
+disorder-aware sampling, GUI/visualization) for actually giving the user a
+real IDP result rather than just a label; the other two are not started.
+
+Inventory taken before writing any code (avoid duplicating existing
+infrastructure): confirmed no radius of gyration, end-to-end distance, or
+contact-map computation exists anywhere in this codebase (C++ or Python);
+confirmed `sasa_nonpolar()` (`physics_engine.cpp`) is a private scalar-total
+helper baked into the energy function, not exposed to Python or usable as a
+general per-atom SASA routine; confirmed the one existing per-bond MC
+step-size hook (`BondTopology.rot_bond_scale`) is driven by a structural
+lever-arm heuristic, `def_readonly`, and never touched by IUPred/RMSF
+anywhere — i.e. there is currently zero feedback from the sequence-based
+disorder predictor into MC sampling.
+
+**Built so far (`python/gui_main.py`), all operating on `LandscapeWorker`'s
+existing pooled `snapshots` — no new C++ needed for any of it:**
+  - `_compute_radius_of_gyration()`, `_compute_end_to_end()` — per-snapshot,
+    Cα-based, rotation/translation-invariant (no alignment needed, unlike
+    RMSF).
+  - `_compute_internal_scaling()` — the polymer-physics internal-distance
+    scaling law `<R_ij> ~ |i-j|^ν` (Marsh & Forman-Kay 2010, Biophys J),
+    fit via ensemble-mean Cα-Cα distance binned by sequence separation, then
+    log-log least squares. Unlike an Rg-vs-chain-length fit, this works from
+    a *single* protein's own ensemble (no need to compare across differently-
+    sized proteins) — ν≈0.33 indicates a compact globule, ν≈0.5 an ideal/
+    random-coil chain, ν≈0.6 an expanded/self-avoiding disordered chain.
+    Loops per-snapshot to bound memory to O(n_ca²) rather than
+    O(n_snaps·n_ca²) — the naive broadcast form would need a multi-GB array
+    at 1YPI's scale (494 residues).
+  - `_compute_contact_map()` — per-residue-pair contact frequency across the
+    ensemble (Cα-Cα distance < 8 Å) plus a per-residue "contact variance"
+    summary (mean Bernoulli variance `p(1-p)` over non-adjacent partners).
+    Deliberately complementary to RMSF, not a duplicate: RMSF needs a
+    Kabsch-aligned reference frame, which becomes shaky for a residue deep
+    in a genuinely disordered region (no single "mean position" is
+    meaningful); contact frequency needs no global alignment at all, only
+    per-snapshot relative distances, so it stays meaningful exactly where
+    RMSF's assumption is weakest.
+  - **Real bug fixed along the way, not just new metrics**: `_compute_rmsf`'s
+    Kabsch fit was computed from *all* Cα atoms, including any genuinely
+    disordered ones. When a large flexible region is present, the
+    least-squares fit itself gets dragged around by that region's motion
+    ("the alignment chases the tail"), contaminating the reference frame
+    used to measure fluctuation everywhere — including the truly rigid core.
+    Fixed by adding a `fit_mask` parameter to `_kabsch_align_points()`: the
+    rotation is still *applied* to every atom, but is now *fitted* only from
+    IUPred-predicted-ordered residues (score < 0.5) when available — a
+    signal that exists pre-MC, purely from sequence, so it can't be
+    circularly biased by the RMSF it's used to compute. Standard practice in
+    MD ensemble analysis for exactly this reason (e.g. restricting alignment
+    to a `backbone and resid <core>` selection). Falls back to the original
+    all-atom fit if fewer than 3 residues pass the core threshold (Kabsch
+    needs ≥3 non-degenerate points).
+
+**Validated so far (synthetic + smoke tests, not yet the full ground-truth
+suite):**
+  - Synthetic core/tail contamination test: a rigid "core" cluster plus a
+    "tail" cluster given an independent extra rotation on top of a shared
+    rigid-body motion. Core-restricted fit recovered the true core rotation
+    to floating-point precision (residual ~2e-15 Å); fitting on the whole
+    set (old behavior) showed real, measurable contamination (1.18 Å
+    residual) — confirms the fix does what it's supposed to, not just that
+    it runs.
+  - Real smoke test on 1UBQ (76 res, 20-snapshot MC trajectory): Rg
+    11.61±0.02 Å (matches ubiquitin's known compactness), tight end-to-end
+    distribution, contact-map per-residue variance near zero (0.0002 mean —
+    correct for a short, near-native, rigid trajectory), core-aligned vs.
+    plain RMSF correlated at 0.93 with the expected direction of difference
+    on a synthetically-tagged "disordered" tail.
+  - Timing at 1YPI's scale (494 residues, 180 synthetic snapshots matching
+    production adaptive-depth budget): every new metric completes in under
+    3 seconds (`_compute_internal_scaling`/`_compute_contact_map`, the two
+    O(n_ca²)-per-snapshot ones, ~2.5s each) — negligible next to the MC
+    sampling itself.
+
+**GUI wiring completed.** A new `ENSEMBLE` page (`_view_stack` index 3,
+toggle button next to `DISORDER`) shows a 4-panel figure — Rg histogram,
+end-to-end histogram, the internal-scaling log-log fit (with ν/R²
+annotated), and a contact-frequency heatmap — following
+`_draw_disorder_profile`'s existing matplotlib-in-Qt embedding pattern
+exactly (same `Figure`/`FigureCanvas` construction, same page-toggle
+mechanics as the existing `DISORDER`/`LANDSCAPE` pages). Wired into
+`_on_landscape_done` right after the existing RMSF computation, reusing the
+same `data["snapshots"]`/`self._ca_indices` already available there — no new
+data plumbing needed. Verified end-to-end headlessly (construct `ProteinApp`
+without showing a window, feed it a real MC result dict, confirm no
+exceptions and that the toggle button/stats label update correctly) before
+running the real validation below.
+
+**Validated against all 4 ground-truth proteins — a real, decisive signal on
+two of the four metrics, a genuine negative finding on the third.** Single
+production run per protein (not a repeat-stability suite — this is a first
+qualitative check, matching the same adaptive-depth budget and plain-MC path
+used everywhere else in this file, i.e. `USE_ALTERNATING_RELAX`/
+`USE_REPLICA_EXCHANGE`/`USE_PIVOT_BRANCH` all default `False` — none of the
+`minimize_torsion` cost-wall machinery from the closed-out alternating-GM/MC
+branch is involved here):
+
+| Protein | Direction | Label | Rg (Å) | ν | R² | contact_var |
+|---|---|---|---|---|---|---|
+| 1UBQ (76 res) | ordered | ORDERED | 11.55±0.04 | 0.168 | 0.29 | 0.0006 |
+| 1LYZ (129 res) | ordered | ORDERED | 13.86±0.03 | 0.105 | 0.17 | 0.0010 |
+| 1YPI (494 res) | ordered | ORDERED | 24.26±0.02 | 0.276 | 0.93 | 0.0001 |
+| 1XQ8 (140 res, real IDP) | IDP | POSSIBLY DISORDERED | 48.30±1.34 | **0.716** | **0.98** | 0.0001 |
+
+**Rg and ν both show a sharp, real separation, exactly matching the
+literature-grounded expectation.** 1XQ8's Rg (48.3 Å) is dramatically larger
+than any of the ordered proteins despite being the second-*smallest* chain
+in the set (140 res, smaller than 1YPI's 494) — a folded protein this size
+would never reach that radius. Its Rg spread is also far wider in absolute
+terms (std 1.34 Å vs. 0.02-0.04 Å for the ordered cases). Most decisively:
+ν=0.716 with R²=0.978 (an excellent power-law fit) lands squarely in
+expanded/self-avoiding-chain territory, sharply distinct from the ordered
+proteins' compact-globule range (ν=0.105-0.276). 1YPI's own ν (0.276,
+R²=0.933) is higher and better-fit than 1UBQ/1LYZ's (0.105-0.168,
+R²=0.17-0.29) — plausibly because its larger, more extended shape gives
+genuine polymer-like scaling behavior over a longer range of sequence
+separations, while the two smaller compact globules are mostly just noise
+at their scale (too small to show clean internal scaling at all).
+
+**`contact_var` did not discriminate as motivated — a real, mechanistic
+negative finding, not a bug.** It stayed low (0.0001-0.0010) across *all
+four* proteins, including 1XQ8, with no clear ordered-vs-IDP separation.
+Root cause, understood after the fact: `contact_var` is a Bernoulli-variance
+statistic (`p·(1-p)`, maximized at contact probability `p=0.5`), but the two
+regimes it was meant to distinguish both drive `p` toward the *extremes*,
+not toward 0.5, just via different mechanisms — a compact ordered protein
+has most residue pairs *permanently* in contact or permanently far apart
+(`p≈1` or `p≈0`), while 1XQ8's fully-expanded ensemble has most pairs
+*almost never* in contact at all (`p≈0` too, just via chain extension rather
+than fixed structure). The metric only lights up for residues with
+genuinely *intermediate, fluctuating* contact behavior across the ensemble
+(e.g. molten-globule-like transient contacts, or a residue oscillating
+between a compact and an open sub-state) — a real, different physical
+question from the general ordered/disordered axis it was introduced to
+detect. Kept in the codebase (the underlying computation is correct and the
+metric may be useful for that narrower question), but not treated as a
+reliable IDP-detection signal on its own.
+
+**Status: ensemble characterization (item #7's first of three originally-
+scoped directions) is functionally complete and validated.** Rg + internal
+scaling exponent are real, working, literature-grounded IDP descriptors,
+now visible in the GUI. `contact_var` is shipped as correct infrastructure
+with an honestly-documented limitation rather than oversold.
+
+**Second direction: disorder-aware sampling — shipped, minimal and
+provably bounded.** Constrained by a real API limitation surfaced during
+the original scoping: `run_landscape_trajectory`'s `temperature`/`max_angle`
+are single scalars for the whole chain, and the one existing per-bond move
+hook (`BondTopology.rot_bond_scale`) is `def_readonly` and computed
+internally in C++ — genuinely targeting *only* the residues IUPred flags
+disordered, within a single trajectory, would need new C++ engine surface
+(a per-bond `max_angle` array), not attempted here. What's achievable
+Python-side without touching the engine: `_adaptive_depth` (already
+size-aware, `n_snapshots ∝ sqrt(n_res/76)`) now also scales with the
+IUPred-predicted disordered fraction, linearly rather than sqrt (more
+disordered residues means proportionally more distinct heterogeneous
+states to resolve, not a spread-of-noise argument the size term's
+central-limit-style sqrt reasoning applies to): `disorder_mult = 1 +
+DISORDER_DEPTH_MULT * disorder_frac` (`DISORDER_DEPTH_MULT = 1.0`, so a
+fully IUPred-disordered protein gets up to 2x depth), applied *before* the
+existing `N_SNAPSHOTS_CAP` clamp so it can't run past the already-validated
+cost ceiling. `LandscapeWorker` now takes an `iupred_scores` constructor
+argument (wired through from `ProteinApp._start_landscape`'s existing
+`self._iupred_scores`, computed at parse time — no new sequence analysis
+needed), and always applies this scaling (not an opt-in
+`USE_...`-style toggle, unlike replica exchange/pivot branch/alternating
+relax) since `disorder_frac` defaults to `0.0` when no scores are supplied,
+making this a provable no-op extension of the already-shipped behavior
+rather than a new mode needing its own off-switch.
+
+**Validated as a true no-op on the 3 ordered ground-truth proteins, and a
+real, bounded, correctness-preserving effect on the one real IDP:**
+
+| Protein | IUPred disordered fraction | N_per (before → after) | steps (before → after) |
+|---|---|---|---|
+| 1UBQ (76 res) | 0.000 | 15 → 15 | 600 → 600 |
+| 1LYZ (129 res) | 0.000 | 20 → 20 | 600 → 600 |
+| 1YPI (494 res) | 0.000 | 30 → 30 | 300 → 300 |
+| 1XQ8 (140 res, real IDP) | 0.250 | 20 → 25 | 600 → 586 |
+
+Confirmed identical `N_per`/`steps` for the 3 ordered proteins directly from
+`_adaptive_depth`'s output (not just expected — the disorder-scaling code
+path is exercised and produces byte-identical results when `disorder_frac`
+is genuinely `0.0`, so no separate re-run of those 3 cases was needed; this
+was a deliberate choice to avoid redundant heavy compute given an ongoing
+hardware/thermal concern on the dev machine — see memory, not this file).
+1XQ8 re-run 3x with the new depth active (real end-to-end
+`LandscapeWorker.run()`, not synthetic): **3/3 correctly POSSIBLY
+DISORDERED**, funnel 0.320-0.333 (consistent with the pre-existing baseline
+range), wall time 37.9-39.1s (no cost regression from the modest depth
+increase).
+
+**Status: disorder-aware sampling shipped as the achievable Python-only
+tier.** The genuinely-targeted version (per-bond `max_angle` scaled by
+IUPred score within a single trajectory, not just more total snapshots)
+remains a real, larger follow-up requiring new C++ engine surface — noted
+here as the natural next step if this coarser depth-scaling version proves
+insufficient, not attempted this round.
+
+**Third direction: GUI/visualization support (2026-07-11/12) — shipped and
+validated on a real IDP.** The `ENSEMBLE` page (from the first direction,
+above) only ever showed scalar summaries (Rg histogram, end-to-end
+histogram, internal-scaling fit, contact-frequency heatmap) — no structural
+picture of what the sampled ensemble actually *looks like*. Added a `SHOW
+ENSEMBLE OVERLAY` button (`python/gui_main.py`,
+`ProteinApp._render_ensemble_overlay`) that renders the classic NMR-
+ensemble "spaghetti plot": up to 20 evenly-spaced snapshots from the pooled
+landscape trajectory, each Kabsch-superposed onto the first frame (fit
+restricted to the IUPred-predicted ordered core when available — reusing
+the exact `fit_mask` machinery already validated for `_compute_rmsf`, for
+the same reason: without it a rigid core looks just as scattered as real
+disorder, since torsion-angle MC has no reason to hold a fixed absolute
+pose across a trajectory), all loaded as separate translucent 3Dmol cartoon
+models in one viewer, colored by the same per-residue RMSF/bwr gradient as
+the existing `COLOR BY FLEXIBILITY` view (blue=rigid, red=flexible). The
+lowest-energy dominant structure is drawn on top as an opaque solid
+reference. No new C++ or data plumbing needed — reuses
+`LandscapeWorker`'s already-pooled `snapshots`, `self._rmsf`, and
+`self._iupred_scores`, all already computed for the existing `ENSEMBLE`/
+`DISORDER` pages.
+
+Verified two ways, not just "renders without crashing": (1) headless smoke
+test constructing `ProteinApp` with no window and confirming the button's
+guard no-ops cleanly before any landscape run; (2) real end-to-end run —
+`LandscapeWorker.run()` on real MC data, fed through the actual
+`_on_landscape_done` path, then `_render_ensemble_overlay()` called for
+real, output HTML inspected directly (not assumed): 1UBQ (76 res, ordered)
+produced 20 sampled conformers + 1 reference model (21 `addModel` calls) as
+expected from its 45 pooled snapshots.
+
+**Validated on the real IDP case (1XQ8), not just the ordered controls —
+the RMSF values feeding the overlay's color scale show exactly the
+contrast the visualization is meant to show.** 1UBQ (ordered): RMSF range
+0.044–2.44 Å, mean 0.37 Å — uniformly low, matching a rigid, single-basin
+fold. 1XQ8 (140 res, real IDP, `POSSIBLY DISORDERED`, 75 pooled snapshots):
+RMSF range 1.25–**18.35 Å** — over 7x 1UBQ's own maximum, confirming the
+overlay's per-conformer color scale (clamped at 4.0 Å, same clamp as
+`COLOR BY FLEXIBILITY`) will show a visibly steady blue core fraying into
+solid red exactly where the real disorder is, rather than a uniform or
+random-looking spread. This is the same RMSF computation already validated
+against literature-documented flexibility (see item #2's 1LYZ N-terminus
+and item #7's `_compute_rmsf` core-alignment fix above) — the overlay adds
+a structural, 3D rendering of a signal that was already known-correct, not
+a new metric needing its own separate validation.
+
+**Live end-to-end run through the actual GUI (2026-07-12), driving the real
+app rather than internal functions — surfaced a real, pre-existing
+environment issue unrelated to this feature.** Drove the real `ProteinApp`
+window exactly as a user would (typed `1XQ8`, clicked `RUN ANALYSIS`,
+clicked `EXPLORE LANDSCAPE`, switched to `ENSEMBLE`, clicked `SHOW ENSEMBLE
+OVERLAY`) and screenshotted the live window. The pipeline/landscape run
+itself worked correctly end-to-end (`POSSIBLY DISORDERED`/`ORDERED` label
+shown correctly across repeat runs, matching the item #2 history), but the
+3D viewer panel rendered blank — `$3Dmol is not defined` in the embedded
+Chromium console. **Root-caused as pre-existing and unrelated to this
+feature, not a regression**: the identical failure reproduces on the
+already-shipped `SHOW BEST STRUCTURE` button (confirmed by instrumenting
+`self.web`'s page with a console-message handler and retrying up to 20s),
+while an isolated minimal `QWebEngineView` loading the same
+`<script src="https://3Dmol.org/...">` tag from a local file succeeds
+every time, including after importing `gui_main` and after constructing a
+real GPU `PhysicsEngine`. The actual differentiator is something specific
+to constructing the full `ProteinApp` window (not narrowed further — not
+GPU/CUDA contention, not a persistent disk cache, not page visibility, not
+the `QTWEBENGINE_DISABLE_SANDBOX` env var timing, all checked and ruled
+out) that intermittently breaks the embedded browser's fetch of the
+external 3Dmol.js CDN script specifically in *this* dev environment. Since
+every 3D view in this app (including all pre-existing ones) depends on the
+same external CDN load, this is a standing, environment-specific rendering
+caveat, not a defect in the ensemble overlay code — the overlay's own
+logic and data were already independently verified correct via direct HTML
+content inspection against real MC output (see above). Flagged here rather
+than silently dropped: a future, more resilient fix would be vendoring
+`3Dmol-min.js` locally instead of loading it from a CDN, removing the
+external-network dependency from every 3D view at once — not attempted
+this round, out of scope for validating this one feature.
+
+**Status: all three originally-scoped IDP directions (ensemble
+characterization, disorder-aware sampling, GUI/visualization) are now
+shipped.** Item #7 is functionally complete. Explicitly not done: a
+repeat-run visual regression check of the overlay itself (only single runs
+on 1UBQ/1XQ8 were inspected this round), the CDN-vendoring fix noted just
+above, and the overlay currently always samples snapshots evenly across
+the *pooled* multi-branch trajectory rather than exposing a per-basin
+overlay (e.g. "show only this basin's
+conformers") — a plausible follow-up if a user wants to visually compare
+basins rather than see the whole pooled ensemble at once.
+
+**Performance follow-up: the two O(n_ca²)-per-snapshot ensemble metrics
+moved to a new C++/OpenMP extension — real, verified speedup, no behavior
+change.** `_compute_internal_scaling`'s mean-distance-matrix pass and
+`_compute_contact_map`'s contact-frequency pass were the two actually
+"computation heavy" pieces of this item (both ~1-2.5s at 1YPI's scale;
+Rg/end-to-end/RMSF are each already sub-0.1s and stayed in Python).
+Followed an existing precedent already in this repo rather than inventing a
+new pattern: `feature/topological-mapping`'s `09f3d10` ("Add
+protein_analysis C++ extension for RQA and ACF acceleration") had already
+established the exact convention this needed — a standalone pybind11
+module separate from `protein_physics`, built via a second
+`Pybind11Extension` in `setup.py`, with the Python side falling back
+silently to its own pure-Python loop when the extension isn't built. New
+`src/analysis_ext.cpp` (module `protein_analysis`) exposes
+`compute_mean_dist_matrix(coords)` and
+`compute_contact_freq_matrix(coords, cutoff)`, both taking the same
+`(n_snaps, n_ca, 3)` coordinate array (built once in Python via a new
+`_snapshots_to_coord_array` helper, shared by both call sites and their
+fallback branches) and parallelized over residue index within each
+snapshot's O(n_ca²) inner pass (same race-free write pattern as
+`analysis_ext.cpp`'s original `compute_rqa`: thread `i` only ever writes
+cells `(i,j)`/`(j,i)` for `j>i`, so no two threads touch the same cell
+within one snapshot's parallel region, and the outer per-snapshot loop
+stays sequential since different snapshots accumulate into the same shared
+matrix).
+
+**Verified numerically identical to the pure-Python fallback** (forced both
+code paths on the same synthetic ensemble): mean-distance matrix max
+absolute difference `7.1e-15`, contact frequency `1.1e-16`, fitted ν
+difference `0.0` — all at floating-point rounding noise, not a real
+discrepancy. Re-ran the full real pipeline end-to-end on 1UBQ
+(`_on_landscape_done` with a real `LandscapeWorker` result) and got the
+exact same `Rg 11.6±0.0 Å · ν=0.17` as the pre-acceleration version.
+`tests/bridge_test.py` still clean.
+
+**Real, substantial speedup even without OpenMP active** — the same
+`has_openmp()` build-environment limitation already documented for
+`physics_engine.cpp` (bare `cl.exe` invocation outside a VS Developer
+environment can't find `omp.h`) applies here too, so this build is
+single-threaded C++, not multi-core. Benchmarked at 1YPI's scale (494
+residues, 180 synthetic snapshots): `_compute_internal_scaling` 1.16s →
+0.08s (**~14x**), `_compute_contact_map` 1.13s → 0.04s (**~26x**) — a
+compiled tight loop beats Python's per-iteration interpreter/numpy-allocation
+overhead by a lot on its own, before any multi-core parallelism is even
+switched on. Building inside a loaded VS Developer environment (the fix
+already documented for `physics_engine.cpp`, not re-applied here) would be
+expected to improve this further but wasn't attempted this round — these
+functions are already negligible next to MC sampling time even at the
+current single-threaded speed, so it wasn't a blocking follow-up.
+
+**Follow-up: wider size sweep found the speedup wasn't uniform — a real
+O(n_ca³) algorithmic bug, not just an un-accelerated piece.** Benchmarking
+across a broader range (76 up to a synthetic 1500 residues, sized well
+past anything in the current ground-truth set) showed `_compute_contact_map`'s
+speedup climbing cleanly with size (6.6x → 36.3x), but
+`_compute_internal_scaling`'s speedup *peaking* around 1YPI's scale
+(~10.8x) and then **shrinking** at larger sizes (3.2x at 1500 residues) —
+worth explaining, not shrugging off. Root cause, isolated directly: only
+the O(n_ca²) mean-distance-matrix build had moved to C++; the function's
+own post-processing (binning that matrix by sequence separation) was still
+a Python loop doing a full O(n_ca²) boolean-mask comparison *per
+separation value* — O(n_ca³) total, never touched by the C++ work above.
+At n_ca=1500 that loop alone cost 2.18s, ~9x longer than the 0.24s
+C++-accelerated matrix build it was diluting.
+
+**The real fix wasn't more C++ — it was recognizing the O(n_ca³) was
+unnecessary in the first place.** `mean_dist_matrix[abs(i-j)==sep]` (the
+old code) does a full matrix comparison to find the values at one
+diagonal offset; `np.diagonal(mean_dist_matrix, offset=sep)` reads the
+exact same values directly, since the matrix is symmetric and both
+diagonals at a given offset contain identical values pairwise — averaging
+either one gives a mathematically identical mean (verified: max
+difference ~5×10⁻¹⁷ against the old algorithm on a synthetic symmetric
+matrix, pure floating-point noise), but costs O(n_ca-sep) with no
+comparison pass at all, O(n_ca²) total over the whole loop instead of
+O(n_ca³). Pure Python/numpy change, no new C++ needed for this piece.
+
+**Result: the divergence is gone.** Re-benchmarked the same size sweep
+with the fix in place — `_compute_internal_scaling` now:
+
+| n_ca | before (all-Python) | after (C++ matrix + fixed binning) | speedup |
+|---|---|---|---|
+| 76 | 0.006s | 0.0016s | 3.8x |
+| 129 | 0.020s | 0.0042s | 4.8x |
+| 140 | 0.020s | 0.0037s | 5.4x |
+| 494 (1YPI) | 0.633s | 0.0315s | **20.1x** |
+| 750 | 1.514s | 0.0578s | 26.2x |
+| 1000 | 2.829s | 0.1065s | 26.6x |
+| 1500 | 8.031s | 0.3105s | **25.9x** |
+
+Now climbs cleanly into the same 20-37x range as `_compute_contact_map`
+at large sizes, instead of declining. At n_ca=1500 the fixed binning step
+now costs ~0.06s (smaller than the 0.24s C++ matrix build itself), so it's
+no longer the bottleneck — no further C++ work is warranted for this
+piece. Re-verified end-to-end through the real GUI pipeline on 1UBQ
+(identical `Rg 11.6±0.0 Å · ν=0.17` as before) and `tests/bridge_test.py`
+clean.
+
+**Widened the search for other C++-worthy hot loops.** With the ensemble
+metrics now confirmed genuinely fast (profiled all remaining pieces —
+Rg, end-to-end, RMSF, and the leftover Python post-processing inside both
+accelerated functions — at up to a synthetic 2500 residues; all sub-0.1s,
+none worth porting), asked where else in the codebase a Python-level
+O(n²)+ loop runs on the main analysis path. Ruled out (all confirmed
+linear or operating on tiny n, not worth porting): `iupred.score()`
+(genuinely O(N), two fixed-width sliding windows), `LandscapeWorker._ca_vec`
+and the PCA `coord_mat` build (O(N·n_ca), linear in both dimensions),
+`_parse_pdb`'s per-atom loops (the only nested one, the CYS SG-SG
+disulfide scan, is O(n_cys²) but `n_cys` is tiny even in large real
+proteins), and `_compute_rmsd`/`_kabsch_fit`/`_kabsch_align_points` (fully
+vectorized numpy, SVD on a fixed 3×3 matrix regardless of atom count).
+
+**Found a real one: `knot_analysis.py`'s KMT reduction + crossing
+detection — a nested Python loop with heavy per-element numpy dispatch
+overhead, run 12+ times on every real landscape analysis.**
+`classify_backbone_knot` is called from `LandscapeWorker.run()` before MC
+sampling even starts (topology classification runs once per parse/landscape
+job); its stochastic-closure loop calls `kmt_reduce` (genuinely nested,
+O(passes·n²), each inner check calling `np.cross`/`np.dot` several times on
+raw 3-vectors — real per-call dispatch overhead, not just FLOPs) and
+`find_crossings` (O(m²) on the KMT-reduced vertex count) once per trial,
+12+ times per call. Profiled directly on real single-chain protein data
+(not the pooled-both-chains bug documented in item #6 — used chain-A-only
+Cα traces, matching `PipelineWorker`'s actual production behavior):
+
+| Protein | n_ca | `classify_backbone_knot` time (pure Python) |
+|---|---|---|
+| 1UBQ | 76 | 0.62s |
+| 1LYZ | 129 | 1.73s |
+| 1YPI (chain A) | 247 | 6.43s |
+
+Scaling (~O(n²)) confirmed the static-analysis estimate; at 247 residues
+this was already a real, non-trivial cost, and would keep growing worse
+relative to MC sampling time as protein size increases further (MC cost is
+roughly linear per step; KMT reduction is quadratic-or-worse).
+
+**Ported `kmt_reduce` and `find_crossings` to `src/analysis_ext.cpp`
+(extending the existing `protein_analysis` module, not a new one) — direct
+ports, not rewrites.** `find_crossings` takes the random projection axis as
+an explicit argument rather than drawing its own RNG value internally
+(`knot_analysis.find_crossings` still draws the axis in Python via the
+existing `_random_unit_vector`, then passes the concrete vector to either
+backend) — this keeps RNG consumption byte-identical regardless of which
+backend runs, so `classify_backbone_knot`'s trial sequence and results
+don't depend on whether the extension is built. `kmt_reduce`'s C++ version
+mirrors the Python original's mutable-list vertex-deletion semantics
+exactly, including *not* advancing the loop index after a deletion (the
+vertex that shifts into the just-vacated position gets re-examined in the
+same pass — a real behavioral subtlety, not incidental, that had to be
+replicated precisely for topological correctness). Both functions fall
+back to the original pure-Python implementations (renamed
+`_kmt_reduce_py`/`_find_crossings_py`) when the extension isn't built.
+
+**Verified numerically identical at every level, not just "runs without
+crashing":**
+- `kmt_reduce` alone: exact match on real closed chains from all 3
+  ground-truth proteins (max diff `0.0`).
+- `find_crossings` alone: 30/30 trials exact match on a synthetic
+  parametric trefoil (standard trefoil parametrization, matching this
+  module's own documented synthetic-curve validation methodology) — a case
+  chosen specifically because a genuine unknot reduces all the way down to
+  a 3-vertex triangle (no crossings possible), so the real proteins alone
+  couldn't exercise `find_crossings`' actual crossing-detection logic;
+  covered real crossings (3-7 per trial), correct degenerate-projection
+  detection, and the correct minimal 6-vertex trefoil reduction.
+- Full `classify_backbone_knot` pipeline, same seed, C++ vs. forced-Python
+  fallback: identical `name`/`crossing_number`/`alexander_coeffs`/
+  `confidence` on all 3 real ground-truth proteins.
+- The official `tests/knot_test.py` regression suite (3/3 PASS, including
+  the real documented trefoil positive control, YibK/1J85) and
+  `tests/bridge_test.py` both clean.
+
+**Speedup: far larger than the ensemble-metrics work — 74x to 1628x,
+growing with size.** 1UBQ (76 res): 0.62s → 0.01s (74x). 1LYZ (129 res):
+1.78s → 0.00s (492x). 1YPI chain A (247 res): 6.52s → 0.00s (1628x). Much
+larger than the ensemble-metrics functions' 20-37x because the original
+bottleneck here wasn't raw FLOPs (which numpy already handles reasonably),
+it was per-call Python/numpy dispatch overhead on `np.cross`/`np.dot` calls
+operating on individual 3-vectors inside a tight nested loop — exactly the
+overhead a compiled loop eliminates entirely, and it dominated even more as
+the loop trip count grew with protein size.
+
+**Re-test pass (2026-07-13): the `$3Dmol is not defined` CDN-loading bug is
+fixed by vendoring — the fix the module's own history already pointed at,
+now actually shipped and validated.** All 9 duplicated
+`<script src="https://3Dmol.org/build/3Dmol-min.js">` call sites in
+`gui_main.py` (every 3D view in the app, not just the ensemble overlay:
+lines 3800, 3872, 4185, 4264, 4427, 4654, 4733, 5040, 5166) shared this
+external dependency, and the prior session's live end-to-end run had already
+root-caused the failure to something specific about the embedded
+`QWebEngineView`'s handling of that external fetch, with vendoring named as
+the not-yet-attempted fix.
+
+Verified 3Dmol.js's license (BSD-3-Clause, University of Pittsburgh and
+contributors) permits redistribution before committing a third-party file —
+checked the primary `LICENSE` file, not just assumed from the package's
+general reputation. Vendored `3Dmol-min.js` (v2.5.5) plus its `LICENSE` and
+`.LICENSE.txt` attribution file under a new `python/vendor/` directory. Added
+`gui_main._vendor_asset_path()` (resolves to `python/vendor/` in dev, or
+`sys._MEIPASS/vendor/` in a PyInstaller-frozen build, following the existing
+`_app_base_dir()` frozen/dev-path convention already used elsewhere in this
+file) and a module-level `_3DMOL_JS_URL` built via
+`QUrl.fromLocalFile(...).toString()` — necessary because every 3D-view HTML
+page is loaded through `QUrl.fromLocalFile()` from a temp file, so a bare
+relative script path wouldn't resolve without an explicit local-file URL.
+Replaced all 9 CDN `<script>` tags with `{_3DMOL_JS_URL}` in one pass (all 9
+were byte-identical strings inside f-strings, confirmed before using a single
+find-and-replace). Updated `alma.spec` to bundle `python/vendor/*` under a
+`vendor/` folder in the frozen build (`datas=vendor_datas`), so the portable
+`.exe` carries the same fix.
+
+**Validated the fix resolves, doesn't just relocate, the failure**: confirmed
+`_vendor_asset_path("3Dmol-min.js")` resolves to a real, existing file and
+that `_3DMOL_JS_URL` is a well-formed `file://` URL (`gui_main` imports
+cleanly, path exists) before considering this done — matching this file's own
+standard of verifying a claimed fix rather than assuming success from the code
+change alone.
+
+**Per-basin ensemble overlay — the other explicitly-flagged follow-up, turned
+out cheaper than scoped and shipped.** The prior session's history flagged
+"the overlay currently always samples snapshots evenly across the pooled
+multi-branch trajectory rather than exposing a per-basin overlay" as a
+plausible future follow-up, not scoped in detail. Traced the actual data flow
+before assuming it needed new plumbing: `LandscapeWorker.run()` already
+computes `communities` (a `list[list[int]]` of pooled-snapshot indices per
+DBSCAN-detected basin) and emits it in the result dict, but `basin_summary`
+(the population-sorted, population/energy-filtered structure the GUI's basin
+pool panel and `self._basin_summary` actually persist) only ever stored one
+representative structure per basin, not its full membership — and
+`basin_summary`'s index order doesn't match `communities`' original order
+(it's re-sorted and pre-filtered through `sig`), so the raw `communities` list
+alone wasn't directly usable by basin number. Fixed by storing each basin's
+own `member_indices` directly inside its `basin_summary` entry at
+construction time (`LandscapeWorker.run()` in `gui_main.py`), which
+sidesteps the reordering problem entirely — the right list is already
+attached to the right basin, no reconstruction needed.
+
+`_render_ensemble_overlay` gained an optional `basin_idx=None` parameter: when
+given, filters to `self._basin_summary[basin_idx]["member_indices"]` before
+the existing Kabsch-alignment/RMSF-coloring pipeline (reused completely
+unchanged); `None` (the existing call sites) reproduces the original
+always-pooled behavior byte-for-byte. Added an "OVERLAY" button next to each
+basin's existing "VIEW" button in the basin-pool panel
+(`_build_basinpool_panel`), wired to a new `_render_basin_overlay(bi)` that
+just calls the extended method — no new UI layout needed, reused the existing
+per-basin row infrastructure the "VIEW" button already had. Verified `gui_main`
+still imports cleanly and the new method's signature is correct
+(`_render_ensemble_overlay(self, basin_idx=None)`) before considering this
+done; a real end-to-end GUI click-through (open a real multi-basin landscape
+result, click OVERLAY on a non-dominant basin, confirm the 3D view actually
+shows fewer, basin-restricted conformers) is still outstanding as a live
+validation step, same category as the `$3Dmol` fix above.
+
+**Live GUI click-through (2026-07-13): the outstanding validation step above,
+finally done for real — found and fixed a real bug in the process.** Drove
+the actual `ProteinApp` window via real `QPushButton.click()` calls (typed
+"1XQ8", clicked `RUN ANALYSIS`, clicked `EXPLORE LANDSCAPE`, switched to
+`ENSEMBLE`, clicked `SHOW ENSEMBLE OVERLAY`, then clicked a non-dominant
+basin's `OVERLAY` button), scripted via `scratchpad/live_gui_overlay_check.py`
+rather than by hand, so it's a real Qt-signal-driven run (QThread workers,
+real `.result`/`.finished` signals awaited via `QEventLoop`), not an internal
+function call.
+
+**Real bug found: `SHOW ENSEMBLE OVERLAY` never showed the pooled ensemble —
+it silently rendered basin 1 only, every time.** `ensemble_overlay_btn.clicked.connect(self._render_ensemble_overlay)`
+connected the button directly to a method whose first parameter is
+`basin_idx=None`. `QPushButton.clicked` emits a positional `checked: bool`
+argument, which PyQt passes into `basin_idx` — so every real click actually
+called `_render_ensemble_overlay(False)`, and `False is not None`, so the
+"show everything pooled" button took the *basin-restricted* code path,
+always with `basin_idx=0`. Caught directly from the live screenshot: the
+overlay's own info-bar text read "ENSEMBLE OVERLAY &middot; BASIN 1" instead
+of the expected plain "ENSEMBLE OVERLAY" with no basin tag — the same label
+text the per-basin `OVERLAY` buttons use, betraying that the pooled button
+was quietly taking the per-basin path. This is a real, live, user-facing bug
+that had shipped since the per-basin overlay feature was added earlier this
+session (`b851b7f`) and would have affected every real use of the top-level
+overlay button — confirmed independently reproducible before touching any
+code by connecting a spy lambda in place of `_render_ensemble_overlay` and
+checking the captured argument (`[False]`, not `[None]`).
+
+**Fixed** by wrapping in a lambda (`lambda: self._render_ensemble_overlay()`),
+matching the pattern this repo already uses elsewhere for other zero-arg
+button handlers. Verified the fix directly (same spy-lambda technique: click
+now passes `[None]`) and via a second full live-GUI run: the pooled overlay's
+info bar now correctly reads "ENSEMBLE OVERLAY &middot; 20 sampled conformers
+&middot; 140 C&alpha; atoms" with no basin tag. Audited every other
+`.clicked.connect(self._method)` call site in the file for the same class of
+bug (a slot with a leading optional parameter) — all seven others
+(`_start`, `_show_best`, `_start_landscape`, `_toggle_view_mode`,
+`_toggle_landscape`, `_toggle_disorder`, `_toggle_ensemble`,
+`_render_colored_by_rmsf`) take no parameters beyond `self`, so this was an
+isolated instance, not a systemic pattern. `tests/bridge_test.py` re-run
+clean; `gui_main` re-verified to import and construct a real `ProteinApp`
+cleanly after the change.
+
+**A second, measurement-only finding, not a code bug: `QWidget.grab()`
+cannot capture the 3Dmol/WebGL canvas content on this Qt/Chromium build.**
+Both screenshots (pooled and per-basin) showed only the HTML info/legend
+overlay text on a blank background — no cartoon models visible — in *every*
+run, including after the wiring fix. Diagnosed rather than assumed broken:
+a separate fast synthetic-data script
+(`scratchpad/diag_overlay_render.py`, small perturbed 1UBQ coordinates,
+no real MC needed) installed a custom `QWebEnginePage` subclass to capture
+JS console output and ran `runJavaScript` probes after rendering. Result:
+zero console errors, `typeof $3Dmol === "object"` (loaded correctly, the
+vendoring fix from earlier this session still holds), a real `<canvas>`
+element present inside `#v`, and correct non-zero dimensions matching the
+viewport exactly (`canvasCssWH: [984, 738]`, `canvasAttrWH: [1968, 1476]`
+matching a devicePixelRatio of 2.0) — every JS-side precondition for a
+working render is satisfied. `QWidget.grab()` still showed blank even after
+forcing a `resize` event and re-rendering. This is consistent with a known
+Qt/Chromium limitation: `QWebEngineView`'s GPU-composited layers (which a
+WebGL canvas renders through) aren't necessarily included in a
+`QWidget::grab()`/`render()` capture, which operates on the widget's own
+paint/backing-store path — the plain HTML/CSS info-bar divs render fine
+because those go through the ordinary path, while the WebGL content doesn't.
+
+**One real capture attempt tried and explicitly abandoned: a genuine desktop
+screen capture (`PIL.ImageGrab`) instead of `QWidget.grab()`, to see what a
+human would actually see on the monitor.** This would sidestep the
+`grab()` limitation in principle (it reads real composited screen pixels),
+but `win.raise_()`/`win.activateWindow()` did not reliably bring the window
+to the real OS foreground in this environment — the resulting capture
+showed unrelated desktop windows instead of the app. Abandoned immediately,
+both for reliability *and* because it's a real privacy risk (an automated
+full-desktop capture can incidentally include unrelated, sensitive on-screen
+content that has nothing to do with the task) — the one capture taken this
+way was deleted right away rather than kept or inspected further. Do not
+reintroduce this approach; `scratchpad/diag_overlay_render.py` documents
+this decision inline as a code comment too.
+
+**Conclusion: the overlay itself is very likely rendering correctly for a
+real user** (every independently-checkable JS-side signal says so, and nothing
+in this investigation found a reason to doubt it) **but this is not the same
+as a directly-observed visual confirmation**, which remains genuinely
+unverified — an honest, not a closed, state. A real visual check would need
+either a human looking at the running app directly, or a more capable
+automated capture method than what's available in this environment (e.g. a
+tool that can read Chromium's actual compositor output, not a Qt widget
+grab). Not blocking — the actually-shipped, user-facing bug this pass found
+(the pooled-vs-basin-0 mixup) was real and is now fixed regardless of
+whether the visual rendering itself gets independently reconfirmed later.
 
 ---
 

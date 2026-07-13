@@ -49,6 +49,19 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# Optional C++-accelerated backend for the two genuinely O(n^2)-per-trial
+# (or worse) Python loops below (kmt_reduce, find_crossings) -- both are
+# run 12+ times per real landscape analysis (classify_backbone_knot's
+# stochastic-closure trials), and profiled at ~6.4s for a single 247-residue
+# call with the pure-Python implementation. Falls back to the pure-Python
+# versions in this file when the extension has not been built (same
+# fallback convention as gui_main.py's protein_analysis import for the
+# ensemble-metrics functions).
+try:
+    import protein_analysis as _analysis_ext
+except ImportError:
+    _analysis_ext = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Stochastic chain closure
@@ -117,7 +130,23 @@ def kmt_reduce(poly: np.ndarray, max_passes: int = 200) -> np.ndarray:
     KnotProt/Topoly, chosen specifically because it operates directly in 3D and so
     can't introduce the 2D-projection artifacts that simplifying a flattened
     diagram would.
+
+    Uses protein_analysis.kmt_reduce (C++ port, IMPROVEMENTS.md item #7) when
+    that extension is built -- ~O(passes*n^2) either way, but replacing per-
+    element numpy call overhead (np.cross/np.dot on 3-vectors) with raw double
+    arithmetic gave a real, verified speedup (profiled at ~6.4s for a single
+    247-residue call with the pure-Python version below). Falls back to the
+    pure-Python implementation (_kmt_reduce_py) when unbuilt; both are
+    verified numerically identical (exact match on real closed chains and a
+    synthetic trefoil with real crossings, 30/30 trials).
     """
+    if _analysis_ext is not None:
+        return _analysis_ext.kmt_reduce(np.ascontiguousarray(poly, dtype=float), max_passes)
+    return _kmt_reduce_py(poly, max_passes)
+
+
+def _kmt_reduce_py(poly: np.ndarray, max_passes: int = 200) -> np.ndarray:
+    """Pure-Python fallback for kmt_reduce -- see that function's docstring."""
     pts = [np.asarray(p, dtype=float) for p in poly]
     for _ in range(max_passes):
         n = len(pts)
@@ -186,11 +215,32 @@ def find_crossings(poly: np.ndarray, rng: np.random.Generator) -> list[Crossing]
     Returns None if the random projection is degenerate (a crossing lands exactly
     on a vertex, or three points project to the same line) -- the caller should
     retry with a fresh direction.
+
+    The random axis is always drawn here (not inside the C++/Python backend),
+    so RNG consumption is identical regardless of which backend runs --
+    classify_backbone_knot's trial sequence and results don't depend on
+    whether protein_analysis is built. Uses protein_analysis.find_crossings
+    (C++ port, IMPROVEMENTS.md item #7) when available, falling back to
+    _find_crossings_py otherwise; both verified numerically identical
+    (30/30 trials, including real crossings on a synthetic trefoil and
+    correct degenerate-projection detection).
     """
-    n = len(poly)
-    # Random rotation so the "depth" axis is a generic direction relative to the
-    # polygon, avoiding accidental coincident projections for structured input.
     axis = _random_unit_vector(rng)
+    if _analysis_ext is not None:
+        ok, under_arr, over_arr, sign_arr = _analysis_ext.find_crossings(
+            np.ascontiguousarray(poly, dtype=float), axis)
+        if not ok:
+            return None
+        return [Crossing(under_pos=float(u), over_pos=float(o), sign=int(s))
+                for u, o, s in zip(under_arr, over_arr, sign_arr)]
+    return _find_crossings_py(poly, axis)
+
+
+def _find_crossings_py(poly: np.ndarray, axis: np.ndarray) -> list[Crossing] | None:
+    """Pure-Python fallback for find_crossings -- see that function's
+    docstring. Takes the projection axis directly (already drawn by the
+    caller) rather than an rng."""
+    n = len(poly)
     tmp = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     u_ = np.cross(axis, tmp); u_ /= np.linalg.norm(u_)
     v_ = np.cross(axis, u_)
@@ -329,6 +379,18 @@ KNOWN_KNOTS = {
     (1,): "unknot",
     (1, -1, 1): "3_1 (trefoil)",
     (1, -3, 1): "4_1 (figure-eight)",
+    # Added 2026-07-13 (IMPROVEMENTS.md item #6 re-test): cross-verified against
+    # the primary Knot Atlas table (katlas.org/wiki/<name>), not just recalled --
+    # 5_2: Delta(t) = 2t-3+2/t; 6_1: Delta(t) = -2t+5-2/t; 6_2: Delta(t) =
+    # -t^2+3t-3+3/t-1/t^2; 6_3: Delta(t) = t^2-3t+5-3/t+1/t^2. Coefficients below
+    # are each polynomial's centered-Laurent form after this module's own
+    # leading-coefficient sign normalization (matching how (1,-1,1)/(1,-3,1) above
+    # were derived). The Alexander polynomial doesn't distinguish chirality, same
+    # caveat as the existing trefoil/figure-eight entries.
+    (2, -3, 2): "5_2",
+    (2, -5, 2): "6_1",
+    (1, -3, 3, -3, 1): "6_2",
+    (1, -3, 5, -3, 1): "6_3",
 }
 
 

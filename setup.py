@@ -198,6 +198,14 @@ cpu_ext = Pybind11Extension(
     extra_link_args=extra_link,
 )
 
+# ── Analysis extension (ensemble-metrics C++/OpenMP backend) ─────
+analysis_ext = Pybind11Extension(
+    "protein_analysis",
+    sources=["src/analysis_ext.cpp"],
+    extra_compile_args=extra_compile,
+    extra_link_args=extra_link,
+)
+
 
 # ── Custom build_ext: builds CPU via setuptools, CUDA via nvcc ───
 class CustomBuildExt(build_ext):
@@ -212,7 +220,7 @@ setup(
     version="0.7.4",
     author="",
     description="Implicit-solvent protein physics engine (CPU + optional GPU)",
-    ext_modules=[cpu_ext],
+    ext_modules=[cpu_ext, analysis_ext],
     cmdclass={"build_ext": CustomBuildExt},
     python_requires=">=3.8",
     install_requires=["pybind11>=2.10"],
