@@ -100,7 +100,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 namespace py = pybind11;
-
+using namespace std;
 // ── Physics constants ─────────────────────────────────────────────────────────
 // 물리 상수 — 모든 에너지 단위는 kcal/mol, 거리 단위는 Å(옹스트롬)
 //
@@ -231,8 +231,8 @@ struct Particle {
 //   ref[i] — position of atom i at the last rebuild (drift-check baseline)
 //            마지막 재구축 시 원자 i의 위치 — drift 검사의 기준점
 struct NeighborList {
-    std::vector<std::vector<size_t>> nb;
-    std::vector<std::array<double,3>> ref;
+    vector<vector<size_t>> nb;
+    vector<array<double,3>> ref;
     size_t N=0;
     // ── 셀 목록 이웃 목록 재구축 (Cell-list Neighbor List rebuild, P4.1) ─────────
     //
@@ -287,10 +287,10 @@ struct NeighborList {
     //   Small epsilon prevents floating-point boundary atoms from being misclassified.
     //
     // 경계 처리: 경계 상자를 cs 만큼 확장해 모든 원자가 유효한 셀 인덱스를 갖도록.
-    //   std::clamp 로 경계 초과 인덱스를 안전하게 클램핑.
+    //   clamp 로 경계 초과 인덱스를 안전하게 클램핑.
     // Boundary: expand the box by one cell (margin=cs) so all atoms get valid
     //   cell indices; clamp prevents out-of-range access.
-    void build(const std::vector<Particle>& p) {
+    void build(const vector<Particle>& p) {
         N = p.size(); nb.assign(N, {}); ref.resize(N);
         if (N == 0) return;
         for (size_t i = 0; i < N; ++i) ref[i] = {p[i].x, p[i].y, p[i].z};
@@ -299,26 +299,26 @@ struct NeighborList {
         // Bounding box
         double xlo=p[0].x,xhi=p[0].x,ylo=p[0].y,yhi=p[0].y,zlo=p[0].z,zhi=p[0].z;
         for (const auto& a : p) {
-            xlo=std::min(xlo,a.x); xhi=std::max(xhi,a.x);
-            ylo=std::min(ylo,a.y); yhi=std::max(yhi,a.y);
-            zlo=std::min(zlo,a.z); zhi=std::max(zhi,a.z);
+            xlo=min(xlo,a.x); xhi=max(xhi,a.x);
+            ylo=min(ylo,a.y); yhi=max(yhi,a.y);
+            zlo=min(zlo,a.z); zhi=max(zhi,a.z);
         }
         // Cell side = full search radius ensures 3×3×3 neighborhood covers all pairs.
-        const double cs = std::sqrt(NL_RCUT2) + 1e-6;
+        const double cs = sqrt(NL_RCUT2) + 1e-6;
         const double mg = cs;   // expand box by one cell on each side
         xlo -= mg; ylo -= mg; zlo -= mg;
         double lx = xhi - xlo + 2.0*mg, ly = yhi - ylo + 2.0*mg, lz = zhi - zlo + 2.0*mg;
-        int nx = std::max(1, (int)std::ceil(lx / cs));
-        int ny = std::max(1, (int)std::ceil(ly / cs));
-        int nz = std::max(1, (int)std::ceil(lz / cs));
+        int nx = max(1, (int)ceil(lx / cs));
+        int ny = max(1, (int)ceil(ly / cs));
+        int nz = max(1, (int)ceil(lz / cs));
 
         // Assign each atom to a cell
-        std::vector<std::vector<size_t>> cells((size_t)(nx*ny*nz));
-        std::vector<int> cx(N), cy(N), cz(N);
+        vector<vector<size_t>> cells((size_t)(nx*ny*nz));
+        vector<int> cx(N), cy(N), cz(N);
         for (size_t i = 0; i < N; ++i) {
-            cx[i] = std::min(nx-1, std::max(0, (int)std::floor((p[i].x-xlo)/cs)));
-            cy[i] = std::min(ny-1, std::max(0, (int)std::floor((p[i].y-ylo)/cs)));
-            cz[i] = std::min(nz-1, std::max(0, (int)std::floor((p[i].z-zlo)/cs)));
+            cx[i] = min(nx-1, max(0, (int)floor((p[i].x-xlo)/cs)));
+            cy[i] = min(ny-1, max(0, (int)floor((p[i].y-ylo)/cs)));
+            cz[i] = min(nz-1, max(0, (int)floor((p[i].z-zlo)/cs)));
             cells[(size_t)(cx[i]+nx*(cy[i]+ny*cz[i]))].push_back(i);
         }
 
@@ -342,7 +342,7 @@ struct NeighborList {
     }
     // Returns true when any atom has moved > NL_SKIN/2 since the last build,
     // meaning a pair that was just outside NL_CUTOFF could now be inside it.
-    bool needs_rebuild(const std::vector<Particle>& p) const {
+    bool needs_rebuild(const vector<Particle>& p) const {
         for(size_t i=0;i<N;++i){
             double dx=p[i].x-ref[i][0],dy=p[i].y-ref[i][1],dz=p[i].z-ref[i][2];
             if(dx*dx+dy*dy+dz*dz>HALF_SKIN2) return true;
@@ -494,7 +494,7 @@ struct DihTerm {
 // Atoms a-b-c-d define the torsion; b-c is the rotatable bond.
 struct DihRecord {
     int   a, b, c, d;              // b-c는 중심 회전 결합
-    std::vector<DihTerm> terms;
+    vector<DihTerm> terms;
 };
 
 // ── 이중면체각 파라미터 표 (Dihedral parameter table) ────────────────────────
@@ -505,8 +505,8 @@ struct DihRecord {
 //
 // Returns Fourier terms keyed by bond kind and first character of atom_j name.
 // The returned V2 values are in kcal/mol (= Vn/2 in AMBER notation).
-static std::vector<DihTerm> get_dih_terms(BondKind kind,
-                                           const std::string& aname_j)
+static vector<DihTerm> get_dih_terms(BondKind kind,
+                                           const string& aname_j)
 {
     using K = BondKind;
     if (kind == K::BACKBONE_PHI)
@@ -558,8 +558,8 @@ static std::vector<DihTerm> get_dih_terms(BondKind kind,
 //  • Hydrogens included (needed for bond-order counting and 1-2 exclusions).
 //    If the PDB lacks H atoms, the lookup.find() simply misses them silently.
 
-using BondPair = std::pair<const char*, const char*>;
-using RotSpec  = std::tuple<const char*, const char*, BondKind>;
+using BondPair = pair<const char*, const char*>;
+using RotSpec  = tuple<const char*, const char*, BondKind>;
 
 // 백본 공통 결합 매크로 (이니셜라이저 리스트 반복 방지용)
 // Backbone bond macros to avoid repeating the same 5 pairs in every entry.
@@ -574,11 +574,11 @@ using RotSpec  = std::tuple<const char*, const char*, BondKind>;
 #define _BB_GLY {"N","H"},{"N","CA"},{"CA","HA2"},{"CA","HA3"},{"CA","C"},{"C","O"}
 #define _BB_PRO {"N","CA"},{"N","CD"},{"CA","HA"},{"CA","C"},{"C","O"}
 
-static const std::unordered_map<std::string, std::vector<BondPair>>&
+static const unordered_map<string, vector<BondPair>>&
 bond_templates() {
     // static 지역 변수 → 프로그램 수명 동안 단 한 번만 초기화됨 (thread-safe in C++11).
     // Static local: initialised exactly once for the program's lifetime (C++11 guaranteed).
-    static const std::unordered_map<std::string, std::vector<BondPair>> t = {
+    static const unordered_map<string, vector<BondPair>> t = {
 
         // GLY (글리신 / Glycine) — 유일하게 Cβ가 없는 잔기.
         // α-탄소에 수소가 두 개(HA2, HA3)붙어 있어 입체화학적으로 대칭.
@@ -1016,10 +1016,10 @@ bond_templates() {
 //   rot_specs에서 의도적으로 제외 (χ4 = CD-NE까지만 등록).
 //   CZ-NH1 and CZ-NH2 have partial double-bond character due to guanidinium
 //   resonance — intentionally excluded.  Only χ1-χ4 (up to CD-NE) registered.
-static const std::unordered_map<std::string, std::vector<RotSpec>>&
+static const unordered_map<string, vector<RotSpec>>&
 rot_specs() {
     using K = BondKind;
-    static const std::unordered_map<std::string, std::vector<RotSpec>> t = {
+    static const unordered_map<string, vector<RotSpec>> t = {
         // φ: N→CA,  ψ: CA→C  (모든 잔기에 공통 — 별도 주석 생략)
         // φ: N→CA,  ψ: CA→C  (universal backbone — comments omitted per-entry)
         {"GLY", { {"N","CA",K::BACKBONE_PHI}, {"CA","C",K::BACKBONE_PSI} }},
@@ -1129,13 +1129,13 @@ rot_specs() {
 class BondTopology {
 public:
     int                              N = 0;
-    std::vector<std::vector<int>>    adj;
-    std::vector<std::pair<int,int>>  bonds;
-    std::vector<RotBond>             rot_bonds;
+    vector<vector<int>>    adj;
+    vector<pair<int,int>>  bonds;
+    vector<RotBond>             rot_bonds;
     // rot_bond_sides[k] = j_side(rot_bonds[k].i, rot_bonds[k].j)
     // Pre-computed once in build() so the hot MC step loop can skip DFS.
     // build() 호출 시 한 번 계산해 MC 루프 내 DFS 비용을 제거한다.
-    std::vector<std::vector<int>>    rot_bond_sides;
+    vector<vector<int>>    rot_bond_sides;
 
     // P1.4b — 1-2/1-3 비결합 배제 집합 (Non-bonded exclusion sets)
     //
@@ -1153,7 +1153,7 @@ public:
     //           pair_e() 호출 전에 is_excluded(i, j)로 빠르게 체크.
     // Storage:  excl[i] = sorted list of j > i excluded from pair_e with i.
     //           Check via is_excluded(i, j) before calling pair_e().
-    std::vector<std::vector<int>>    excl;
+    vector<vector<int>>    excl;
 
     // P1.4a — 이중면체각 레코드 목록 (Pre-built dihedral energy records)
     //
@@ -1162,7 +1162,7 @@ public:
     //
     // One DihRecord per rotatable bond.  a = first adj[rb.i] ≠ rb.j;
     // d = first adj[rb.j] ≠ rb.i.  Energy terms from get_dih_terms().
-    std::vector<DihRecord>           dihedrals;
+    vector<DihRecord>           dihedrals;
 
     // ── 레버암 스케일 (Lever-arm scale per rotatable bond) ───────────────────
     //
@@ -1176,7 +1176,7 @@ public:
     // Each bond's scale_k = sqrt(N_ref / N_downstream), clamped to [0.05, 1.0].
     // Multiplied into max_angle before sampling δφ so that per-atom RMS
     // displacement is approximately constant regardless of bond position.
-    std::vector<double>              rot_bond_scale;
+    vector<double>              rot_bond_scale;
 
     // ── 크랭크샤프트 협동 이동 쌍 (Crankshaft concerted-move pairs) ──────────
     //
@@ -1192,7 +1192,7 @@ public:
     // Applied as +δ around φ then −δ around ψ: sidechain moves, downstream
     // backbone approximately restores (O(δ²) residual).  Yields higher acceptance
     // than single torsion moves for large proteins.
-    std::vector<std::pair<int,int>>  concerted_pairs;
+    vector<pair<int,int>>  concerted_pairs;
 
     // ── 곁사슬 협동 이동 쌍 (Concerted sidechain-pair moves, IMPROVEMENTS.md
     // 항목 #2의 MC 혼합 병목 진단 결과에 대한 대응) ──────────────────────────
@@ -1231,7 +1231,7 @@ public:
     // moves to happen in the right order by chance. Computed once at parse
     // time in identify_concerted_sidechain_pairs() (needs coordinates, so
     // deliberately not part of build() itself, which stays coordinate-free).
-    std::vector<std::pair<int,int>>  concerted_sidechain_pairs;
+    vector<pair<int,int>>  concerted_sidechain_pairs;
 
     // ── 이황화 결합 쌍 및 구속 (Disulfide bond pairs + restraints, P2.3) ────────
     //
@@ -1289,7 +1289,7 @@ public:
     // 1-2 exclusion:
     //   As a covalent bond, the SS pair must be excluded from the non-bonded sum.
     //   add_disulfide() inserts the pair into excl[] so is_excluded(i,j) returns true.
-    std::vector<std::pair<int,int>>  disulfide_pairs;
+    vector<pair<int,int>>  disulfide_pairs;
 
     // add_disulfide: 이황화 결합 쌍 (i, j)를 등록한다.
     //   • 경계 검사: 유효하지 않은 인덱스나 자기 자신과의 쌍은 조용히 무시.
@@ -1302,14 +1302,14 @@ public:
     //   • Push to disulfide_pairs and insert j into excl[i] (keeps excl sorted).
     void add_disulfide(int i, int j) {
         if (i < 0 || j < 0 || i >= N || j >= N || i == j) return;
-        if (i > j) std::swap(i, j);
+        if (i > j) swap(i, j);
         disulfide_pairs.push_back({i, j});
         // 이황화 SG-SG 쌍을 1-2 비결합 배제 목록에 추가.
         // 이진 탐색으로 정렬된 위치를 찾아 중복 없이 삽입.
         // Insert SS pair into 1-2 exclusion list (binary search keeps list sorted,
         // duplicate check prevents double-insertion).
         auto& vi = excl[i];
-        auto pos = std::lower_bound(vi.begin(), vi.end(), j);
+        auto pos = lower_bound(vi.begin(), vi.end(), j);
         if (pos == vi.end() || *pos != j) vi.insert(pos, j);
     }
 
@@ -1338,9 +1338,9 @@ public:
     //   3. 각 잔기에 AMBER 템플릿 결합 쌍을 적용해 잔기 내 결합 추가.
     //   4. 연속 잔기 쌍(r, r+1) 사이에 펩타이드 결합 C(r)→N(r+1) 추가.
     //   5. rot_specs 표에서 회전 가능 결합 인덱스 추출해 rot_bonds 채움.
-    void build(const std::vector<std::string>& resnames,
-               const std::vector<std::string>& atomnames,
-               const std::vector<int>&          res_idx)
+    void build(const vector<string>& resnames,
+               const vector<string>& atomnames,
+               const vector<int>&          res_idx)
     {
         N = (int)resnames.size();
         adj.assign(N, {});
@@ -1350,14 +1350,14 @@ public:
 
         // ── 단계 1: 역방향 조회 맵 구성 ────────────────────────────────────
         // (res_idx, atomname) → 파티클 배열 내 인덱스 k.
-        // std::map 사용: pair<int,string> 비교 연산자가 기본 정의되어 있어 안전.
+        // map 사용: pair<int,string> 비교 연산자가 기본 정의되어 있어 안전.
         // O(N log N) 구성; 이후 각 조회는 O(log N).
         //
         // Step 1: Build reverse lookup map.
         // (res_idx, atomname) → index k in the Particle array.
-        // std::map used: pair<int,string> comparison is defined in the standard.
+        // map used: pair<int,string> comparison is defined in the standard.
         // O(N log N) build; O(log N) per subsequent lookup.
-        std::map<std::pair<int,std::string>, int> lookup;
+        map<pair<int,string>, int> lookup;
         for (int k = 0; k < N; ++k)
             lookup[{res_idx[k], atomnames[k]}] = k;
 
@@ -1371,13 +1371,13 @@ public:
         // res_of:     res_idx → canonical resname.
         //             HIS → HID: unspecified HIS treated as the dominant neutral
         //             form at pH 7 (Nδ1-protonated).
-        std::vector<int> unique_res;
-        std::unordered_map<int, std::string> res_of;
+        vector<int> unique_res;
+        unordered_map<int, string> res_of;
         for (int k = 0; k < N; ++k) {
             int r = res_idx[k];
             if (res_of.find(r) == res_of.end()) {
                 unique_res.push_back(r);
-                std::string rn = resnames[k];
+                string rn = resnames[k];
                 if (rn == "HIS") rn = "HID";
                 res_of[r] = rn;
             }
@@ -1392,7 +1392,7 @@ public:
         // Inserts both directions into adj for an undirected graph.
         auto add_bond = [&](int i, int j) {
             if (i == j) return;
-            if (i > j) std::swap(i, j);
+            if (i > j) swap(i, j);
             adj[i].push_back(j);
             adj[j].push_back(i);
             bonds.push_back({i, j});
@@ -1522,8 +1522,8 @@ public:
                     excl[lo].push_back(hi);
                 }
         for (auto& v : excl) {
-            std::sort(v.begin(), v.end());
-            v.erase(std::unique(v.begin(), v.end()), v.end());
+            sort(v.begin(), v.end());
+            v.erase(unique(v.begin(), v.end()), v.end());
         }
 
         // ── P1.4a: 이중면체각 레코드 구성 ────────────────────────────────────
@@ -1549,7 +1549,7 @@ public:
             if (a_idx < 0 || b_idx < 0) continue;
             auto terms = get_dih_terms(rb.kind, atomnames[rb.j]);
             if (!terms.empty())
-                dihedrals.push_back({a_idx, rb.i, rb.j, b_idx, std::move(terms)});
+                dihedrals.push_back({a_idx, rb.i, rb.j, b_idx, move(terms)});
         }
 
         // ── 사전 계산: 각 회전 가능 결합의 j-side 원자 집합 ─────────────────
@@ -1571,8 +1571,8 @@ public:
         constexpr double LEVER_NREF = 10.0;
         rot_bond_scale.resize(rot_bonds.size());
         for (size_t k = 0; k < rot_bonds.size(); ++k) {
-            double ns = std::max(1.0, (double)rot_bond_sides[k].size());
-            rot_bond_scale[k] = std::min(1.0, std::max(0.05, std::sqrt(LEVER_NREF / ns)));
+            double ns = max(1.0, (double)rot_bond_sides[k].size());
+            rot_bond_scale[k] = min(1.0, max(0.05, sqrt(LEVER_NREF / ns)));
         }
 
         // ── 크랭크샤프트 협동 이동 쌍 구성 ──────────────────────────────────
@@ -1581,7 +1581,7 @@ public:
         //
         // Match φ and ψ bonds sharing the same Cα: φ.j == ψ.i == CA_atom_idx.
         {
-            std::unordered_map<int,int> phi_at_ca, psi_at_ca;
+            unordered_map<int,int> phi_at_ca, psi_at_ca;
             for (size_t k = 0; k < rot_bonds.size(); ++k) {
                 if (rot_bonds[k].kind == BondKind::BACKBONE_PHI)
                     phi_at_ca[rot_bonds[k].j] = (int)k;
@@ -1637,7 +1637,7 @@ public:
     //
     // O(n_rotbonds²) one-time cost at parse time, not per MC step. Capped to
     // avoid an unbounded pair count on very large/dense proteins.
-    void identify_concerted_sidechain_pairs(const std::vector<Particle>& init_coords,
+    void identify_concerted_sidechain_pairs(const vector<Particle>& init_coords,
                                              double cutoff = 6.0) {
         concerted_sidechain_pairs.clear();
         constexpr size_t MAX_PAIRS = 4000;  // safety valve for very large/dense proteins
@@ -1653,7 +1653,7 @@ public:
             const auto& small  = (sa.size() <= sb.size()) ? sa : sb;
             const auto& big    = (sa.size() <= sb.size()) ? sb : sa;
             for (int idx : small)
-                if (std::find(big.begin(), big.end(), idx) != big.end())
+                if (find(big.begin(), big.end(), idx) != big.end())
                     return false;
             return true;
         };
@@ -1699,9 +1699,9 @@ public:
     // Implementation: binary search in excl[lo] for hi — O(log E) ≈ O(1).
     bool is_excluded(int i, int j) const noexcept {
         if (i < 0 || j < 0 || i >= N || j >= N) return false;
-        if (i > j) std::swap(i, j);
+        if (i > j) swap(i, j);
         const auto& v = excl[i];
-        return std::binary_search(v.begin(), v.end(), j);
+        return binary_search(v.begin(), v.end(), j);
     }
 
     // ── j_side() ─────────────────────────────────────────────────────────────
@@ -1728,12 +1728,12 @@ public:
     // 반환값 (Return value):
     //   회전할 원자들의 인덱스 벡터.  bi·bj 모두 범위 밖이면 빈 벡터 반환.
     //   Vector of atom indices that rotate.  Returns empty if bi or bj is out of range.
-    std::vector<int> j_side(int bi, int bj) const {
-        std::vector<int> side;
+    vector<int> j_side(int bi, int bj) const {
+        vector<int> side;
         if (bi < 0 || bi >= N || bj < 0 || bj >= N) return side;
-        std::vector<bool> visited(N, false);
+        vector<bool> visited(N, false);
         visited[bi] = true;   // bi를 장벽으로 설정 / set bi as traversal barrier
-        std::vector<int> stk = {bj};
+        vector<int> stk = {bj};
         while (!stk.empty()) {
             int cur = stk.back(); stk.pop_back();
             if (visited[cur]) continue;
@@ -1826,7 +1826,7 @@ public:
 // a 'this' pointer inside OpenMP parallel sections.
 class PhysicsEngine {
 private:
-    std::mt19937 gen;
+    mt19937 gen;
 
     // Squared Euclidean distance between two particles.
     static inline double d2(const Particle& a,const Particle& b) noexcept {
@@ -1868,7 +1868,7 @@ private:
     // 벡터 b1 = a-b, b2 = c-b, b3 = d-c 로 정의.
     // n1 = b1×b2, n2 = b2×b3 이 두 평면의 법선 벡터.
     // atan2(m·n2, n1·n2) 로 부호를 결정한다 (m = n1 × b2).
-    static inline double dihedral_angle(const std::vector<Particle>& p,
+    static inline double dihedral_angle(const vector<Particle>& p,
                                          int a, int b, int c, int d) noexcept {
         double b1x = p[a].x-p[b].x, b1y = p[a].y-p[b].y, b1z = p[a].z-p[b].z;
         double b2x = p[c].x-p[b].x, b2y = p[c].y-p[b].y, b2z = p[c].z-p[b].z;
@@ -1881,7 +1881,7 @@ private:
         double m1x = n1y*b2z-n1z*b2y, m1y = n1z*b2x-n1x*b2z, m1z = n1x*b2y-n1y*b2x;
         double x = n1x*n2x+n1y*n2y+n1z*n2z;
         double y = m1x*n2x+m1y*n2y+m1z*n2z;
-        return std::atan2(y, x);
+        return atan2(y, x);
     }
 
     // Sum of torsion energy over all DihRecord entries that cross the
@@ -1890,9 +1890,9 @@ private:
     //
     // 이중면체각 에너지 합산.  경계를 가로지르는 레코드(j-side와 i-side가 혼재)만 포함.
     // 공식: E = Σ V2 · [1 + cos(n·φ − γ)]
-    static double dihedral_e_boundary(const std::vector<Particle>& p,
-                                       const std::vector<DihRecord>& dihs,
-                                       const std::vector<bool>& in_side) noexcept {
+    static double dihedral_e_boundary(const vector<Particle>& p,
+                                       const vector<DihRecord>& dihs,
+                                       const vector<bool>& in_side) noexcept {
         double E = 0.0;
         for (const auto& dr : dihs) {
             bool s_a = in_side[dr.a], s_b = in_side[dr.b],
@@ -1902,20 +1902,20 @@ private:
             if (!any_side || !any_fixed) continue;
             double phi = dihedral_angle(p, dr.a, dr.b, dr.c, dr.d);
             for (const auto& t : dr.terms)
-                E += t.V2 * (1.0 + std::cos((double)t.n * phi - t.gamma));
+                E += t.V2 * (1.0 + cos((double)t.n * phi - t.gamma));
         }
         return E;
     }
 
     // Full dihedral energy sum over all records (for total_e).
     // 전체 이중면체각 에너지 합산 (total_e에서 사용).
-    static double dihedral_e(const std::vector<Particle>& p,
-                              const std::vector<DihRecord>& dihs) noexcept {
+    static double dihedral_e(const vector<Particle>& p,
+                              const vector<DihRecord>& dihs) noexcept {
         double E = 0.0;
         for (const auto& dr : dihs) {
             double phi = dihedral_angle(p, dr.a, dr.b, dr.c, dr.d);
             for (const auto& t : dr.terms)
-                E += t.V2 * (1.0 + std::cos((double)t.n * phi - t.gamma));
+                E += t.V2 * (1.0 + cos((double)t.n * phi - t.gamma));
         }
         return E;
     }
@@ -1962,12 +1962,12 @@ private:
 
     // ss_e: 전체 이황화 구속 에너지 합산.  total_e()에서 호출.
     // ss_e: Total disulfide restraint energy.  Called from total_e().
-    static double ss_e(const std::vector<Particle>& p,
-                        const std::vector<std::pair<int,int>>& ss) noexcept {
+    static double ss_e(const vector<Particle>& p,
+                        const vector<pair<int,int>>& ss) noexcept {
         double E = 0.0;
         for (const auto& [i, j] : ss) {
             double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
-            double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+            double dr = sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
             E += K_SS * dr * dr;
         }
         return E;
@@ -1978,16 +1978,16 @@ private:
     //
     // ss_e_side: Partial SS restraint energy for MC ΔE — only cross-side pairs
     // (exactly one atom in in_side) contribute to ΔE under a torsion rotation.
-    static double ss_e_side(const std::vector<Particle>& p,
-                              const std::vector<std::pair<int,int>>& ss,
-                              const std::vector<bool>& in_side) noexcept {
+    static double ss_e_side(const vector<Particle>& p,
+                              const vector<pair<int,int>>& ss,
+                              const vector<bool>& in_side) noexcept {
         double E = 0.0;
         for (const auto& [i, j] : ss) {
             // 두 원자 모두 in_side이거나 둘 다 아니면 → 이동에 의해 거리 불변 → 건너뜀.
             // Both in same side → rigid rotation preserves their distance → skip.
             if (!in_side[i] && !in_side[j]) continue;
             double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
-            double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+            double dr = sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
             E += K_SS * dr * dr;
         }
         return E;
@@ -2005,9 +2005,9 @@ private:
     //       GB 에너지가 줄어든다 (더 잘 차폐됨 = 덜 불리).
     // j가 i에 완전히 묻혀 있으면 0 반환.
     static inline double hct(double r,double r2,double ri,double rj) noexcept {
-        double L=std::max(std::abs(r-rj),ri),U=r+rj;
+        double L=max(abs(r-rj),ri),U=r+rj;
         if(ri>=U) return 0.0;
-        return 1.0/L-1.0/U+(r2-rj*rj+ri*ri)/(2.0*r*ri*ri)*std::log(L/U)*0.5/r;
+        return 1.0/L-1.0/U+(r2-rj*rj+ri*ri)/(2.0*r*ri*ri)*log(L/U)*0.5/r;
     }
 
     // Compute effective Born radii for all atoms.
@@ -2021,33 +2021,33 @@ private:
     //
     // 물리적 의미: 노출된 원자(a ≈ r_i)는 GB 에너지가 크고(불리),
     //             묻힌 원자(a >> r_i)는 GB 에너지가 작다(유리).
-    static std::vector<double> born_radii(const std::vector<Particle>& p,const NeighborList& nl){
+    static vector<double> born_radii(const vector<Particle>& p,const NeighborList& nl){
         size_t N=p.size();
-        std::vector<double> sum(N,0.0);
+        vector<double> sum(N,0.0);
         for(size_t i=0;i<N;++i)
             for(size_t j:nl.nb[i]){
-                double r2=d2(p[i],p[j]),r=std::sqrt(r2);
+                double r2=d2(p[i],p[j]),r=sqrt(r2);
                 sum[i]+=hct(r,r2,p[i].radius,p[j].radius);
                 sum[j]+=hct(r,r2,p[j].radius,p[i].radius);
             }
-        std::vector<double> a(N);
+        vector<double> a(N);
         for(size_t i=0;i<N;++i){
             double inv=1.0/p[i].radius-0.5*sum[i];
-            a[i]=1.0/std::max(inv,2.0);
+            a[i]=1.0/max(inv,2.0);
         }
         return a;
     }
 
     // Incremental Born radius update for one atom (idx) after it moves.
     // Cheaper than recomputing all radii; used every MC step in generate_ensemble.
-    static void update_born(size_t idx,const std::vector<Particle>& p,
-                             const NeighborList& nl,std::vector<double>& a){
+    static void update_born(size_t idx,const vector<Particle>& p,
+                             const NeighborList& nl,vector<double>& a){
         double ri=p[idx].radius,sum=0.0;
         for(size_t j:nl.nb[idx]){
-            double r2=d2(p[idx],p[j]),r=std::sqrt(r2);
+            double r2=d2(p[idx],p[j]),r=sqrt(r2);
             sum+=hct(r,r2,ri,p[j].radius);
         }
-        a[idx]=1.0/std::max(1.0/ri-0.5*sum,2.0);
+        a[idx]=1.0/max(1.0/ri-0.5*sum,2.0);
     }
 
     // SASA nonpolar energy.
@@ -2065,19 +2065,19 @@ private:
     //       수소결합 네트워크를 재배열해야 해 엔트로피 비용이 발생한다.
     //       (소수성 효과, hydrophobic effect)
     //       단백질이 접히면 이 비용이 줄어 전체 에너지가 낮아진다.
-    static double sasa_nonpolar(const std::vector<Particle>& p,const NeighborList& nl){
+    static double sasa_nonpolar(const vector<Particle>& p,const NeighborList& nl){
         size_t N=p.size();double E=BETA_SA;
         for(size_t i=0;i<N;++i){
             double ri=p[i].radius+PROBE_R,sa=4.0*M_PI*ri*ri;
             for(size_t j:nl.nb[i]){
                 double rj=p[j].radius+PROBE_R;
                 double dx=p[i].x-p[j].x,dy=p[i].y-p[j].y,dz=p[i].z-p[j].z;
-                double r=std::sqrt(dx*dx+dy*dy+dz*dz),dc=ri+rj;
+                double r=sqrt(dx*dx+dy*dy+dz*dz),dc=ri+rj;
                 if(r>=dc) continue;
                 double h=(dc-r)/(2.0*ri);
-                sa-=std::min(sa*0.85,2.0*M_PI*ri*ri*h);
+                sa-=min(sa*0.85,2.0*M_PI*ri*ri*h);
             }
-            E+=GAMMA_SA*std::max(0.0,sa);
+            E+=GAMMA_SA*max(0.0,sa);
         }
         return E;
     }
@@ -2147,18 +2147,18 @@ private:
     // 실제 배제되지 않는 정상 접촉보다는 훨씬 큰 페널티를 유지한다.
     static inline double pair_e(const Particle& pi,const Particle& pj,double ai,double aj) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
-        double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
+        double r2=dx*dx+dy*dy+dz*dz,r=sqrt(r2),sig=pi.radius+pj.radius;
         double qp=pi.charge*pj.charge;
-        double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
-        double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
+        double edh=(COULOMB*qp)/(EPS_WATER*r)*exp(-KAPPA*r);
+        double fgb=sqrt(r2+ai*aj*exp(-r2/(4.0*ai*aj)));
         double egb=GB_COEF*qp/fgb;
-        double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
+        double eps=sqrt(pi.epsilon*pj.epsilon),s6=pow(sig/r,6);
         double elj=4.0*eps*(s6*s6-s6);
         double E=edh+egb+elj;
         double r_cut=sig*HARD_CUTOFF_FRAC;
         if(r<r_cut){
-            double x=std::pow(r_cut/r,12.0)-1.0;
-            E+=std::min(HARD_SCALE*x*x, HARD_CAP);
+            double x=pow(r_cut/r,12.0)-1.0;
+            E+=min(HARD_SCALE*x*x, HARD_CAP);
         }
         return E;
     }
@@ -2180,19 +2180,19 @@ private:
     static inline double pair_e_diag(const Particle& pi,const Particle& pj,double ai,double aj,
                                       double& hardcore_out) noexcept {
         double dx=pi.x-pj.x,dy=pi.y-pj.y,dz=pi.z-pj.z;
-        double r2=dx*dx+dy*dy+dz*dz,r=std::sqrt(r2),sig=pi.radius+pj.radius;
+        double r2=dx*dx+dy*dy+dz*dz,r=sqrt(r2),sig=pi.radius+pj.radius;
         double qp=pi.charge*pj.charge;
-        double edh=(COULOMB*qp)/(EPS_WATER*r)*std::exp(-KAPPA*r);
-        double fgb=std::sqrt(r2+ai*aj*std::exp(-r2/(4.0*ai*aj)));
+        double edh=(COULOMB*qp)/(EPS_WATER*r)*exp(-KAPPA*r);
+        double fgb=sqrt(r2+ai*aj*exp(-r2/(4.0*ai*aj)));
         double egb=GB_COEF*qp/fgb;
-        double eps=std::sqrt(pi.epsilon*pj.epsilon),s6=std::pow(sig/r,6);
+        double eps=sqrt(pi.epsilon*pj.epsilon),s6=pow(sig/r,6);
         double elj=4.0*eps*(s6*s6-s6);
         double E=edh+egb+elj;
         double r_cut=sig*HARD_CUTOFF_FRAC;
         hardcore_out = 0.0;
         if(r<r_cut){
-            double x=std::pow(r_cut/r,12.0)-1.0;
-            hardcore_out = std::min(HARD_SCALE*x*x, HARD_CAP);
+            double x=pow(r_cut/r,12.0)-1.0;
+            hardcore_out = min(HARD_SCALE*x*x, HARD_CAP);
             E+=hardcore_out;
         }
         return E;
@@ -2202,8 +2202,8 @@ private:
     // Skips 1-2/1-3 excluded pairs when topo != nullptr (P1.4b).
     // Includes dihedral energy when topo != nullptr and topo has dihedrals (P1.4a).
     // OpenMP parallel-for over atom i with dynamic scheduling and energy reduction.
-    static double total_e(const std::vector<Particle>& p, const NeighborList& nl,
-                          const std::vector<double>& a,
+    static double total_e(const vector<Particle>& p, const NeighborList& nl,
+                          const vector<double>& a,
                           const BondTopology* topo = nullptr) {
         double E = sasa_nonpolar(p, nl);
         if (topo && !topo->dihedrals.empty())
@@ -2219,11 +2219,11 @@ private:
         // natural type here, matching p.size()) fails to compile under
         // MSVC+/openmp with C3016. Use a signed ptrdiff_t for the loop counter
         // and cast back to size_t for indexing.
-        const std::ptrdiff_t N = static_cast<std::ptrdiff_t>(p.size());
+        const ptrdiff_t N = static_cast<ptrdiff_t>(p.size());
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic,8) reduction(+:E)
 #endif
-        for (std::ptrdiff_t i = 0; i < N; ++i)
+        for (ptrdiff_t i = 0; i < N; ++i)
             for (size_t j : nl.nb[(size_t)i]) {
                 if (topo && topo->is_excluded((int)i, (int)j)) continue;
                 double dx = p[i].x-p[j].x, dy = p[i].y-p[j].y, dz = p[i].z-p[j].z;
@@ -2233,13 +2233,13 @@ private:
         return E;
     }
 public:
-    PhysicsEngine():gen(std::random_device{}()){}
+    PhysicsEngine():gen(random_device{}()){}
 
     // calculate_potential: full GB/DH/LJ/SASA energy for an arbitrary particle list.
     // Rebuilds the neighbor list from scratch on every call — use only for final
     // evaluation, not inside the inner MC loop.
     // Pass topo != nullptr to enable 1-2/1-3 exclusions (P1.4b).
-    double calculate_potential(const std::vector<Particle>& particles,
+    double calculate_potential(const vector<Particle>& particles,
                                const BondTopology* topo = nullptr) {
         if (particles.empty()) return 0.0;
         NeighborList nl; nl.build(particles);
@@ -2270,31 +2270,31 @@ public:
     // Metropolis detailed balance is preserved:
     //   torsion move  — symmetric U[-δ,+δ] proposal.
     //   crankshaft    — symmetric U[-δ,+δ] for +δ/−δ pair; reverse proposal identical probability.
-    std::vector<std::vector<Particle>> generate_ensemble(
-        const std::vector<Particle>& init,
+    vector<vector<Particle>> generate_ensemble(
+        const vector<Particle>& init,
         const BondTopology& topo,
         int ncand, int steps,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw std::invalid_argument("initial_state empty");
-        if (ncand <= 0 || steps <= 0) throw std::invalid_argument("ncand/steps must be positive");
-        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+        if (init.empty()) throw invalid_argument("initial_state empty");
+        if (ncand <= 0 || steps <= 0) throw invalid_argument("ncand/steps must be positive");
+        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
         size_t N   = init.size();
         int    nrb = (int)topo.rot_bonds.size();
         int    ncp = (int)topo.concerted_pairs.size();
-        std::vector<std::vector<Particle>> ens(ncand);
+        vector<vector<Particle>> ens(ncand);
 
-        auto chain = [&](int c, std::mt19937& rng) {
-            std::vector<Particle> st = init;
+        auto chain = [&](int c, mt19937& rng) {
+            vector<Particle> st = init;
             NeighborList nl; nl.build(st);
             auto a = born_radii(st, nl);
             double curE = total_e(st, nl, a, &topo);
 
-            std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
-            std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
-            std::uniform_real_distribution<double> uni(0.0, 1.0);
-            std::vector<bool> in_side(N, false);  // reused every step; cleared after each move
+            uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+            uniform_int_distribution<int>    pick_cp(0, max(0, ncp - 1));
+            uniform_real_distribution<double> uni(0.0, 1.0);
+            vector<bool> in_side(N, false);  // reused every step; cleared after each move
 
             // ── 적응형 제안 폭 상태 (Adaptive proposal width state) ──────────
             // TUNE_FREQ 스텝마다 수용율을 측정해 cur_max를 조절한다.
@@ -2325,15 +2325,15 @@ public:
             // ── 표준 비틀림 이동 람다 ─────────────────────────────────────
             // Standard torsion-angle MC move with lever-arm scaling.
             // Returns {accepted, did_move}.
-            auto try_torsion = [&]() -> std::pair<bool,bool> {
+            auto try_torsion = [&]() -> pair<bool,bool> {
                 int            rb_idx = pick_rb(rng);
                 const RotBond& rb     = topo.rot_bonds[rb_idx];
-                const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+                const vector<int>& side = topo.rot_bond_sides[rb_idx];
                 if (side.empty()) return {false, false};
 
                 // 회전축 계산 / Compute normalised rotation axis.
                 double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
-                double al = std::sqrt(ax*ax+ay*ay+az*az);
+                double al = sqrt(ax*ax+ay*ay+az*az);
                 if (al < 1e-10) return {false, false};
                 ax/=al; ay/=al; az/=al;
 
@@ -2343,13 +2343,13 @@ public:
                                  rb.kind == BondKind::BACKBONE_PSI)
                                 ? cur_max : cur_max * 2.5;
                 base_d *= topo.rot_bond_scale[rb_idx];
-                double delta = std::uniform_real_distribution<double>(-base_d, base_d)(rng);
-                double cosD  = std::cos(delta), sinD = std::sin(delta);
+                double delta = uniform_real_distribution<double>(-base_d, base_d)(rng);
+                double cosD  = cos(delta), sinD = sin(delta);
 
                 for (int k : side) in_side[k] = true;
 
-                std::vector<std::array<double,3>> old_pos(side.size());
-                std::vector<double>               old_born(side.size());
+                vector<array<double,3>> old_pos(side.size());
+                vector<double>               old_born(side.size());
                 for (size_t k = 0; k < side.size(); ++k) {
                     int idx = side[k];
                     old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -2384,7 +2384,7 @@ public:
                 bool accepted = false;
                 double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                           + (new_dih-old_dih)   + (new_ss-old_ss);
-                if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
+                if (dE < 0.0 || uni(rng) < exp(-dE / T)) {
                     curE += dE;
                     accepted = true;
                 } else {
@@ -2404,13 +2404,13 @@ public:
             //   Phase 2 (ψ, −δ): C + O + all downstream rotate back (≈ cancels).
             //   Net displacement: sidechain of residue i; downstream backbone O(δ²).
             // Returns {accepted, did_move}.
-            auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+            auto try_crankshaft = [&]() -> pair<bool,bool> {
                 if (ncp == 0) return {false, false};
                 int cp_idx = (ncp > 1) ? pick_cp(rng) : 0;
                 int phi_k  = topo.concerted_pairs[cp_idx].first;
                 int psi_k  = topo.concerted_pairs[cp_idx].second;
-                const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
-                const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+                const vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+                const vector<int>& psi_side = topo.rot_bond_sides[psi_k];
                 if (phi_side.empty() || psi_side.empty()) return {false, false};
 
                 // in_side: φ side (includes sidechain + downstream backbone)
@@ -2420,13 +2420,13 @@ public:
                 const RotBond& phi_rb = topo.rot_bonds[phi_k];
                 double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
                 double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
-                double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+                double p1l  = sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
                 if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
                 p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
 
                 // 이전 에너지 + 상태 저장 / Save old energy and positions.
-                std::vector<std::array<double,3>> old_pos(phi_side.size());
-                std::vector<double>               old_born(phi_side.size());
+                vector<array<double,3>> old_pos(phi_side.size());
+                vector<double>               old_born(phi_side.size());
                 for (size_t k = 0; k < phi_side.size(); ++k) {
                     int idx = phi_side[k];
                     old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -2443,8 +2443,8 @@ public:
                 // δ 샘플링: 크랭크샤프트는 실효 이동이 국소적이므로 스케일 없이 cur_max 사용.
                 // No lever-arm scale for crankshaft: the effective displacement is local
                 // regardless of chain position (downstream atoms approximately cancel).
-                double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(rng);
-                double cosD  = std::cos(delta), sinD = std::sin(delta);
+                double delta = uniform_real_distribution<double>(-cur_max, cur_max)(rng);
+                double cosD  = cos(delta), sinD = sin(delta);
 
                 // Phase 1: φ 회전 (+δ), φ-side 전체
                 for (int k : phi_side)
@@ -2455,7 +2455,7 @@ public:
                 const RotBond& psi_rb = topo.rot_bonds[psi_k];
                 double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
                 double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
-                double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+                double p2l  = sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
                 if (p2l < 1e-10) {
                     // φ 회전 복원 후 스킵 / Revert φ and skip.
                     for (size_t k = 0; k < phi_side.size(); ++k) {
@@ -2486,7 +2486,7 @@ public:
                 bool accepted = false;
                 double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                           + (new_dih-old_dih)   + (new_ss-old_ss);
-                if (dE < 0.0 || uni(rng) < std::exp(-dE / T)) {
+                if (dE < 0.0 || uni(rng) < exp(-dE / T)) {
                     curE += dE;
                     accepted = true;
                 } else {
@@ -2520,19 +2520,19 @@ public:
                     acc_win += accepted ? 1 : 0;
                     if (++tot_win == TUNE_FREQ) {
                         double rate = (double)acc_win / TUNE_FREQ;
-                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
-                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        if      (rate > TARGET_HI) cur_max = min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = max(ANGLE_MIN, cur_max * SCALE_DOWN);
                         acc_win = tot_win = 0;
                     }
                 }
             }
-            ens[c] = std::move(st);
+            ens[c] = move(st);
         };
 
 #ifdef _OPENMP
         #pragma omp parallel
         {
-            std::mt19937 lg(std::random_device{}() ^ (std::hash<int>{}(omp_get_thread_num()) << 16));
+            mt19937 lg(random_device{}() ^ (hash<int>{}(omp_get_thread_num()) << 16));
             #pragma omp for schedule(dynamic)
             for (int c = 0; c < ncand; ++c) chain(c, lg);
         }
@@ -2553,37 +2553,37 @@ public:
     // (see IMPROVEMENTS.md item #12). The per-step physics is identical to
     // generate_ensemble's single-chain body (duplicated rather than shared via
     // a helper, to avoid touching that already-verified hot path).
-    std::pair<std::vector<std::vector<Particle>>, std::vector<double>>
+    pair<vector<vector<Particle>>, vector<double>>
     run_landscape_trajectory(
-        const std::vector<Particle>& init,
+        const vector<Particle>& init,
         const BondTopology& topo,
         int n_snapshots, int steps_per_snapshot,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (init.empty()) throw invalid_argument("initial_state empty");
         if (n_snapshots <= 0 || steps_per_snapshot <= 0)
-            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
-        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+            throw invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
 
         size_t N   = init.size();
         int    nrb = (int)topo.rot_bonds.size();
         int    ncp = (int)topo.concerted_pairs.size();
 
-        std::vector<std::vector<Particle>> snapshots;
-        std::vector<double>                energies;
+        vector<vector<Particle>> snapshots;
+        vector<double>                energies;
         snapshots.reserve(n_snapshots);
         energies.reserve(n_snapshots);
 
-        std::vector<Particle> st = init;
+        vector<Particle> st = init;
         NeighborList nl; nl.build(st);
         auto a = born_radii(st, nl);
         double curE = total_e(st, nl, a, &topo);
 
-        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
-        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
-        std::vector<bool> in_side(N, false);
+        uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        uniform_int_distribution<int>    pick_cp(0, max(0, ncp - 1));
+        uniform_real_distribution<double> uni(0.0, 1.0);
+        vector<bool> in_side(N, false);
 
         double cur_max = max_angle;
         int    acc_win = 0, tot_win = 0;
@@ -2605,14 +2605,14 @@ public:
             return E;
         };
 
-        auto try_torsion = [&]() -> std::pair<bool,bool> {
+        auto try_torsion = [&]() -> pair<bool,bool> {
             int            rb_idx = pick_rb(gen);
             const RotBond& rb     = topo.rot_bonds[rb_idx];
-            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            const vector<int>& side = topo.rot_bond_sides[rb_idx];
             if (side.empty()) return {false, false};
 
             double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
-            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            double al = sqrt(ax*ax+ay*ay+az*az);
             if (al < 1e-10) return {false, false};
             ax/=al; ay/=al; az/=al;
 
@@ -2620,13 +2620,13 @@ public:
                              rb.kind == BondKind::BACKBONE_PSI)
                             ? cur_max : cur_max * 2.5;
             base_d *= topo.rot_bond_scale[rb_idx];
-            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : side) in_side[k] = true;
 
-            std::vector<std::array<double,3>> old_pos(side.size());
-            std::vector<double>               old_born(side.size());
+            vector<array<double,3>> old_pos(side.size());
+            vector<double>               old_born(side.size());
             for (size_t k = 0; k < side.size(); ++k) {
                 int idx = side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -2653,7 +2653,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -2667,13 +2667,13 @@ public:
             return {accepted, true};
         };
 
-        auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+        auto try_crankshaft = [&]() -> pair<bool,bool> {
             if (ncp == 0) return {false, false};
             int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
             int phi_k  = topo.concerted_pairs[cp_idx].first;
             int psi_k  = topo.concerted_pairs[cp_idx].second;
-            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
-            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            const vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const vector<int>& psi_side = topo.rot_bond_sides[psi_k];
             if (phi_side.empty() || psi_side.empty()) return {false, false};
 
             for (int k : phi_side) in_side[k] = true;
@@ -2681,12 +2681,12 @@ public:
             const RotBond& phi_rb = topo.rot_bonds[phi_k];
             double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
             double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
-            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            double p1l  = sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
             if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
             p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
 
-            std::vector<std::array<double,3>> old_pos(phi_side.size());
-            std::vector<double>               old_born(phi_side.size());
+            vector<array<double,3>> old_pos(phi_side.size());
+            vector<double>               old_born(phi_side.size());
             for (size_t k = 0; k < phi_side.size(); ++k) {
                 int idx = phi_side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -2698,8 +2698,8 @@ public:
             double old_ss    = topo.disulfide_pairs.empty() ? 0.0
                              : ss_e_side(st, topo.disulfide_pairs, in_side);
 
-            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : phi_side)
                 rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
@@ -2707,7 +2707,7 @@ public:
             const RotBond& psi_rb = topo.rot_bonds[psi_k];
             double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
             double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
-            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            double p2l  = sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
             if (p2l < 1e-10) {
                 for (size_t k = 0; k < phi_side.size(); ++k) {
                     int idx = phi_side[k];
@@ -2731,7 +2731,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -2779,7 +2779,7 @@ public:
         // cross term entirely -- exactly the interaction this move exists to
         // capture (do the two proposed sidechain moves clash with each
         // other) -- hence the separate cross_e_concerted() below.
-        std::vector<int> side_group(N, 0);
+        vector<int> side_group(N, 0);
         auto cross_e_concerted = [&]() -> double {
             double E = 0.0;
             for (size_t i = 0; i < N; ++i)
@@ -2793,47 +2793,47 @@ public:
             return E;
         };
         const int ncsp = (int)topo.concerted_sidechain_pairs.size();
-        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+        uniform_int_distribution<int> pick_csp(0, max(0, ncsp - 1));
 
-        auto try_concerted_sidechain = [&]() -> std::pair<bool,bool> {
+        auto try_concerted_sidechain = [&]() -> pair<bool,bool> {
             if (ncsp == 0) return {false, false};
             int   pair_idx = (ncsp > 1) ? pick_csp(gen) : 0;
             int   bond_a   = topo.concerted_sidechain_pairs[pair_idx].first;
             int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
             const RotBond& rb_a = topo.rot_bonds[bond_a];
             const RotBond& rb_b = topo.rot_bonds[bond_b];
-            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
-            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            const vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const vector<int>& side_b = topo.rot_bond_sides[bond_b];
             if (side_a.empty() || side_b.empty()) return {false, false};
 
             double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
-            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            double alA = sqrt(axA*axA+ayA*ayA+azA*azA);
             if (alA < 1e-10) return {false, false};
             axA/=alA; ayA/=alA; azA/=alA;
             double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
-            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            double alB = sqrt(axB*axB+ayB*ayB+azB*azB);
             if (alB < 1e-10) return {false, false};
             axB/=alB; ayB/=alB; azB/=alB;
 
             // Both bonds are BondKind::SIDECHAIN by construction (see
             // identify_concerted_sidechain_pairs) -- same sidechain-style
             // 2.5x lever-arm scaling as try_torsion's non-backbone branch.
-            double deltaA = std::uniform_real_distribution<double>(
+            double deltaA = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
-            double deltaB = std::uniform_real_distribution<double>(
+            double deltaB = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
-            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
-            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+            double cosA = cos(deltaA), sinA = sin(deltaA);
+            double cosB = cos(deltaB), sinB = sin(deltaB);
 
             for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
             for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
 
-            std::vector<int> all_idx;
+            vector<int> all_idx;
             all_idx.reserve(side_a.size() + side_b.size());
             all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
             all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
-            std::vector<std::array<double,3>> old_pos(all_idx.size());
-            std::vector<double>               old_born(all_idx.size());
+            vector<array<double,3>> old_pos(all_idx.size());
+            vector<double>               old_born(all_idx.size());
             for (size_t k = 0; k < all_idx.size(); ++k) {
                 int idx = all_idx[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -2863,7 +2863,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -2905,8 +2905,8 @@ public:
                     acc_win += accepted ? 1 : 0;
                     if (++tot_win == TUNE_FREQ) {
                         double rate = (double)acc_win / TUNE_FREQ;
-                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
-                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        if      (rate > TARGET_HI) cur_max = min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = max(ANGLE_MIN, cur_max * SCALE_DOWN);
                         acc_win = tot_win = 0;
                     }
                 }
@@ -2948,37 +2948,37 @@ public:
     // CPU only -- physics_engine_cuda.cu's run_landscape_trajectory has the
     // identical reset behavior (S.cur_max = max_angle at the top of every
     // call) but does not yet have a GPU equivalent of this fix; deferred.
-    std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double>
+    tuple<vector<vector<Particle>>, vector<double>, double>
     run_landscape_segment(
-        const std::vector<Particle>& init,
+        const vector<Particle>& init,
         const BondTopology& topo,
         int n_snapshots, int steps_per_snapshot,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (init.empty()) throw invalid_argument("initial_state empty");
         if (n_snapshots <= 0 || steps_per_snapshot <= 0)
-            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
-        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+            throw invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
 
         size_t N   = init.size();
         int    nrb = (int)topo.rot_bonds.size();
         int    ncp = (int)topo.concerted_pairs.size();
 
-        std::vector<std::vector<Particle>> snapshots;
-        std::vector<double>                energies;
+        vector<vector<Particle>> snapshots;
+        vector<double>                energies;
         snapshots.reserve(n_snapshots);
         energies.reserve(n_snapshots);
 
-        std::vector<Particle> st = init;
+        vector<Particle> st = init;
         NeighborList nl; nl.build(st);
         auto a = born_radii(st, nl);
         double curE = total_e(st, nl, a, &topo);
 
-        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
-        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
-        std::vector<bool> in_side(N, false);
+        uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        uniform_int_distribution<int>    pick_cp(0, max(0, ncp - 1));
+        uniform_real_distribution<double> uni(0.0, 1.0);
+        vector<bool> in_side(N, false);
 
         double cur_max = max_angle;
         int    acc_win = 0, tot_win = 0;
@@ -3000,14 +3000,14 @@ public:
             return E;
         };
 
-        auto try_torsion = [&]() -> std::pair<bool,bool> {
+        auto try_torsion = [&]() -> pair<bool,bool> {
             int            rb_idx = pick_rb(gen);
             const RotBond& rb     = topo.rot_bonds[rb_idx];
-            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            const vector<int>& side = topo.rot_bond_sides[rb_idx];
             if (side.empty()) return {false, false};
 
             double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
-            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            double al = sqrt(ax*ax+ay*ay+az*az);
             if (al < 1e-10) return {false, false};
             ax/=al; ay/=al; az/=al;
 
@@ -3015,13 +3015,13 @@ public:
                              rb.kind == BondKind::BACKBONE_PSI)
                             ? cur_max : cur_max * 2.5;
             base_d *= topo.rot_bond_scale[rb_idx];
-            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : side) in_side[k] = true;
 
-            std::vector<std::array<double,3>> old_pos(side.size());
-            std::vector<double>               old_born(side.size());
+            vector<array<double,3>> old_pos(side.size());
+            vector<double>               old_born(side.size());
             for (size_t k = 0; k < side.size(); ++k) {
                 int idx = side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3048,7 +3048,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -3062,13 +3062,13 @@ public:
             return {accepted, true};
         };
 
-        auto try_crankshaft = [&]() -> std::pair<bool,bool> {
+        auto try_crankshaft = [&]() -> pair<bool,bool> {
             if (ncp == 0) return {false, false};
             int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
             int phi_k  = topo.concerted_pairs[cp_idx].first;
             int psi_k  = topo.concerted_pairs[cp_idx].second;
-            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
-            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            const vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const vector<int>& psi_side = topo.rot_bond_sides[psi_k];
             if (phi_side.empty() || psi_side.empty()) return {false, false};
 
             for (int k : phi_side) in_side[k] = true;
@@ -3076,12 +3076,12 @@ public:
             const RotBond& phi_rb = topo.rot_bonds[phi_k];
             double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
             double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
-            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            double p1l  = sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
             if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return {false, false}; }
             p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
 
-            std::vector<std::array<double,3>> old_pos(phi_side.size());
-            std::vector<double>               old_born(phi_side.size());
+            vector<array<double,3>> old_pos(phi_side.size());
+            vector<double>               old_born(phi_side.size());
             for (size_t k = 0; k < phi_side.size(); ++k) {
                 int idx = phi_side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3093,8 +3093,8 @@ public:
             double old_ss    = topo.disulfide_pairs.empty() ? 0.0
                              : ss_e_side(st, topo.disulfide_pairs, in_side);
 
-            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : phi_side)
                 rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
@@ -3102,7 +3102,7 @@ public:
             const RotBond& psi_rb = topo.rot_bonds[psi_k];
             double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
             double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
-            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            double p2l  = sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
             if (p2l < 1e-10) {
                 for (size_t k = 0; k < phi_side.size(); ++k) {
                     int idx = phi_side[k];
@@ -3126,7 +3126,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -3144,7 +3144,7 @@ public:
         // above (see the detailed comment there for the physical motivation and the
         // side_group/cross_e_concerted design rationale) -- duplicated here rather
         // than shared, matching this pair of functions' existing precedent.
-        std::vector<int> side_group(N, 0);
+        vector<int> side_group(N, 0);
         auto cross_e_concerted = [&]() -> double {
             double E = 0.0;
             for (size_t i = 0; i < N; ++i)
@@ -3158,44 +3158,44 @@ public:
             return E;
         };
         const int ncsp = (int)topo.concerted_sidechain_pairs.size();
-        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+        uniform_int_distribution<int> pick_csp(0, max(0, ncsp - 1));
 
-        auto try_concerted_sidechain = [&]() -> std::pair<bool,bool> {
+        auto try_concerted_sidechain = [&]() -> pair<bool,bool> {
             if (ncsp == 0) return {false, false};
             int   pair_idx = (ncsp > 1) ? pick_csp(gen) : 0;
             int   bond_a   = topo.concerted_sidechain_pairs[pair_idx].first;
             int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
             const RotBond& rb_a = topo.rot_bonds[bond_a];
             const RotBond& rb_b = topo.rot_bonds[bond_b];
-            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
-            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            const vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const vector<int>& side_b = topo.rot_bond_sides[bond_b];
             if (side_a.empty() || side_b.empty()) return {false, false};
 
             double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
-            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            double alA = sqrt(axA*axA+ayA*ayA+azA*azA);
             if (alA < 1e-10) return {false, false};
             axA/=alA; ayA/=alA; azA/=alA;
             double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
-            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            double alB = sqrt(axB*axB+ayB*ayB+azB*azB);
             if (alB < 1e-10) return {false, false};
             axB/=alB; ayB/=alB; azB/=alB;
 
-            double deltaA = std::uniform_real_distribution<double>(
+            double deltaA = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
-            double deltaB = std::uniform_real_distribution<double>(
+            double deltaB = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
-            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
-            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+            double cosA = cos(deltaA), sinA = sin(deltaA);
+            double cosB = cos(deltaB), sinB = sin(deltaB);
 
             for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
             for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
 
-            std::vector<int> all_idx;
+            vector<int> all_idx;
             all_idx.reserve(side_a.size() + side_b.size());
             all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
             all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
-            std::vector<std::array<double,3>> old_pos(all_idx.size());
-            std::vector<double>               old_born(all_idx.size());
+            vector<array<double,3>> old_pos(all_idx.size());
+            vector<double>               old_born(all_idx.size());
             for (size_t k = 0; k < all_idx.size(); ++k) {
                 int idx = all_idx[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3225,7 +3225,7 @@ public:
             bool accepted = false;
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -3257,8 +3257,8 @@ public:
                     acc_win += accepted ? 1 : 0;
                     if (++tot_win == TUNE_FREQ) {
                         double rate = (double)acc_win / TUNE_FREQ;
-                        if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
-                        else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                        if      (rate > TARGET_HI) cur_max = min(ANGLE_MAX, cur_max * SCALE_UP);
+                        else if (rate < TARGET_LO) cur_max = max(ANGLE_MIN, cur_max * SCALE_DOWN);
                         acc_win = tot_win = 0;
                     }
                 }
@@ -3287,40 +3287,40 @@ public:
     // already-verified hot path for a change that's purely additive logging.
     // CPU only (an introspection tool, no GPU counterpart needed).
     struct McDiagnosticResult {
-        std::vector<int>    move_type;       // 0 = torsion, 1 = crankshaft
-        std::vector<double> proposed_delta;   // |sampled angle|, radians, pre-scaling
-        std::vector<int>    accepted;         // 0/1 (not vector<bool> -- pybind11/numpy friendliness)
-        std::vector<double> d_hardcore;
-        std::vector<double> d_nonbonded_soft; // edh+egb+elj delta, hard-core excluded
-        std::vector<double> d_sasa;
-        std::vector<double> d_dih;
-        std::vector<double> d_ss;
+        vector<int>    move_type;       // 0 = torsion, 1 = crankshaft
+        vector<double> proposed_delta;   // |sampled angle|, radians, pre-scaling
+        vector<int>    accepted;         // 0/1 (not vector<bool> -- pybind11/numpy friendliness)
+        vector<double> d_hardcore;
+        vector<double> d_nonbonded_soft; // edh+egb+elj delta, hard-core excluded
+        vector<double> d_sasa;
+        vector<double> d_dih;
+        vector<double> d_ss;
     };
 
     McDiagnosticResult run_mc_diagnostic(
-        const std::vector<Particle>& init,
+        const vector<Particle>& init,
         const BondTopology& topo,
         int n_steps,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw std::invalid_argument("initial_state empty");
-        if (n_steps <= 0) throw std::invalid_argument("n_steps must be positive");
-        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
+        if (init.empty()) throw invalid_argument("initial_state empty");
+        if (n_steps <= 0) throw invalid_argument("n_steps must be positive");
+        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
 
         size_t N   = init.size();
         int    nrb = (int)topo.rot_bonds.size();
         int    ncp = (int)topo.concerted_pairs.size();
 
-        std::vector<Particle> st = init;
+        vector<Particle> st = init;
         NeighborList nl; nl.build(st);
         auto a = born_radii(st, nl);
         double curE = total_e(st, nl, a, &topo);
 
-        std::uniform_int_distribution<int>    pick_rb(0, nrb - 1);
-        std::uniform_int_distribution<int>    pick_cp(0, std::max(0, ncp - 1));
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
-        std::vector<bool> in_side(N, false);
+        uniform_int_distribution<int>    pick_rb(0, nrb - 1);
+        uniform_int_distribution<int>    pick_cp(0, max(0, ncp - 1));
+        uniform_real_distribution<double> uni(0.0, 1.0);
+        vector<bool> in_side(N, false);
 
         double cur_max = max_angle;
         int    acc_win = 0, tot_win = 0;
@@ -3360,11 +3360,11 @@ public:
         auto try_torsion_diag = [&]() -> bool {
             int            rb_idx = pick_rb(gen);
             const RotBond& rb     = topo.rot_bonds[rb_idx];
-            const std::vector<int>& side = topo.rot_bond_sides[rb_idx];
+            const vector<int>& side = topo.rot_bond_sides[rb_idx];
             if (side.empty()) return false;
 
             double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
-            double al = std::sqrt(ax*ax+ay*ay+az*az);
+            double al = sqrt(ax*ax+ay*ay+az*az);
             if (al < 1e-10) return false;
             ax/=al; ay/=al; az/=al;
 
@@ -3372,13 +3372,13 @@ public:
                              rb.kind == BondKind::BACKBONE_PSI)
                             ? cur_max : cur_max * 2.5;
             base_d *= topo.rot_bond_scale[rb_idx];
-            double delta = std::uniform_real_distribution<double>(-base_d, base_d)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-base_d, base_d)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : side) in_side[k] = true;
 
-            std::vector<std::array<double,3>> old_pos(side.size());
-            std::vector<double>               old_born(side.size());
+            vector<array<double,3>> old_pos(side.size());
+            vector<double>               old_born(side.size());
             for (size_t k = 0; k < side.size(); ++k) {
                 int idx = side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3412,7 +3412,7 @@ public:
             double dE = (new_cross-old_cross) + d_sasa_ + d_dih_ + d_ss_;
 
             bool accepted = false;
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -3425,7 +3425,7 @@ public:
             for (int k : side) in_side[k] = false;
 
             out.move_type.push_back(0);
-            out.proposed_delta.push_back(std::fabs(delta));
+            out.proposed_delta.push_back(fabs(delta));
             out.accepted.push_back(accepted ? 1 : 0);
             out.d_hardcore.push_back(d_hc);
             out.d_nonbonded_soft.push_back(d_soft);
@@ -3437,8 +3437,8 @@ public:
             acc_win += accepted ? 1 : 0;
             if (++tot_win == TUNE_FREQ) {
                 double rate = (double)acc_win / TUNE_FREQ;
-                if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
-                else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                if      (rate > TARGET_HI) cur_max = min(ANGLE_MAX, cur_max * SCALE_UP);
+                else if (rate < TARGET_LO) cur_max = max(ANGLE_MIN, cur_max * SCALE_DOWN);
                 acc_win = tot_win = 0;
             }
             return true;
@@ -3449,8 +3449,8 @@ public:
             int cp_idx = (ncp > 1) ? pick_cp(gen) : 0;
             int phi_k  = topo.concerted_pairs[cp_idx].first;
             int psi_k  = topo.concerted_pairs[cp_idx].second;
-            const std::vector<int>& phi_side = topo.rot_bond_sides[phi_k];
-            const std::vector<int>& psi_side = topo.rot_bond_sides[psi_k];
+            const vector<int>& phi_side = topo.rot_bond_sides[phi_k];
+            const vector<int>& psi_side = topo.rot_bond_sides[psi_k];
             if (phi_side.empty() || psi_side.empty()) return false;
 
             for (int k : phi_side) in_side[k] = true;
@@ -3458,12 +3458,12 @@ public:
             const RotBond& phi_rb = topo.rot_bonds[phi_k];
             double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
             double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
-            double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+            double p1l  = sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
             if (p1l < 1e-10) { for (int k : phi_side) in_side[k] = false; return false; }
             p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
 
-            std::vector<std::array<double,3>> old_pos(phi_side.size());
-            std::vector<double>               old_born(phi_side.size());
+            vector<array<double,3>> old_pos(phi_side.size());
+            vector<double>               old_born(phi_side.size());
             for (size_t k = 0; k < phi_side.size(); ++k) {
                 int idx = phi_side[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3476,8 +3476,8 @@ public:
             double old_ss    = topo.disulfide_pairs.empty() ? 0.0
                              : ss_e_side(st, topo.disulfide_pairs, in_side);
 
-            double delta = std::uniform_real_distribution<double>(-cur_max, cur_max)(gen);
-            double cosD  = std::cos(delta), sinD = std::sin(delta);
+            double delta = uniform_real_distribution<double>(-cur_max, cur_max)(gen);
+            double cosD  = cos(delta), sinD = sin(delta);
 
             for (int k : phi_side)
                 rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
@@ -3485,7 +3485,7 @@ public:
             const RotBond& psi_rb = topo.rot_bonds[psi_k];
             double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
             double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
-            double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+            double p2l  = sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
             if (p2l < 1e-10) {
                 for (size_t k = 0; k < phi_side.size(); ++k) {
                     int idx = phi_side[k];
@@ -3515,7 +3515,7 @@ public:
             double dE = (new_cross-old_cross) + d_sasa_ + d_dih_ + d_ss_;
 
             bool accepted = false;
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
                 accepted = true;
             } else {
@@ -3528,7 +3528,7 @@ public:
             for (int k : phi_side) in_side[k] = false;
 
             out.move_type.push_back(1);
-            out.proposed_delta.push_back(std::fabs(delta));
+            out.proposed_delta.push_back(fabs(delta));
             out.accepted.push_back(accepted ? 1 : 0);
             out.d_hardcore.push_back(d_hc);
             out.d_nonbonded_soft.push_back(d_soft);
@@ -3539,8 +3539,8 @@ public:
             acc_win += accepted ? 1 : 0;
             if (++tot_win == TUNE_FREQ) {
                 double rate = (double)acc_win / TUNE_FREQ;
-                if      (rate > TARGET_HI) cur_max = std::min(ANGLE_MAX, cur_max * SCALE_UP);
-                else if (rate < TARGET_LO) cur_max = std::max(ANGLE_MIN, cur_max * SCALE_DOWN);
+                if      (rate > TARGET_HI) cur_max = min(ANGLE_MAX, cur_max * SCALE_UP);
+                else if (rate < TARGET_LO) cur_max = max(ANGLE_MIN, cur_max * SCALE_DOWN);
                 acc_win = tot_win = 0;
             }
             return true;
@@ -3555,7 +3555,7 @@ public:
         // this move's own d_hardcore/d_dih split isn't the question being re-tested
         // here) -- it just advances the chain like an accepted/rejected torsion or
         // crankshaft move would, silently, same as the existing degenerate-retry path.
-        std::vector<int> side_group(N, 0);
+        vector<int> side_group(N, 0);
         auto cross_e_concerted = [&]() -> double {
             double E = 0.0;
             for (size_t i = 0; i < N; ++i)
@@ -3569,7 +3569,7 @@ public:
             return E;
         };
         const int ncsp = (int)topo.concerted_sidechain_pairs.size();
-        std::uniform_int_distribution<int> pick_csp(0, std::max(0, ncsp - 1));
+        uniform_int_distribution<int> pick_csp(0, max(0, ncsp - 1));
         constexpr double CONCERTED_SIDECHAIN_PROB = 0.15;
 
         auto try_concerted_sidechain_plain = [&]() -> bool {
@@ -3579,35 +3579,35 @@ public:
             int   bond_b   = topo.concerted_sidechain_pairs[pair_idx].second;
             const RotBond& rb_a = topo.rot_bonds[bond_a];
             const RotBond& rb_b = topo.rot_bonds[bond_b];
-            const std::vector<int>& side_a = topo.rot_bond_sides[bond_a];
-            const std::vector<int>& side_b = topo.rot_bond_sides[bond_b];
+            const vector<int>& side_a = topo.rot_bond_sides[bond_a];
+            const vector<int>& side_b = topo.rot_bond_sides[bond_b];
             if (side_a.empty() || side_b.empty()) return false;
 
             double axA = st[rb_a.j].x-st[rb_a.i].x, ayA = st[rb_a.j].y-st[rb_a.i].y, azA = st[rb_a.j].z-st[rb_a.i].z;
-            double alA = std::sqrt(axA*axA+ayA*ayA+azA*azA);
+            double alA = sqrt(axA*axA+ayA*ayA+azA*azA);
             if (alA < 1e-10) return false;
             axA/=alA; ayA/=alA; azA/=alA;
             double axB = st[rb_b.j].x-st[rb_b.i].x, ayB = st[rb_b.j].y-st[rb_b.i].y, azB = st[rb_b.j].z-st[rb_b.i].z;
-            double alB = std::sqrt(axB*axB+ayB*ayB+azB*azB);
+            double alB = sqrt(axB*axB+ayB*ayB+azB*azB);
             if (alB < 1e-10) return false;
             axB/=alB; ayB/=alB; azB/=alB;
 
-            double deltaA = std::uniform_real_distribution<double>(
+            double deltaA = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_a], cur_max*2.5*topo.rot_bond_scale[bond_a])(gen);
-            double deltaB = std::uniform_real_distribution<double>(
+            double deltaB = uniform_real_distribution<double>(
                 -cur_max*2.5*topo.rot_bond_scale[bond_b], cur_max*2.5*topo.rot_bond_scale[bond_b])(gen);
-            double cosA = std::cos(deltaA), sinA = std::sin(deltaA);
-            double cosB = std::cos(deltaB), sinB = std::sin(deltaB);
+            double cosA = cos(deltaA), sinA = sin(deltaA);
+            double cosB = cos(deltaB), sinB = sin(deltaB);
 
             for (int k : side_a) { in_side[k] = true; side_group[k] = 1; }
             for (int k : side_b) { in_side[k] = true; side_group[k] = 2; }
 
-            std::vector<int> all_idx;
+            vector<int> all_idx;
             all_idx.reserve(side_a.size() + side_b.size());
             all_idx.insert(all_idx.end(), side_a.begin(), side_a.end());
             all_idx.insert(all_idx.end(), side_b.begin(), side_b.end());
-            std::vector<std::array<double,3>> old_pos(all_idx.size());
-            std::vector<double>               old_born(all_idx.size());
+            vector<array<double,3>> old_pos(all_idx.size());
+            vector<double>               old_born(all_idx.size());
             for (size_t k = 0; k < all_idx.size(); ++k) {
                 int idx = all_idx[k];
                 old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -3636,7 +3636,7 @@ public:
 
             double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
                       + (new_dih-old_dih)   + (new_ss-old_ss);
-            if (dE < 0.0 || uni(gen) < std::exp(-dE / T)) {
+            if (dE < 0.0 || uni(gen) < exp(-dE / T)) {
                 curE += dE;
             } else {
                 for (size_t k = 0; k < all_idx.size(); ++k) {
@@ -3669,9 +3669,9 @@ public:
     // lowest_energy_structure: scan an ensemble and return the conformation with the
     // minimum total potential energy.  Calls calculate_potential on every member,
     // so this is O(ncand · N²) and should only be called once after MC finishes.
-    std::vector<Particle> lowest_energy_structure(const std::vector<std::vector<Particle>>& ens){
-        if(ens.empty()) throw std::invalid_argument("ensemble empty");
-        return *std::min_element(ens.begin(),ens.end(),
+    vector<Particle> lowest_energy_structure(const vector<vector<Particle>>& ens){
+        if(ens.empty()) throw invalid_argument("ensemble empty");
+        return *min_element(ens.begin(),ens.end(),
             [this](const auto& a,const auto& b){return calculate_potential(a)<calculate_potential(b);});
     }
 
@@ -3756,43 +3756,43 @@ PYBIND11_MODULE(protein_physics,m){
         // int/double lets any module reconstruct it via ordinary STL casts.
         .def_property_readonly("rb_atom_i",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                vector<int> v; v.reserve(t.rot_bonds.size());
                 for (const auto& rb : t.rot_bonds) v.push_back(rb.i);
                 return v;
             })
         .def_property_readonly("rb_atom_j",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                vector<int> v; v.reserve(t.rot_bonds.size());
                 for (const auto& rb : t.rot_bonds) v.push_back(rb.j);
                 return v;
             })
         .def_property_readonly("rb_kind",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.rot_bonds.size());
+                vector<int> v; v.reserve(t.rot_bonds.size());
                 for (const auto& rb : t.rot_bonds) v.push_back(static_cast<int>(rb.kind));
                 return v;
             })
         .def_property_readonly("dih_a",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.dihedrals.size());
+                vector<int> v; v.reserve(t.dihedrals.size());
                 for (const auto& d : t.dihedrals) v.push_back(d.a);
                 return v;
             })
         .def_property_readonly("dih_b",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.dihedrals.size());
+                vector<int> v; v.reserve(t.dihedrals.size());
                 for (const auto& d : t.dihedrals) v.push_back(d.b);
                 return v;
             })
         .def_property_readonly("dih_c",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.dihedrals.size());
+                vector<int> v; v.reserve(t.dihedrals.size());
                 for (const auto& d : t.dihedrals) v.push_back(d.c);
                 return v;
             })
         .def_property_readonly("dih_d",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.dihedrals.size());
+                vector<int> v; v.reserve(t.dihedrals.size());
                 for (const auto& d : t.dihedrals) v.push_back(d.d);
                 return v;
             })
@@ -3801,28 +3801,28 @@ PYBIND11_MODULE(protein_physics,m){
         // [offsets[k], offsets[k+1]) of the flat v2/n/gamma arrays.
         .def_property_readonly("dih_term_offsets",
             [](const BondTopology& t){
-                std::vector<int> v; v.reserve(t.dihedrals.size() + 1);
+                vector<int> v; v.reserve(t.dihedrals.size() + 1);
                 int off = 0; v.push_back(0);
                 for (const auto& d : t.dihedrals) { off += (int)d.terms.size(); v.push_back(off); }
                 return v;
             })
         .def_property_readonly("dih_term_v2",
             [](const BondTopology& t){
-                std::vector<double> v;
+                vector<double> v;
                 for (const auto& d : t.dihedrals)
                     for (const auto& term : d.terms) v.push_back(term.V2);
                 return v;
             })
         .def_property_readonly("dih_term_n",
             [](const BondTopology& t){
-                std::vector<int> v;
+                vector<int> v;
                 for (const auto& d : t.dihedrals)
                     for (const auto& term : d.terms) v.push_back(term.n);
                 return v;
             })
         .def_property_readonly("dih_term_gamma",
             [](const BondTopology& t){
-                std::vector<double> v;
+                vector<double> v;
                 for (const auto& d : t.dihedrals)
                     for (const auto& term : d.terms) v.push_back(term.gamma);
                 return v;
@@ -3843,7 +3843,7 @@ PYBIND11_MODULE(protein_physics,m){
         .def(py::init<>())
         .def("calculate_potential",
              [](PhysicsEngine& self,
-                const std::vector<Particle>& particles,
+                const vector<Particle>& particles,
                 py::object topo_obj) -> double {
                  const BondTopology* topo = nullptr;
                  if (!topo_obj.is_none())
@@ -3871,14 +3871,14 @@ PYBIND11_MODULE(protein_physics,m){
              py::arg("temperature")=0.6,py::arg("max_angle")=0.12,
              py::call_guard<py::gil_scoped_release>())
         .def("run_mc_diagnostic",
-             [](PhysicsEngine& self, const std::vector<Particle>& init,
+             [](PhysicsEngine& self, const vector<Particle>& init,
                 const BondTopology& topo, int n_steps, double T, double max_angle) {
                  PhysicsEngine::McDiagnosticResult r;
                  {
                      py::gil_scoped_release release;
                      r = self.run_mc_diagnostic(init, topo, n_steps, T, max_angle);
                  }  // GIL re-acquired here, before building the Python-visible tuple below
-                 return std::make_tuple(r.move_type, r.proposed_delta, r.accepted,
+                 return make_tuple(r.move_type, r.proposed_delta, r.accepted,
                                          r.d_hardcore, r.d_nonbonded_soft, r.d_sasa,
                                          r.d_dih, r.d_ss);
              },
