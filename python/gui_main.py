@@ -3564,12 +3564,27 @@ class ProteinApp(QMainWindow):
         if not target:
             return
 
-        # Stop any still-running background workers
+        # Refuse to start a new analysis while another worker is still
+        # running, rather than force-killing it (2026-07-13: this used to call
+        # QThread.terminate() here, which on Windows maps to TerminateThread --
+        # it doesn't unwind the C++ stack, release any lock/mutex the thread
+        # holds, or run destructors. Killing a worker mid-call into the C++
+        # physics engine (a real scenario: EXPLORE LANDSCAPE runs can take
+        # minutes, long enough for a user to type a new ID and click RUN
+        # ANALYSIS again while it's still going) can corrupt process-wide
+        # state and crash somewhere unrelated later -- reproduced as a real
+        # access-violation crash inside python314.dll itself, not any specific
+        # extension, exactly the delayed/relocated symptom memory corruption
+        # produces. Blocking the new run is a real capability loss (no
+        # in-app cancel button exists yet) but it's the safe default until a
+        # cooperative-cancellation flag is threaded through the engine.
         for w in (getattr(self, "_comp_worker", None),
                   getattr(self, "_landscape_worker", None)):
             if w is not None and w.isRunning():
-                w.terminate()
-                w.wait(500)
+                self._log("[ANALYSIS] Still running a previous computation "
+                          "(comparison or landscape exploration) -- wait for "
+                          "it to finish before starting a new one.")
+                return
 
         self.run_btn.setEnabled(False)
         self.best_btn.setEnabled(False)
