@@ -3557,6 +3557,28 @@ class ProteinApp(QMainWindow):
         left_w.setLayout(sidebar)
         outer.addWidget(left_w); outer.addWidget(viewer_panel)
 
+    def closeEvent(self, event):
+        """Refuse to close while a background worker is still running, same
+        risk category as the QThread.terminate() crash fixed in _start()
+        (2026-07-13): Qt tearing down a QThread-owning QObject while the
+        thread is still executing is undefined/unsafe for the same reason --
+        no guarantee the C++ engine call it's in the middle of gets a chance
+        to finish or unwind cleanly. Cheap, safe guard: block the close and
+        tell the user to wait, rather than let Qt attempt it."""
+        running = [w for w in (getattr(self, "worker", None),
+                                getattr(self, "_comp_worker", None),
+                                getattr(self, "_landscape_worker", None))
+                   if w is not None and w.isRunning()]
+        if running:
+            QMessageBox.warning(
+                self, "Analysis in progress",
+                "A background computation (analysis, comparison, or landscape "
+                "exploration) is still running. Please wait for it to finish "
+                "before closing.")
+            event.ignore()
+            return
+        event.accept()
+
     # ── Workflow ──────────────────────────────────────────────────
 
     def _start(self):
