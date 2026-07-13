@@ -2606,6 +2606,97 @@ result, click OVERLAY on a non-dominant basin, confirm the 3D view actually
 shows fewer, basin-restricted conformers) is still outstanding as a live
 validation step, same category as the `$3Dmol` fix above.
 
+**Live GUI click-through (2026-07-13): the outstanding validation step above,
+finally done for real — found and fixed a real bug in the process.** Drove
+the actual `ProteinApp` window via real `QPushButton.click()` calls (typed
+"1XQ8", clicked `RUN ANALYSIS`, clicked `EXPLORE LANDSCAPE`, switched to
+`ENSEMBLE`, clicked `SHOW ENSEMBLE OVERLAY`, then clicked a non-dominant
+basin's `OVERLAY` button), scripted via `scratchpad/live_gui_overlay_check.py`
+rather than by hand, so it's a real Qt-signal-driven run (QThread workers,
+real `.result`/`.finished` signals awaited via `QEventLoop`), not an internal
+function call.
+
+**Real bug found: `SHOW ENSEMBLE OVERLAY` never showed the pooled ensemble —
+it silently rendered basin 1 only, every time.** `ensemble_overlay_btn.clicked.connect(self._render_ensemble_overlay)`
+connected the button directly to a method whose first parameter is
+`basin_idx=None`. `QPushButton.clicked` emits a positional `checked: bool`
+argument, which PyQt passes into `basin_idx` — so every real click actually
+called `_render_ensemble_overlay(False)`, and `False is not None`, so the
+"show everything pooled" button took the *basin-restricted* code path,
+always with `basin_idx=0`. Caught directly from the live screenshot: the
+overlay's own info-bar text read "ENSEMBLE OVERLAY &middot; BASIN 1" instead
+of the expected plain "ENSEMBLE OVERLAY" with no basin tag — the same label
+text the per-basin `OVERLAY` buttons use, betraying that the pooled button
+was quietly taking the per-basin path. This is a real, live, user-facing bug
+that had shipped since the per-basin overlay feature was added earlier this
+session (`b851b7f`) and would have affected every real use of the top-level
+overlay button — confirmed independently reproducible before touching any
+code by connecting a spy lambda in place of `_render_ensemble_overlay` and
+checking the captured argument (`[False]`, not `[None]`).
+
+**Fixed** by wrapping in a lambda (`lambda: self._render_ensemble_overlay()`),
+matching the pattern this repo already uses elsewhere for other zero-arg
+button handlers. Verified the fix directly (same spy-lambda technique: click
+now passes `[None]`) and via a second full live-GUI run: the pooled overlay's
+info bar now correctly reads "ENSEMBLE OVERLAY &middot; 20 sampled conformers
+&middot; 140 C&alpha; atoms" with no basin tag. Audited every other
+`.clicked.connect(self._method)` call site in the file for the same class of
+bug (a slot with a leading optional parameter) — all seven others
+(`_start`, `_show_best`, `_start_landscape`, `_toggle_view_mode`,
+`_toggle_landscape`, `_toggle_disorder`, `_toggle_ensemble`,
+`_render_colored_by_rmsf`) take no parameters beyond `self`, so this was an
+isolated instance, not a systemic pattern. `tests/bridge_test.py` re-run
+clean; `gui_main` re-verified to import and construct a real `ProteinApp`
+cleanly after the change.
+
+**A second, measurement-only finding, not a code bug: `QWidget.grab()`
+cannot capture the 3Dmol/WebGL canvas content on this Qt/Chromium build.**
+Both screenshots (pooled and per-basin) showed only the HTML info/legend
+overlay text on a blank background — no cartoon models visible — in *every*
+run, including after the wiring fix. Diagnosed rather than assumed broken:
+a separate fast synthetic-data script
+(`scratchpad/diag_overlay_render.py`, small perturbed 1UBQ coordinates,
+no real MC needed) installed a custom `QWebEnginePage` subclass to capture
+JS console output and ran `runJavaScript` probes after rendering. Result:
+zero console errors, `typeof $3Dmol === "object"` (loaded correctly, the
+vendoring fix from earlier this session still holds), a real `<canvas>`
+element present inside `#v`, and correct non-zero dimensions matching the
+viewport exactly (`canvasCssWH: [984, 738]`, `canvasAttrWH: [1968, 1476]`
+matching a devicePixelRatio of 2.0) — every JS-side precondition for a
+working render is satisfied. `QWidget.grab()` still showed blank even after
+forcing a `resize` event and re-rendering. This is consistent with a known
+Qt/Chromium limitation: `QWebEngineView`'s GPU-composited layers (which a
+WebGL canvas renders through) aren't necessarily included in a
+`QWidget::grab()`/`render()` capture, which operates on the widget's own
+paint/backing-store path — the plain HTML/CSS info-bar divs render fine
+because those go through the ordinary path, while the WebGL content doesn't.
+
+**One real capture attempt tried and explicitly abandoned: a genuine desktop
+screen capture (`PIL.ImageGrab`) instead of `QWidget.grab()`, to see what a
+human would actually see on the monitor.** This would sidestep the
+`grab()` limitation in principle (it reads real composited screen pixels),
+but `win.raise_()`/`win.activateWindow()` did not reliably bring the window
+to the real OS foreground in this environment — the resulting capture
+showed unrelated desktop windows instead of the app. Abandoned immediately,
+both for reliability *and* because it's a real privacy risk (an automated
+full-desktop capture can incidentally include unrelated, sensitive on-screen
+content that has nothing to do with the task) — the one capture taken this
+way was deleted right away rather than kept or inspected further. Do not
+reintroduce this approach; `scratchpad/diag_overlay_render.py` documents
+this decision inline as a code comment too.
+
+**Conclusion: the overlay itself is very likely rendering correctly for a
+real user** (every independently-checkable JS-side signal says so, and nothing
+in this investigation found a reason to doubt it) **but this is not the same
+as a directly-observed visual confirmation**, which remains genuinely
+unverified — an honest, not a closed, state. A real visual check would need
+either a human looking at the running app directly, or a more capable
+automated capture method than what's available in this environment (e.g. a
+tool that can read Chromium's actual compositor output, not a Qt widget
+grab). Not blocking — the actually-shipped, user-facing bug this pass found
+(the pooled-vs-basin-0 mixup) was real and is now fixed regardless of
+whether the visual rendering itself gets independently reconfirmed later.
+
 ---
 
 ## Completed Work

@@ -3471,7 +3471,12 @@ class ProteinApp(QMainWindow):
         self.ensemble_overlay_btn.setStyleSheet(
             "background:transparent;color:#7c3aed;border:1.5px solid #7c3aed;"
             "border-radius:4px;padding:2px 10px;font-size:9px;letter-spacing:1px;")
-        self.ensemble_overlay_btn.clicked.connect(self._render_ensemble_overlay)
+        # NOT `.connect(self._render_ensemble_overlay)` directly -- QPushButton.clicked
+        # emits a `checked: bool` positional arg, which would land in
+        # _render_ensemble_overlay's `basin_idx` parameter (`False` is not `None`,
+        # so it silently rendered basin 0 only every time instead of the full
+        # pooled ensemble -- found 2026-07-13 via a live GUI click-through).
+        self.ensemble_overlay_btn.clicked.connect(lambda: self._render_ensemble_overlay())
         ep_h.addWidget(self.ensemble_overlay_btn)
         ep_v.addWidget(ep_hdr)
 
