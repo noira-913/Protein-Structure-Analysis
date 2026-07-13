@@ -245,12 +245,16 @@ Non-amino-acid HETATM records are not silently discarded:
 - **Other ligands/cofactors** are kept, using element-symbol-based
   fallback VDW parameters (full GAFF2 small-molecule parameterization is
   not yet implemented — see [Known Limitations](#known-limitations)).
-  ATP is the exception: it carries real AMBER-derived RESP partial
-  charges (Manchester AMBER parameter database, verified against the
-  source paper, summing to the exact ATP4− formal charge), and
-  AMP/ADP/GTP/GDP have RCSB CCD-sourced bond-connectivity templates —
-  though these four still fall back to element-based VDW/charge
-  parameters rather than their own RESP charges.
+  ATP, ADP, GTP, GDP, heme (HEM), and NAD⁺ carry real AMBER-derived RESP
+  partial charges (Manchester AMBER parameter database, each verified to
+  sum to the correct formal charge state against a real deposited
+  structure), and AMP/heme/NAD⁺/FAD/PLP have RCSB CCD-sourced bond-
+  connectivity templates. FAD, PLP, and AMP still use element-based
+  fallback charges (no independently verifiable RESP source was found for
+  these three), and none of these ligands have their own VDW radii/epsilon
+  yet (charge and VDW are independent lookups — element-based fallback
+  VDW applies regardless of whether real charges exist for a given
+  ligand).
 
 ### Disulfide Bonds
 
@@ -550,10 +554,10 @@ items:
   the full particle array between Python and the GPU on every snapshot,
   rather than keeping the trajectory resident in device memory.
 - **Small-molecule ligands**: non-ion HETATM records use element-based
-  fallback parameters rather than a full GAFF2 force field. ATP has real
-  RESP charges and heme/NAD⁺/FAD/PLP/AMP/ADP/GTP/GDP have bond
-  connectivity templates, but AMP/ADP/GTP/GDP still use fallback
-  VDW/charge parameters rather than their own RESP charges.
+  fallback VDW parameters rather than a full GAFF2 force field. ATP, ADP,
+  GTP, GDP, heme, and NAD⁺ have real RESP partial charges; FAD, PLP, and
+  AMP still use fallback charges (no independently verifiable RESP source
+  found); none of these ligands have their own VDW radii/epsilon yet.
 - **No membrane/lipid environment**: the implicit-solvent model assumes
   uniform bulk water everywhere, so membrane protein regions are not
   treated with a lower-dielectric slab.

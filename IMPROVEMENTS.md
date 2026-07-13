@@ -2887,6 +2887,31 @@ whether the visual rendering itself gets independently reconfirmed later.
   parity between engines is within 0.06% on all 11 bundled test structures.
 
 ### Release / CI infrastructure
+- **Fixed a real, reproducible crash: `RUN ANALYSIS` could segfault the whole
+  process via `QThread.terminate()`.** Found live (2026-07-13, post-v0.8.0
+  release) driving the real GUI: `python.exe` crashed with an access
+  violation (`0xc0000005`) inside `python314.dll` itself — not any specific
+  extension — confirmed via Windows Event Viewer's own crash record.
+  Root cause: `_start()` called `.terminate()` on `_comp_worker`/
+  `_landscape_worker` whenever `RUN ANALYSIS` was clicked while either was
+  still running — a real, easy-to-hit scenario, since a landscape
+  exploration run can take minutes, easily long enough to type a new ID and
+  click `RUN ANALYSIS` again in the meantime. `QThread.terminate()` maps to
+  Windows' `TerminateThread`, which doesn't unwind the C++ stack, release
+  any lock/mutex the thread holds, or run destructors — killing a thread
+  mid-call into the C++ physics engine (or mid-GIL-hold, or mid-numpy-
+  allocation) can corrupt process-wide state, surfacing later as a crash
+  anywhere in the interpreter, exactly matching the observed fault site
+  (generic, not attributable to a specific module). Fixed by refusing to
+  start a new analysis while another worker is still running (logs a
+  message, returns) instead of force-killing it — verified both by a direct
+  unit-level check (a fake still-running worker whose `.terminate()` raises
+  if ever called — confirmed `_start()` never calls it and correctly
+  refuses) and by re-running `bridge_test.py`/`knot_test.py`/
+  `charge_validation_test.py` clean afterward. A real capability loss (no
+  in-app cancel button exists yet for a long-running landscape/comparison
+  job), but the safe default until cooperative cancellation is threaded
+  through the engine.
 - **GPU runtime fallback** — a GPU kernel-launch failure (as opposed to an
   import/device-detection failure at startup) used to crash the whole analysis.
   `PipelineWorker`/`LandscapeWorker` now catch engine failures specifically,
