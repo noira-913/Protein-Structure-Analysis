@@ -234,10 +234,16 @@ jobs:
       - name: Build portable ALMA app
         run: pyinstaller alma.spec --noconfirm --clean
 
+      # alma.spec now wraps the executable in a real ALMA.app bundle on
+      # macOS (2026-07-14 -- see alma.spec's BUNDLE() comment: without a
+      # proper bundle, QWebEngineView's helper process can't find its
+      # Frameworks and every 3D view renders blank). `ditto` preserves the
+      # bundle's internal structure/permissions the way `zip -r` isn't
+      # guaranteed to -- the standard tool for this on macOS CI.
       - name: Package release zip
         run: |
-          chmod +x dist/ALMA
-          zip -j ALMA-macos-portable.zip dist/ALMA
+          chmod +x dist/ALMA.app/Contents/MacOS/ALMA
+          ditto -c -k --sequesterRsrc --keepParent dist/ALMA.app ALMA-macos-portable.zip
 
       # continue-on-error: matches the same reasoning as the Windows job's
       # identical step -- this upload is a convenience artifact only, not a
@@ -254,6 +260,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ALMA
             ALMA-macos-portable.zip
           generate_release_notes: true

@@ -127,3 +127,23 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
 )
+
+# macOS .app bundle (2026-07-14): EXE() alone produces a bare Mach-O
+# executable, not a real .app -- fine on Windows, but on macOS
+# QWebEngineView's separate QtWebEngineProcess helper locates its sibling
+# Frameworks/Resources via rpaths that assume the standard
+# Contents/MacOS + Contents/Frameworks bundle layout. Without that layout
+# the helper process fails to launch silently (the failure is inside the
+# Chromium subprocess, invisible to gui_main.py's own exception handling),
+# leaving every QWebEngineView-based 3D view (all 3Dmol.js panels,
+# including the landscape ensemble overlay) blank while the rest of the
+# Qt-widget UI keeps working normally -- matches the reported symptom
+# exactly. BUNDLE() wraps EXE() into a proper ALMA.app; only meaningful
+# on macOS, so guarded here rather than applied unconditionally.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="ALMA.app",
+        bundle_identifier="dev.noira913.alma",
+        info_plist={"NSHighResolutionCapable": "True"},
+    )
