@@ -3965,13 +3965,26 @@ class ProteinApp(QMainWindow):
                 pdb_best = self._build_ca_pdb_str(
                     self._ensemble[best_idx], transform, bvalues=self._rmsf)
                 best_color_js = 'colorscheme:{prop:"b",gradient:"rwb",min:4.0,max:0}'
+                # style:"trace" (2026-07-14): this branch builds a genuine
+                # Cα-only trace (_build_ca_pdb_str, one atom per residue) --
+                # 3Dmol's default cartoon draws nothing for that (confirmed
+                # via a real PrintWindow screenshot, see
+                # _render_colored_by_rmsf's docstring), so it needs 3Dmol's
+                # explicit coarse-trace cartoon mode. Not applied in the
+                # else branch below: _build_pdb_str's all-particle output
+                # isn't a true single-atom-per-residue trace, so the same
+                # mode isn't known to apply there and that path already
+                # rendered fine via its dense sphere cloud.
+                cartoon_extra = ',style:"trace"'
             else:
                 pdb_best = self._build_pdb_str(self._ensemble[best_idx], transform)
                 best_color_js = 'color:"#1d4ed8"'
+                cartoon_extra = ''
             best_e   = f"{self._energies[best_idx]:.1f} kcal/mol"
             best_js  = (
                 '  var mBest=v.addModel(`' + pdb_best + '`,"pdb");\n'
-                '  mBest.setStyle({},{cartoon:{' + best_color_js + ',thickness:0.8,opacity:1.0},'
+                '  mBest.setStyle({},{cartoon:{' + best_color_js + ',thickness:0.8,opacity:1.0'
+                + cartoon_extra + '},'
                 'sphere:{' + best_color_js + ',radius:0.55,opacity:1.0}});')
 
         ext_js = (
@@ -5255,6 +5268,25 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         capture QWebEngineView's WebGL canvas (see IMPROVEMENTS.md item #7's
         "measurement-only finding"), so no prior automated check could ever
         see the actual rendered colors, only that rendering happened at all.
+
+        cartoon style:"trace" (2026-07-14, reported live: "the landscape
+        overlay shows nothing", reproduced on both macOS and Windows -- this
+        is unrelated to the macOS .app-bundle fix): finally got a REAL pixel
+        capture of the rendered WebGL content (PrintWindow with
+        PW_RENDERFULLCONTENT, which -- unlike QWidget.grab() -- can read
+        GPU-composited window content on Windows 8.1+) and confirmed 3Dmol's
+        default cartoon algorithm draws NOTHING for a Cα-only trace (one "CA"
+        ATOM record per residue, no N/C/O backbone atoms) -- the info/legend
+        HTML painted fine, proving the page loaded, but the model itself was
+        completely invisible. This function's sphere style already masked
+        the symptom here (dots are still visible even with a dead cartoon
+        layer), but _render_ensemble_overlay had no sphere fallback at all
+        and was genuinely, totally blank. style:"trace" is 3Dmol's explicit
+        mode for drawing a coarse ribbon through a Cα-only chain -- already
+        used correctly elsewhere in this file (_render_basin's and
+        _render_subcandidate's cartoon specs both have it) but missing here
+        and in _render_ensemble_overlay/_render_external_layered's RMSF-
+        colored candidate. Added to all of them.
         """
         if self._rmsf is None or not self._ensemble:
             return
@@ -5312,7 +5344,7 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   m.setStyle({{}},{{
     cartoon:{{
       colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},
-      thickness:0.8,opacity:1.0
+      thickness:0.8,opacity:1.0,style:"trace"
     }},
     sphere:{{
       colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},
@@ -5403,24 +5435,39 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
                     f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
                     f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b:6.2f}           C")
             pdb_esc = "\n".join(lines).replace("\\", "\\\\").replace("`", "\\`")
+            # cartoon style:"trace" + sphere fallback (2026-07-14): every
+            # model here is a Cα-only trace (one "CA" ATOM record per
+            # residue, no N/C/O backbone atoms) -- confirmed via a real
+            # PrintWindow screenshot of the actual rendered QWebEngineView
+            # (not just HTML/JS inspection, which had already looked
+            # correct) that 3Dmol's DEFAULT cartoon mode draws NOTHING for
+            # this input: the info bar and legend divs painted correctly,
+            # proving the page loaded and 3Dmol initialized, but the model
+            # itself was completely invisible -- this is the real "landscape
+            # overlay shows nothing" bug, reproduced on Windows too, and is
+            # unrelated to the macOS-only .app-bundle issue fixed separately.
+            # style:"trace" is 3Dmol's explicit coarse-ribbon mode for a
+            # Cα-only chain -- already used correctly elsewhere in this file
+            # (_render_basin, _render_subcandidate) but missing here; the
+            # sphere fallback is extra insurance, matching every other
+            # Cα-only render in this file.
+            colorscheme_js = 'colorscheme:{prop:"b",gradient:"rwb",min:4.0,max:0}'
             models_js.append(
-                f'  var m{k}=v.addModel(`{pdb_esc}`,"pdb");\n'
-                f'  m{k}.setStyle({{}},{{cartoon:{{'
-                # min/max reversed (4.0, 0) -- see _render_colored_by_rmsf's
-                # docstring: 3Dmol's rwb gradient renders low values red and
-                # high values blue, backwards from this app's blue=rigid/
-                # red=flexible legend, so the range must be passed flipped.
-                f'colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},'
-                f'thickness:0.5,opacity:0.30}}}});\n')
+                '  var m' + str(k) + '=v.addModel(`' + pdb_esc + '`,"pdb");\n'
+                '  m' + str(k) + '.setStyle({},{cartoon:{'
+                + colorscheme_js + ',thickness:0.5,opacity:0.30,style:"trace"},'
+                'sphere:{' + colorscheme_js + ',radius:0.35,opacity:0.30}});\n')
 
         ref_js = ""
         if self._landscape_dominant_particles:
             dom_pdb = self._build_ca_pdb_str(self._landscape_dominant_particles)
             dom_esc = dom_pdb.replace("\\", "\\\\").replace("`", "\\`")
+            # Same style:"trace"+sphere fix as above.
             ref_js = (
-                f'  var mRef=v.addModel(`{dom_esc}`,"pdb");\n'
-                f'  mRef.setStyle({{}},{{cartoon:{{color:"#1d4ed8",'
-                f'thickness:0.9,opacity:1.0}}}});\n')
+                '  var mRef=v.addModel(`' + dom_esc + '`,"pdb");\n'
+                '  mRef.setStyle({},{cartoon:{color:"#1d4ed8",'
+                'thickness:0.9,opacity:1.0,style:"trace"},'
+                'sphere:{color:"#1d4ed8",radius:0.5,opacity:1.0}});\n')
 
         html = f"""<!DOCTYPE html><html><head>
 <script src="{_3DMOL_JS_URL}"></script>
