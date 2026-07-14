@@ -605,10 +605,16 @@ def _parse_pdb(path, log, physics_mod):
             heavy_map, heavy_indices, heavy_keys)
 
 def _ca_map_from_pdb(path):
-    """Return (ca_map, avg_bfactor). avg_bfactor = avg pLDDT for AlphaFold files."""
+    """Return (ca_map, avg_bfactor, bfactor_map). avg_bfactor = avg pLDDT for
+    AlphaFold files. bfactor_map is the per-residue breakdown of the same
+    value, keyed identically to ca_map ((chain_id, res_seq) -> bfactor) --
+    added so callers can render a per-residue AlphaFold confidence gradient
+    (2026-07-14) instead of only having a single averaged number, the same
+    way _compute_rmsf already gives a per-residue flexibility gradient.
+    """
     parser = PDBParser(QUIET=True)
     st = parser.get_structure("x", path)
-    ca_map, bfactors = {}, []
+    ca_map, bfactors, bfactor_map = {}, [], {}
     for model in st:
         for chain in model:
             for res in chain:
@@ -618,10 +624,12 @@ def _ca_map_from_pdb(path):
                     if atom.get_name().strip() == "CA":
                         key = (chain.get_id(), res.get_id()[1])
                         ca_map[key] = atom.get_coord().copy()
-                        bfactors.append(atom.get_bfactor())
+                        b = atom.get_bfactor()
+                        bfactors.append(b)
+                        bfactor_map[key] = b
         break
     avg_b = float(np.mean(bfactors)) if bfactors else None
-    return ca_map, avg_b
+    return ca_map, avg_b, bfactor_map
 
 def _heavy_atom_map_from_pdb(path):
     """Return {(chain_id, res_seq, atom_name): coord} for a reference PDB file
@@ -900,7 +908,7 @@ def _aligned_pdb_text(path, ref_ca_map):
     """
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         raw_text = f.read()
-    ca_map, _ = _ca_map_from_pdb(path)
+    ca_map, _, _ = _ca_map_from_pdb(path)
     fit = _kabsch_fit(ref_ca_map, ca_map)
     if fit is None:
         return raw_text
@@ -1650,7 +1658,7 @@ class ComparisonWorker(QThread):
             self.progress.emit("  [CMP] Fetching AlphaFold structure…")
             af_path = self._fetch_alphafold(uniprot_id)
             if af_path:
-                af_ca, avg_plddt = _ca_map_from_pdb(af_path)
+                af_ca, avg_plddt, _ = _ca_map_from_pdb(af_path)
                 af_heavy = _heavy_atom_map_from_pdb(af_path)
                 results.append({
                     "source": "AlphaFold", "is_mc": False, "is_best": False,
@@ -1664,7 +1672,7 @@ class ComparisonWorker(QThread):
             self.progress.emit("  [CMP] Fetching SWISS-MODEL homology model…")
             sm_path = self._fetch_swissmodel(uniprot_id)
             if sm_path:
-                sm_ca, _ = _ca_map_from_pdb(sm_path)
+                sm_ca, _, _ = _ca_map_from_pdb(sm_path)
                 sm_heavy = _heavy_atom_map_from_pdb(sm_path)
                 results.append({
                     "source": "Homology  (SWISS-MODEL)", "is_mc": False, "is_best": False,
@@ -3904,6 +3912,25 @@ class ProteinApp(QMainWindow):
         pdb_esc = pdb_ext.replace("\\", "\\\\").replace("`", "\\`")
         n_atoms = pdb_ext.count("\nATOM")
 
+        # AlphaFold confidence coloring (2026-07-14): _aligned_pdb_text
+        # rewrites coordinates via Bio.PDB's PDBIO but leaves each atom's
+        # original B-factor field untouched, and AlphaFold's PDB files carry
+        # per-residue pLDDT (0-100, higher = more confident) in that exact
+        # field -- so pdb_ext already has real per-residue confidence data
+        # for free, no separate fetch needed. min=0,max=100 (NOT swapped,
+        # unlike the RMSF gradient below) is deliberate: 3Dmol's rwb gradient
+        # renders the low end of the range red and the high end blue (see
+        # _render_colored_by_rmsf's docstring for how this was confirmed
+        # against the actual vendored gradient code), and here LOW pLDDT is
+        # the "bad" value that should read red while HIGH pLDDT is "good"
+        # and should read blue -- the natural, unswapped direction, unlike
+        # RMSF where low=good needs the range flipped to land blue on low.
+        # Not meaningful for SWISS-MODEL (its B-factor field is a per-atom
+        # QMEAN-family local score on a different scale, not pLDDT), so this
+        # only applies when the source is AlphaFold.
+        ext_color_js = ('colorscheme:{prop:"b",gradient:"rwb",min:0,max:100}' if is_af
+                         else f'color:"{ext_color}"')
+
         best_js, best_e, best_idx = "", "", None
         if self._ensemble and self._energies:
             best_idx = int(np.argmin(self._energies))
@@ -3921,28 +3948,58 @@ class ProteinApp(QMainWindow):
                     self._ref_ca_map, self._ca_indices, self._ensemble[best_idx])
                 if cand_ca_map:
                     transform = _kabsch_fit(self._ref_ca_map, cand_ca_map)
-            pdb_best = self._build_pdb_str(self._ensemble[best_idx], transform)
+            # Color the candidate by its own per-residue RMSF when a landscape
+            # run has produced one (2026-07-14) -- matches the AlphaFold
+            # confidence coloring above in the same blue=trustworthy/
+            # red=uncertain visual language (low RMSF -> blue, matching high
+            # pLDDT -> blue), so a viewer can visually pattern-match "does
+            # AlphaFold turn red in the same places my ensemble frays red?"
+            # instead of needing to read the RMSD/energy numbers. Falls back
+            # to the plain flat-blue rendering (via _build_pdb_str's
+            # all-particle trace, not just Cα) when no RMSF exists yet (e.g.
+            # RUN ANALYSIS finished but EXPLORE LANDSCAPE hasn't run) --
+            # unchanged from the original behavior in that case.
+            has_rmsf = (self._rmsf is not None
+                        and len(self._rmsf) == len(self._ca_indices))
+            if has_rmsf:
+                pdb_best = self._build_ca_pdb_str(
+                    self._ensemble[best_idx], transform, bvalues=self._rmsf)
+                best_color_js = 'colorscheme:{prop:"b",gradient:"rwb",min:4.0,max:0}'
+            else:
+                pdb_best = self._build_pdb_str(self._ensemble[best_idx], transform)
+                best_color_js = 'color:"#1d4ed8"'
             best_e   = f"{self._energies[best_idx]:.1f} kcal/mol"
             best_js  = (
-                f'  var mBest=v.addModel(`{pdb_best}`,"pdb");\n'
-                f'  mBest.setStyle({{}},{{cartoon:{{color:"#1d4ed8",thickness:0.8,opacity:1.0}},'
-                f'sphere:{{color:"#1d4ed8",radius:0.55,opacity:1.0}}}});')
+                '  var mBest=v.addModel(`' + pdb_best + '`,"pdb");\n'
+                '  mBest.setStyle({},{cartoon:{' + best_color_js + ',thickness:0.8,opacity:1.0},'
+                'sphere:{' + best_color_js + ',radius:0.55,opacity:1.0}});')
 
         ext_js = (
-            f'  var mExt=v.addModel(`{pdb_esc}`,"pdb");\n'
-            f'  mExt.setStyle({{}},{{cartoon:{{color:"{ext_color}",thickness:0.6,opacity:0.65}},'
-            f'sphere:{{color:"{ext_color}",radius:0.50,opacity:0.60}}}});')
+            '  var mExt=v.addModel(`' + pdb_esc + '`,"pdb");\n'
+            '  mExt.setStyle({},{cartoon:{' + ext_color_js + ',thickness:0.6,opacity:0.65},'
+            'sphere:{' + ext_color_js + ',radius:0.50,opacity:0.60}});')
 
         if best_js:
             label  = (f"LAYERED &nbsp; {label_ext} &nbsp;over&nbsp; "
                       f"C{best_idx+1} BEST ({best_e}) &nbsp;&middot;&nbsp; {n_atoms} ATOMS")
-            legend = ('<div id="legend">OVERLAY &nbsp; '
-                      '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE &nbsp;'
-                      f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
+            if is_af or has_rmsf:
+                legend = ('<div id="legend">OVERLAY &nbsp; '
+                          '<span style="color:#2563eb">&#9632;</span> CONFIDENT / RIGID &nbsp;'
+                          '<span style="color:#dc2626">&#9632;</span> UNCERTAIN / FLEXIBLE'
+                          f' &nbsp;&middot;&nbsp; {label_ext} vs C{best_idx+1}</div>')
+            else:
+                legend = ('<div id="legend">OVERLAY &nbsp; '
+                          '<span style="color:#1d4ed8">&#9632;</span> BEST CANDIDATE &nbsp;'
+                          f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
         else:
             label  = f"{label_ext} &nbsp;&middot;&nbsp; {n_atoms} ATOMS"
-            legend = (f'<div id="legend">'
-                      f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
+            if is_af:
+                legend = ('<div id="legend">'
+                          '<span style="color:#2563eb">&#9632;</span> CONFIDENT (high pLDDT) &nbsp;'
+                          '<span style="color:#dc2626">&#9632;</span> UNCERTAIN (low pLDDT)</div>')
+            else:
+                legend = (f'<div id="legend">'
+                          f'<span style="color:{ext_color}">&#9632;</span> {label_ext}</div>')
 
         html = f"""<!DOCTYPE html><html><head>
 <script src="{_3DMOL_JS_URL}"></script>
@@ -4381,11 +4438,16 @@ E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
         # to the full structure page every time.
         self._set_landscape_html(html)
 
-    def _build_ca_pdb_str(self, particles, transform=None):
+    def _build_ca_pdb_str(self, particles, transform=None, bvalues=None):
         """Cα-only synthetic PDB text, indexed the same way as the region
         (lo, hi) tuples from LandscapeWorker (both derive from ca_indices in
         the same order), so a flagged region maps directly onto residue
-        numbers here without needing a separate atom->residue lookup."""
+        numbers here without needing a separate atom->residue lookup.
+
+        bvalues (2026-07-14): optional per-Cα B-factor override, same order
+        as self._ca_indices (e.g. self._rmsf), letting a caller drive a
+        3Dmol colorscheme off this text like _render_colored_by_rmsf already
+        does. None (default) keeps every existing caller's flat 0.50."""
         lines = []
         for i, pidx in enumerate(self._ca_indices):
             if pidx >= len(particles):
@@ -4395,9 +4457,10 @@ E=[{basin['energy_min']:.0f}, {basin['energy_max']:.0f}] &nbsp;&middot;&nbsp; \
             if transform is not None:
                 R, ref_c, mob_c = transform
                 x, y, z = (np.array([x, y, z]) - mob_c) @ R.T + ref_c
+            b = float(bvalues[i]) if bvalues is not None and i < len(bvalues) else 0.50
             lines.append(
                 f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.50           C")
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b:6.2f}           C")
         return "\n".join(lines)
 
     def _render_subcandidate(self, region_idx, cand_idx):
@@ -5174,6 +5237,24 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
         vendored 3Dmol.js's actual registered builtin gradient key, confirmed
         2026-07-13 after a live GUI run surfaced "bwr" as invalid -- see
         IMPROVEMENTS.md item #7.)
+
+        min/max are passed as (4.0, 0) -- REVERSED, not (0, 4.0) (2026-07-14):
+        traced the vendored 3Dmol.js's actual RWB.valueToHex() and its
+        normalizeValue() helper directly (not assumed) and confirmed by
+        running the real gradient math in node: with min=0,max=4 the low end
+        (rigid, val=0) renders 0xFF0000 (red) and the high end (flexible,
+        val=4) renders 0x0000FF (blue) -- exactly backwards from this
+        docstring's own stated legend and from every on-screen legend caption
+        in this app ("blue=rigid", "red=flexible"). normalizeValue() has an
+        explicit reflection branch for a reversed (min>max) range
+        (`val = min - val + max`), so passing (4.0, 0) instead of (0, 4.0)
+        flips the mapping back to the intended blue=low/red=high without
+        touching the underlying b-factor data -- verified against the same
+        real gradient code (min=4,max=0: val=0 -> 0x0000FF, val=4 ->
+        0xFF0000). This bug shipped invisibly because QWidget.grab() cannot
+        capture QWebEngineView's WebGL canvas (see IMPROVEMENTS.md item #7's
+        "measurement-only finding"), so no prior automated check could ever
+        see the actual rendered colors, only that rendering happened at all.
         """
         if self._rmsf is None or not self._ensemble:
             return
@@ -5230,11 +5311,11 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
   var m=v.addModel(`{pdb_esc}`,"pdb");
   m.setStyle({{}},{{
     cartoon:{{
-      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},
       thickness:0.8,opacity:1.0
     }},
     sphere:{{
-      colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},
+      colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},
       radius:0.55,opacity:1.0
     }}
   }});
@@ -5325,7 +5406,11 @@ REGION {lo+1}-{hi+1} &nbsp;&middot;&nbsp; {cand['energy']:.1f} kcal/mol \
             models_js.append(
                 f'  var m{k}=v.addModel(`{pdb_esc}`,"pdb");\n'
                 f'  m{k}.setStyle({{}},{{cartoon:{{'
-                f'colorscheme:{{prop:"b",gradient:"rwb",min:0,max:4.0}},'
+                # min/max reversed (4.0, 0) -- see _render_colored_by_rmsf's
+                # docstring: 3Dmol's rwb gradient renders low values red and
+                # high values blue, backwards from this app's blue=rigid/
+                # red=flexible legend, so the range must be passed flipped.
+                f'colorscheme:{{prop:"b",gradient:"rwb",min:4.0,max:0}},'
                 f'thickness:0.5,opacity:0.30}}}});\n')
 
         ref_js = ""
