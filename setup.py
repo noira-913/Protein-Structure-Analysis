@@ -217,7 +217,7 @@ class CustomBuildExt(build_ext):
 
 setup(
     name="protein_physics",
-    version="0.9.0",
+    version="0.9.1",
     author="",
     description="Implicit-solvent protein physics engine (CPU + optional GPU)",
     ext_modules=[cpu_ext, analysis_ext],
