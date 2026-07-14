@@ -48,7 +48,7 @@
 #include <vector>
 
 namespace py = pybind11;
-using namespace std;
+
 
 // ─── shared 3-vector helper (knot-analysis functions only) ───────────────
 namespace {
@@ -68,7 +68,7 @@ struct Vec3 {
 // once from LandscapeWorker's pooled Particle snapshots.
 static void check_coords(const py::buffer_info &buf) {
     if (buf.ndim != 3 || buf.shape[2] != 3)
-        throw invalid_argument("coords must be a 3-D array (n_snaps, n_ca, 3)");
+        throw std::invalid_argument("coords must be a 3-D array (n_snaps, n_ca, 3)");
 }
 
 
@@ -94,19 +94,19 @@ py::array_t<double> compute_mean_dist_matrix(
 
     auto result = py::array_t<double>({n_ca, n_ca});
     double* sum_mat = static_cast<double*>(result.request().ptr);
-    fill(sum_mat, sum_mat + static_cast<size_t>(n_ca) * n_ca, 0.0);
+    std::fill(sum_mat, sum_mat + static_cast<std::size_t>(n_ca) * n_ca, 0.0);
 
     if (n_snaps == 0 || n_ca == 0) return result;
 
     for (int s = 0; s < n_snaps; ++s) {
-        const double* snap = data + static_cast<size_t>(s) * n_ca * 3;
+        const double* snap = data + static_cast<std::size_t>(s) * n_ca * 3;
 #pragma omp parallel for schedule(dynamic) if(n_ca > 100)
         for (int i = 0; i < n_ca; ++i) {
             for (int j = i + 1; j < n_ca; ++j) {
                 double dx = snap[i * 3 + 0] - snap[j * 3 + 0];
                 double dy = snap[i * 3 + 1] - snap[j * 3 + 1];
                 double dz = snap[i * 3 + 2] - snap[j * 3 + 2];
-                double d = sqrt(dx * dx + dy * dy + dz * dz);
+                double d = std::sqrt(dx * dx + dy * dy + dz * dz);
                 sum_mat[i * n_ca + j] += d;
                 sum_mat[j * n_ca + i] += d;
             }
@@ -114,7 +114,7 @@ py::array_t<double> compute_mean_dist_matrix(
     }
 
     const double inv_n = 1.0 / static_cast<double>(n_snaps);
-    for (size_t k = 0; k < static_cast<size_t>(n_ca) * n_ca; ++k)
+    for (std::size_t k = 0; k < static_cast<std::size_t>(n_ca) * n_ca; ++k)
         sum_mat[k] *= inv_n;
 
     return result;
@@ -138,13 +138,13 @@ py::array_t<double> compute_contact_freq_matrix(
 
     auto result = py::array_t<double>({n_ca, n_ca});
     double* freq = static_cast<double*>(result.request().ptr);
-    fill(freq, freq + static_cast<size_t>(n_ca) * n_ca, 0.0);
+    std::fill(freq, freq + static_cast<std::size_t>(n_ca) * n_ca, 0.0);
 
     if (n_snaps == 0 || n_ca == 0) return result;
 
     const double cutoff2 = cutoff * cutoff;
     for (int s = 0; s < n_snaps; ++s) {
-        const double* snap = data + static_cast<size_t>(s) * n_ca * 3;
+        const double* snap = data + static_cast<std::size_t>(s) * n_ca * 3;
 #pragma omp parallel for schedule(dynamic) if(n_ca > 100)
         for (int i = 0; i < n_ca; ++i) {
             for (int j = i + 1; j < n_ca; ++j) {
@@ -160,7 +160,7 @@ py::array_t<double> compute_contact_freq_matrix(
     }
 
     const double inv_n = 1.0 / static_cast<double>(n_snaps);
-    for (size_t k = 0; k < static_cast<size_t>(n_ca) * n_ca; ++k)
+    for (std::size_t k = 0; k < static_cast<std::size_t>(n_ca) * n_ca; ++k)
         freq[k] *= inv_n;
 
     return result;
@@ -184,7 +184,7 @@ static bool segment_triangle_intersect(const Vec3 &p0, const Vec3 &p1,
     Vec3 e2 = c - a;
     Vec3 pvec = d.cross(e2);
     double det = e1.dot(pvec);
-    if (abs(det) < eps) return false;  // segment parallel to triangle plane
+    if (std::abs(det) < eps) return false;  // segment parallel to triangle plane
     double inv_det = 1.0 / det;
     Vec3 tvec = p0 - a;
     double u = tvec.dot(pvec) * inv_det;
@@ -202,11 +202,11 @@ py::array_t<double> kmt_reduce(
 {
     auto buf = poly.request();
     if (buf.ndim != 2 || buf.shape[1] != 3)
-        throw invalid_argument("poly must be a (n,3) array");
+        throw std::invalid_argument("poly must be a (n,3) array");
     const int n0 = static_cast<int>(buf.shape[0]);
     const double *data = static_cast<const double *>(buf.ptr);
 
-    vector<Vec3> pts(n0);
+    std::vector<Vec3> pts(n0);
     for (int i = 0; i < n0; ++i)
         pts[i] = {data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]};
 
@@ -249,7 +249,7 @@ py::array_t<double> kmt_reduce(
 
     auto result = py::array_t<double>({static_cast<int>(pts.size()), 3});
     double *out = static_cast<double *>(result.request().ptr);
-    for (size_t i = 0; i < pts.size(); ++i) {
+    for (std::size_t i = 0; i < pts.size(); ++i) {
         out[i * 3 + 0] = pts[i].x;
         out[i * 3 + 1] = pts[i].y;
         out[i * 3 + 2] = pts[i].z;
@@ -277,23 +277,23 @@ py::tuple find_crossings(
 {
     auto buf = poly.request();
     if (buf.ndim != 2 || buf.shape[1] != 3)
-        throw invalid_argument("poly must be a (n,3) array");
+        throw std::invalid_argument("poly must be a (n,3) array");
     const int n = static_cast<int>(buf.shape[0]);
     const double *data = static_cast<const double *>(buf.ptr);
 
     auto axbuf = axis_arr.request();
     if (axbuf.size != 3)
-        throw invalid_argument("axis must be a length-3 array");
+        throw std::invalid_argument("axis must be a length-3 array");
     const double *axd = static_cast<const double *>(axbuf.ptr);
     const Vec3 axis = {axd[0], axd[1], axd[2]};
 
-    const Vec3 tmp = (abs(axis.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+    const Vec3 tmp = (std::abs(axis.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     Vec3 u_ = axis.cross(tmp);
-    const double u_norm = sqrt(u_.dot(u_));
+    const double u_norm = std::sqrt(u_.dot(u_));
     u_ = {u_.x / u_norm, u_.y / u_norm, u_.z / u_norm};
     const Vec3 v_ = axis.cross(u_);
 
-    vector<double> proj_u(n), proj_v(n), depth(n);
+    std::vector<double> proj_u(n), proj_v(n), depth(n);
     for (int i = 0; i < n; ++i) {
         const Vec3 p = {data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]};
         proj_u[i] = p.dot(u_);
@@ -306,8 +306,8 @@ py::tuple find_crossings(
                                py::array_t<double>(0), py::array_t<int>(0));
     };
 
-    vector<double> under_pos, over_pos;
-    vector<int> sign;
+    std::vector<double> under_pos, over_pos;
+    std::vector<int> sign;
     const double eps = 1e-9;
 
     for (int i = 0; i < n; ++i) {
@@ -321,7 +321,7 @@ py::tuple find_crossings(
             const double d2x = proj_u[jp1] - q0x, d2y = proj_v[jp1] - q0y;
 
             const double denom = d1x * d2y - d1y * d2x;
-            if (abs(denom) < eps) continue;
+            if (std::abs(denom) < eps) continue;
             const double diffx = q0x - p0x, diffy = q0y - p0y;
             const double t = (diffx * d2y - diffy * d2x) / denom;
             const double u = (diffx * d1y - diffy * d1x) / denom;
@@ -329,10 +329,10 @@ py::tuple find_crossings(
 
             const double depth_i = depth[i] * (1 - t) + depth[ip1] * t;
             const double depth_j = depth[j] * (1 - u) + depth[jp1] * u;
-            if (abs(depth_i - depth_j) < 1e-9) return degenerate();
+            if (std::abs(depth_i - depth_j) < 1e-9) return degenerate();
 
             const double cross_z = d1x * d2y - d1y * d2x;
-            if (abs(cross_z) < 1e-12) return degenerate();
+            if (std::abs(cross_z) < 1e-12) return degenerate();
 
             double op, unp;
             int sgn;
@@ -352,9 +352,9 @@ py::tuple find_crossings(
     py::array_t<double> under_arr(under_pos.size());
     py::array_t<double> over_arr(over_pos.size());
     py::array_t<int> sign_arr(sign.size());
-    copy(under_pos.begin(), under_pos.end(), static_cast<double *>(under_arr.request().ptr));
-    copy(over_pos.begin(), over_pos.end(), static_cast<double *>(over_arr.request().ptr));
-    copy(sign.begin(), sign.end(), static_cast<int *>(sign_arr.request().ptr));
+    std::copy(under_pos.begin(), under_pos.end(), static_cast<double *>(under_arr.request().ptr));
+    std::copy(over_pos.begin(), over_pos.end(), static_cast<double *>(over_arr.request().ptr));
+    std::copy(sign.begin(), sign.end(), static_cast<int *>(sign_arr.request().ptr));
     return py::make_tuple(true, under_arr, over_arr, sign_arr);
 }
 

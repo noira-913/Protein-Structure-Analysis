@@ -64,7 +64,7 @@
 #endif
 
 namespace py = pybind11;
-using namespace std;
+
 /* ═══════════════════════════════════════════════════════════════════════
  * 1.  PHYSICS CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -118,10 +118,10 @@ static void cuda_check(cudaError_t err, const char* file, int line)
 {
     if (err != cudaSuccess) {
         char buf[512];
-        snprintf(buf, sizeof(buf),
+        std::snprintf(buf, sizeof(buf),
                       "CUDA error %s at %s:%d",
                       cudaGetErrorString(err), file, line);
-        throw runtime_error(buf);
+        throw std::runtime_error(buf);
     }
 }
 #define CUDA_CHECK(x) cuda_check((x), __FILE__, __LINE__)
@@ -184,16 +184,16 @@ struct Particle {
  * ═══════════════════════════════════════════════════════════════════════ */
 struct NeighborList {
     /* Per-atom adjacency list (CPU incremental MC) */
-    vector<vector<size_t>> nb;
+    std::vector<std::vector<size_t>> nb;
     /* Reference positions for drift check */
-    vector<array<double, 3>> ref;
+    std::vector<std::array<double, 3>> ref;
     size_t N = 0;
 
     /* Flat pair arrays for GPU kernels */
-    vector<int> pi;   /* index of atom i in each pair */
-    vector<int> pj;   /* index of atom j in each pair */
+    std::vector<int> pi;   /* index of atom i in each pair */
+    std::vector<int> pj;   /* index of atom j in each pair */
 
-    void build(const vector<Particle>& p) {
+    void build(const std::vector<Particle>& p) {
         N = p.size();
         nb.assign(N, {});
         ref.resize(N);
@@ -215,7 +215,7 @@ struct NeighborList {
         }
     }
 
-    bool needs_rebuild(const vector<Particle>& p) const {
+    bool needs_rebuild(const std::vector<Particle>& p) const {
         for (size_t i = 0; i < N; ++i) {
             double dx = p[i].x - ref[i][0];
             double dy = p[i].y - ref[i][1];
@@ -237,28 +237,28 @@ static inline double d2_cpu(const Particle& a, const Particle& b) noexcept {
 }
 
 static inline double hct_cpu(double r, double r2, double ri, double rj) noexcept {
-    double L = max(abs(r - rj), ri);
+    double L = std::max(std::abs(r - rj), ri);
     double U = r + rj;
     if (ri >= U) return 0.0;
     return 1.0/L - 1.0/U
-           + (r2 - rj*rj + ri*ri) / (2.0*r*ri*ri) * log(L/U) * 0.5 / r;
+           + (r2 - rj*rj + ri*ri) / (2.0*r*ri*ri) * std::log(L/U) * 0.5 / r;
 }
 
 static void update_born_cpu(size_t idx,
-                             const vector<Particle>& p,
+                             const std::vector<Particle>& p,
                              const NeighborList& nl,
-                             vector<double>& a)
+                             std::vector<double>& a)
 {
     double ri = p[idx].radius, sum = 0.0;
     for (size_t j : nl.nb[idx]) {
         double r2 = d2_cpu(p[idx], p[j]);
-        double r  = sqrt(r2);
+        double r  = std::sqrt(r2);
         sum += hct_cpu(r, r2, ri, p[j].radius);
     }
-    a[idx] = 1.0 / max(1.0 / ri - 0.5 * sum, 2.0);
+    a[idx] = 1.0 / std::max(1.0 / ri - 0.5 * sum, 2.0);
 }
 
-static double sasa_nonpolar_cpu(const vector<Particle>& p,
+static double sasa_nonpolar_cpu(const std::vector<Particle>& p,
                                  const NeighborList& nl)
 {
     size_t N = p.size();
@@ -271,13 +271,13 @@ static double sasa_nonpolar_cpu(const vector<Particle>& p,
             double dx = p[i].x - p[j].x;
             double dy = p[i].y - p[j].y;
             double dz = p[i].z - p[j].z;
-            double r  = sqrt(dx*dx + dy*dy + dz*dz);
+            double r  = std::sqrt(dx*dx + dy*dy + dz*dz);
             double dc = ri + rj;
             if (r >= dc) continue;
             double h = (dc - r) / (2.0 * ri);
-            sa -= min(sa * 0.85, 2.0 * M_PI * ri * ri * h);
+            sa -= std::min(sa * 0.85, 2.0 * M_PI * ri * ri * h);
         }
-        E += GAMMA_SA * max(0.0, sa);
+        E += GAMMA_SA * std::max(0.0, sa);
     }
     return E;
 }
@@ -317,24 +317,24 @@ struct DihTerm {
 
 struct DihRecord {
     int a, b, c, d;
-    vector<DihTerm> terms;
+    std::vector<DihTerm> terms;
 };
 
 struct HostTopology {
-    vector<RotBond>            rot_bonds;
-    vector<vector<int>>   rot_bond_sides;
-    vector<double>             rot_bond_scale;
-    vector<vector<int>>   excl;
-    vector<DihRecord>          dihedrals;
-    vector<pair<int,int>> disulfide_pairs;
-    vector<pair<int,int>> concerted_pairs;
+    std::vector<RotBond>            rot_bonds;
+    std::vector<std::vector<int>>   rot_bond_sides;
+    std::vector<double>             rot_bond_scale;
+    std::vector<std::vector<int>>   excl;
+    std::vector<DihRecord>          dihedrals;
+    std::vector<std::pair<int,int>> disulfide_pairs;
+    std::vector<std::pair<int,int>> concerted_pairs;
 
     /* Identical algorithm to BondTopology::is_excluded in physics_engine.cpp. */
     bool is_excluded(int i, int j) const noexcept {
         if (i < 0 || j < 0 || i >= (int)excl.size() || j >= (int)excl.size()) return false;
-        if (i > j) swap(i, j);
+        if (i > j) std::swap(i, j);
         const auto& v = excl[i];
-        return binary_search(v.begin(), v.end(), j);
+        return std::binary_search(v.begin(), v.end(), j);
     }
 };
 
@@ -342,27 +342,27 @@ static HostTopology extract_topology(const py::object& topo_obj)
 {
     HostTopology t;
 
-    auto rb_i = topo_obj.attr("rb_atom_i").cast<vector<int>>();
-    auto rb_j = topo_obj.attr("rb_atom_j").cast<vector<int>>();
-    auto rb_k = topo_obj.attr("rb_kind").cast<vector<int>>();
+    auto rb_i = topo_obj.attr("rb_atom_i").cast<std::vector<int>>();
+    auto rb_j = topo_obj.attr("rb_atom_j").cast<std::vector<int>>();
+    auto rb_k = topo_obj.attr("rb_kind").cast<std::vector<int>>();
     t.rot_bonds.resize(rb_i.size());
     for (size_t k = 0; k < rb_i.size(); ++k)
         t.rot_bonds[k] = RotBond{rb_i[k], rb_j[k], rb_k[k]};
 
-    t.rot_bond_sides = topo_obj.attr("rot_bond_sides").cast<vector<vector<int>>>();
-    t.rot_bond_scale = topo_obj.attr("rot_bond_scale").cast<vector<double>>();
-    t.excl           = topo_obj.attr("excl").cast<vector<vector<int>>>();
-    t.disulfide_pairs = topo_obj.attr("disulfide_pairs").cast<vector<pair<int,int>>>();
-    t.concerted_pairs = topo_obj.attr("concerted_pairs").cast<vector<pair<int,int>>>();
+    t.rot_bond_sides = topo_obj.attr("rot_bond_sides").cast<std::vector<std::vector<int>>>();
+    t.rot_bond_scale = topo_obj.attr("rot_bond_scale").cast<std::vector<double>>();
+    t.excl           = topo_obj.attr("excl").cast<std::vector<std::vector<int>>>();
+    t.disulfide_pairs = topo_obj.attr("disulfide_pairs").cast<std::vector<std::pair<int,int>>>();
+    t.concerted_pairs = topo_obj.attr("concerted_pairs").cast<std::vector<std::pair<int,int>>>();
 
-    auto da   = topo_obj.attr("dih_a").cast<vector<int>>();
-    auto db   = topo_obj.attr("dih_b").cast<vector<int>>();
-    auto dc   = topo_obj.attr("dih_c").cast<vector<int>>();
-    auto dd   = topo_obj.attr("dih_d").cast<vector<int>>();
-    auto doff = topo_obj.attr("dih_term_offsets").cast<vector<int>>();
-    auto dv2  = topo_obj.attr("dih_term_v2").cast<vector<double>>();
-    auto dn   = topo_obj.attr("dih_term_n").cast<vector<int>>();
-    auto dg   = topo_obj.attr("dih_term_gamma").cast<vector<double>>();
+    auto da   = topo_obj.attr("dih_a").cast<std::vector<int>>();
+    auto db   = topo_obj.attr("dih_b").cast<std::vector<int>>();
+    auto dc   = topo_obj.attr("dih_c").cast<std::vector<int>>();
+    auto dd   = topo_obj.attr("dih_d").cast<std::vector<int>>();
+    auto doff = topo_obj.attr("dih_term_offsets").cast<std::vector<int>>();
+    auto dv2  = topo_obj.attr("dih_term_v2").cast<std::vector<double>>();
+    auto dn   = topo_obj.attr("dih_term_n").cast<std::vector<int>>();
+    auto dg   = topo_obj.attr("dih_term_gamma").cast<std::vector<double>>();
     t.dihedrals.resize(da.size());
     for (size_t k = 0; k < da.size(); ++k) {
         DihRecord& r = t.dihedrals[k];
@@ -390,7 +390,7 @@ static inline void rodrigues(double& px, double& py, double& pz,
     pz = oz + vz*cosD + cz*sinD + uz*dot*k;
 }
 
-static inline double dihedral_angle(const vector<Particle>& p,
+static inline double dihedral_angle(const std::vector<Particle>& p,
                                      int a, int b, int c, int d) noexcept
 {
     double b1x = p[a].x-p[b].x, b1y = p[a].y-p[b].y, b1z = p[a].z-p[b].z;
@@ -401,24 +401,24 @@ static inline double dihedral_angle(const vector<Particle>& p,
     double m1x = n1y*b2z-n1z*b2y, m1y = n1z*b2x-n1x*b2z, m1z = n1x*b2y-n1y*b2x;
     double x = n1x*n2x+n1y*n2y+n1z*n2z;
     double y = m1x*n2x+m1y*n2y+m1z*n2z;
-    return atan2(y, x);
+    return std::atan2(y, x);
 }
 
-static double dihedral_e(const vector<Particle>& p,
-                          const vector<DihRecord>& dihs) noexcept
+static double dihedral_e(const std::vector<Particle>& p,
+                          const std::vector<DihRecord>& dihs) noexcept
 {
     double E = 0.0;
     for (const auto& dr : dihs) {
         double phi = dihedral_angle(p, dr.a, dr.b, dr.c, dr.d);
         for (const auto& t : dr.terms)
-            E += t.V2 * (1.0 + cos((double)t.n * phi - t.gamma));
+            E += t.V2 * (1.0 + std::cos((double)t.n * phi - t.gamma));
     }
     return E;
 }
 
-static double dihedral_e_boundary(const vector<Particle>& p,
-                                   const vector<DihRecord>& dihs,
-                                   const vector<bool>& in_side) noexcept
+static double dihedral_e_boundary(const std::vector<Particle>& p,
+                                   const std::vector<DihRecord>& dihs,
+                                   const std::vector<bool>& in_side) noexcept
 {
     double E = 0.0;
     for (const auto& dr : dihs) {
@@ -429,32 +429,32 @@ static double dihedral_e_boundary(const vector<Particle>& p,
         if (!any_side || !any_fixed) continue;
         double phi = dihedral_angle(p, dr.a, dr.b, dr.c, dr.d);
         for (const auto& t : dr.terms)
-            E += t.V2 * (1.0 + cos((double)t.n * phi - t.gamma));
+            E += t.V2 * (1.0 + std::cos((double)t.n * phi - t.gamma));
     }
     return E;
 }
 
-static double ss_e(const vector<Particle>& p,
-                    const vector<pair<int,int>>& ss) noexcept
+static double ss_e(const std::vector<Particle>& p,
+                    const std::vector<std::pair<int,int>>& ss) noexcept
 {
     double E = 0.0;
     for (const auto& [i, j] : ss) {
         double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
-        double dr = sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+        double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
         E += K_SS * dr * dr;
     }
     return E;
 }
 
-static double ss_e_side(const vector<Particle>& p,
-                         const vector<pair<int,int>>& ss,
-                         const vector<bool>& in_side) noexcept
+static double ss_e_side(const std::vector<Particle>& p,
+                         const std::vector<std::pair<int,int>>& ss,
+                         const std::vector<bool>& in_side) noexcept
 {
     double E = 0.0;
     for (const auto& [i, j] : ss) {
         if (!in_side[i] && !in_side[j]) continue;
         double dx=p[i].x-p[j].x, dy=p[i].y-p[j].y, dz=p[i].z-p[j].z;
-        double dr = sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
+        double dr = std::sqrt(dx*dx+dy*dy+dz*dz) - R0_SS;
         E += K_SS * dr * dr;
     }
     return E;
@@ -668,15 +668,15 @@ void cross_pair_energy_kernel(int npairs,
  *     computed Born radii (as double) so the caller can adopt them as its
  *     incremental per-step state.
  * ═══════════════════════════════════════════════════════════════════════ */
-static double gpu_total_energy_topo(const vector<Particle>& p,
+static double gpu_total_energy_topo(const std::vector<Particle>& p,
                                      const NeighborList&           nl,
-                                     const vector<uint8_t>&   excluded,
-                                     vector<double>*          a_out)
+                                     const std::vector<uint8_t>&   excluded,
+                                     std::vector<double>*          a_out)
 {
     const int N      = static_cast<int>(p.size());
     const int npairs = static_cast<int>(nl.pi.size());
 
-    vector<float> hx(N), hy(N), hz(N), hq(N), hr(N), heps(N);
+    std::vector<float> hx(N), hy(N), hz(N), hq(N), hr(N), heps(N);
     for (int i = 0; i < N; ++i) {
         hx[i]   = static_cast<float>(p[i].x);
         hy[i]   = static_cast<float>(p[i].y);
@@ -742,7 +742,7 @@ static double gpu_total_energy_topo(const vector<Particle>& p,
     d_etot.download(&h_etot, 1);
 
     if (a_out) {
-        vector<float> ha(N);
+        std::vector<float> ha(N);
         d_a.download(ha.data(), N);
         a_out->resize(N);
         for (int i = 0; i < N; ++i) (*a_out)[i] = static_cast<double>(ha[i]);
@@ -784,17 +784,17 @@ struct ChainGpuState {
         d_etot.alloc(1);
     }
 
-    void upload_static(const vector<float>& q,
-                       const vector<float>& r,
-                       const vector<float>& eps) {
+    void upload_static(const std::vector<float>& q,
+                       const std::vector<float>& r,
+                       const std::vector<float>& eps) {
         d_q.upload(q.data(), N);
         d_r.upload(r.data(), N);
         d_eps.upload(eps.data(), N);
     }
 
-    void rebuild_pairs(const vector<int>& pi,
-                       const vector<int>& pj,
-                       const vector<uint8_t>& excluded) {
+    void rebuild_pairs(const std::vector<int>& pi,
+                       const std::vector<int>& pj,
+                       const std::vector<uint8_t>& excluded) {
         npairs = static_cast<int>(pi.size());
         d_pi.alloc(npairs > 0 ? npairs : 1);
         d_pj.alloc(npairs > 0 ? npairs : 1);
@@ -806,9 +806,9 @@ struct ChainGpuState {
         }
     }
 
-    void upload_state(const vector<float>& x, const vector<float>& y,
-                      const vector<float>& z, const vector<float>& a,
-                      const vector<uint8_t>& inside) {
+    void upload_state(const std::vector<float>& x, const std::vector<float>& y,
+                      const std::vector<float>& z, const std::vector<float>& a,
+                      const std::vector<uint8_t>& inside) {
         d_x.upload(x.data(), N);
         d_y.upload(y.data(), N);
         d_z.upload(z.data(), N);
@@ -839,13 +839,13 @@ struct ChainGpuState {
  * after the Rodrigues rotation) with the same mask, mirroring
  * physics_engine.cpp's cross_e(). */
 static double gpu_cross_energy(ChainGpuState& gpu,
-                               const vector<Particle>& st,
-                               const vector<double>& a,
-                               const vector<bool>& in_side)
+                               const std::vector<Particle>& st,
+                               const std::vector<double>& a,
+                               const std::vector<bool>& in_side)
 {
     int N = static_cast<int>(st.size());
-    vector<float>   hx(N), hy(N), hz(N), ha(N);
-    vector<uint8_t> hin(N);
+    std::vector<float>   hx(N), hy(N), hz(N), ha(N);
+    std::vector<uint8_t> hin(N);
     for (int i = 0; i < N; ++i) {
         hx[i]  = static_cast<float>(st[i].x);
         hy[i]  = static_cast<float>(st[i].y);
@@ -864,32 +864,32 @@ static double gpu_cross_energy(ChainGpuState& gpu,
  *     nonbonded sum offloaded to the GPU via ChainGpuState.
  * ═══════════════════════════════════════════════════════════════════════ */
 struct MCState {
-    vector<Particle> st;
+    std::vector<Particle> st;
     HostTopology           topo;
     NeighborList           nl;
-    vector<double>    a;
+    std::vector<double>    a;
     ChainGpuState          gpu;
-    vector<bool>      in_side;
+    std::vector<bool>      in_side;
     double curE    = 0.0;
     double cur_max = 0.12;
     int    acc_win = 0, tot_win = 0;
-    mt19937 rng{random_device{}()};
+    std::mt19937 rng{std::random_device{}()};
 };
 
 static void rebuild_state(MCState& S)
 {
     S.nl.build(S.st);
-    vector<uint8_t> excluded(S.nl.pi.size());
+    std::vector<uint8_t> excluded(S.nl.pi.size());
     for (size_t k = 0; k < S.nl.pi.size(); ++k)
         excluded[k] = S.topo.is_excluded(S.nl.pi[k], S.nl.pj[k]) ? 1 : 0;
 
-    vector<double> a_new;
+    std::vector<double> a_new;
     double e = gpu_total_energy_topo(S.st, S.nl, excluded, &a_new);
     if (!S.topo.dihedrals.empty())       e += dihedral_e(S.st, S.topo.dihedrals);
     if (!S.topo.disulfide_pairs.empty()) e += ss_e(S.st, S.topo.disulfide_pairs);
 
     S.curE = e;
-    S.a    = move(a_new);
+    S.a    = std::move(a_new);
     S.gpu.rebuild_pairs(S.nl.pi, S.nl.pj, excluded);
 }
 
@@ -897,7 +897,7 @@ static void init_chain(MCState& S)
 {
     int N = static_cast<int>(S.st.size());
     S.gpu.init(N);
-    vector<float> hq(N), hr(N), heps(N);
+    std::vector<float> hq(N), hr(N), heps(N);
     for (int i = 0; i < N; ++i) {
         hq[i]   = static_cast<float>(S.st[i].charge);
         hr[i]   = static_cast<float>(S.st[i].radius);
@@ -909,31 +909,31 @@ static void init_chain(MCState& S)
 }
 
 /* Standard torsion-angle MC move with lever-arm scaling (P1.5 parity). */
-static pair<bool,bool> try_torsion(MCState& S, double T)
+static std::pair<bool,bool> try_torsion(MCState& S, double T)
 {
     int nrb = static_cast<int>(S.topo.rot_bonds.size());
-    uniform_int_distribution<int> pick_rb(0, nrb - 1);
+    std::uniform_int_distribution<int> pick_rb(0, nrb - 1);
     int rb_idx = pick_rb(S.rng);
     const RotBond& rb = S.topo.rot_bonds[rb_idx];
-    const vector<int>& side = S.topo.rot_bond_sides[rb_idx];
+    const std::vector<int>& side = S.topo.rot_bond_sides[rb_idx];
     if (side.empty()) return {false, false};
 
     auto& st = S.st;
     double ax = st[rb.j].x-st[rb.i].x, ay = st[rb.j].y-st[rb.i].y, az = st[rb.j].z-st[rb.i].z;
-    double al = sqrt(ax*ax+ay*ay+az*az);
+    double al = std::sqrt(ax*ax+ay*ay+az*az);
     if (al < 1e-10) return {false, false};
     ax/=al; ay/=al; az/=al;
 
     double base_d = (rb.kind == BK_BACKBONE_PHI || rb.kind == BK_BACKBONE_PSI)
                     ? S.cur_max : S.cur_max * 2.5;
     base_d *= S.topo.rot_bond_scale[rb_idx];
-    double delta = uniform_real_distribution<double>(-base_d, base_d)(S.rng);
-    double cosD  = cos(delta), sinD = sin(delta);
+    double delta = std::uniform_real_distribution<double>(-base_d, base_d)(S.rng);
+    double cosD  = std::cos(delta), sinD = std::sin(delta);
 
     for (int k : side) S.in_side[k] = true;
 
-    vector<array<double,3>> old_pos(side.size());
-    vector<double>               old_born(side.size());
+    std::vector<std::array<double,3>> old_pos(side.size());
+    std::vector<double>               old_born(side.size());
     for (size_t k = 0; k < side.size(); ++k) {
         int idx = side[k];
         old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -957,11 +957,11 @@ static pair<bool,bool> try_torsion(MCState& S, double T)
     double new_ss    = S.topo.disulfide_pairs.empty() ? 0.0
                      : ss_e_side(st, S.topo.disulfide_pairs, S.in_side);
 
-    uniform_real_distribution<double> uni(0.0, 1.0);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
     bool accepted = false;
     double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
               + (new_dih-old_dih)   + (new_ss-old_ss);
-    if (dE < 0.0 || uni(S.rng) < exp(-dE / T)) {
+    if (dE < 0.0 || uni(S.rng) < std::exp(-dE / T)) {
         S.curE += dE;
         accepted = true;
     } else {
@@ -976,16 +976,16 @@ static pair<bool,bool> try_torsion(MCState& S, double T)
 }
 
 /* Crankshaft concerted move: +delta on phi then -delta on psi sharing one Ca. */
-static pair<bool,bool> try_crankshaft(MCState& S, double T)
+static std::pair<bool,bool> try_crankshaft(MCState& S, double T)
 {
     int ncp = static_cast<int>(S.topo.concerted_pairs.size());
     if (ncp == 0) return {false, false};
-    uniform_int_distribution<int> pick_cp(0, max(0, ncp - 1));
+    std::uniform_int_distribution<int> pick_cp(0, std::max(0, ncp - 1));
     int cp_idx = (ncp > 1) ? pick_cp(S.rng) : 0;
     int phi_k  = S.topo.concerted_pairs[cp_idx].first;
     int psi_k  = S.topo.concerted_pairs[cp_idx].second;
-    const vector<int>& phi_side = S.topo.rot_bond_sides[phi_k];
-    const vector<int>& psi_side = S.topo.rot_bond_sides[psi_k];
+    const std::vector<int>& phi_side = S.topo.rot_bond_sides[phi_k];
+    const std::vector<int>& psi_side = S.topo.rot_bond_sides[psi_k];
     if (phi_side.empty() || psi_side.empty()) return {false, false};
 
     auto& st = S.st;
@@ -994,12 +994,12 @@ static pair<bool,bool> try_crankshaft(MCState& S, double T)
     const RotBond& phi_rb = S.topo.rot_bonds[phi_k];
     double p1ox = st[phi_rb.i].x, p1oy = st[phi_rb.i].y, p1oz = st[phi_rb.i].z;
     double p1ax = st[phi_rb.j].x-p1ox, p1ay = st[phi_rb.j].y-p1oy, p1az = st[phi_rb.j].z-p1oz;
-    double p1l  = sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
+    double p1l  = std::sqrt(p1ax*p1ax+p1ay*p1ay+p1az*p1az);
     if (p1l < 1e-10) { for (int k : phi_side) S.in_side[k] = false; return {false, false}; }
     p1ax/=p1l; p1ay/=p1l; p1az/=p1l;
 
-    vector<array<double,3>> old_pos(phi_side.size());
-    vector<double>               old_born(phi_side.size());
+    std::vector<std::array<double,3>> old_pos(phi_side.size());
+    std::vector<double>               old_born(phi_side.size());
     for (size_t k = 0; k < phi_side.size(); ++k) {
         int idx = phi_side[k];
         old_pos[k]  = {st[idx].x, st[idx].y, st[idx].z};
@@ -1011,8 +1011,8 @@ static pair<bool,bool> try_crankshaft(MCState& S, double T)
     double old_ss    = S.topo.disulfide_pairs.empty() ? 0.0
                      : ss_e_side(st, S.topo.disulfide_pairs, S.in_side);
 
-    double delta = uniform_real_distribution<double>(-S.cur_max, S.cur_max)(S.rng);
-    double cosD  = cos(delta), sinD = sin(delta);
+    double delta = std::uniform_real_distribution<double>(-S.cur_max, S.cur_max)(S.rng);
+    double cosD  = std::cos(delta), sinD = std::sin(delta);
 
     for (int k : phi_side)
         rodrigues(st[k].x, st[k].y, st[k].z, p1ox, p1oy, p1oz, p1ax, p1ay, p1az, cosD, sinD);
@@ -1020,7 +1020,7 @@ static pair<bool,bool> try_crankshaft(MCState& S, double T)
     const RotBond& psi_rb = S.topo.rot_bonds[psi_k];
     double p2ox = st[psi_rb.i].x, p2oy = st[psi_rb.i].y, p2oz = st[psi_rb.i].z;
     double p2ax = st[psi_rb.j].x-p2ox, p2ay = st[psi_rb.j].y-p2oy, p2az = st[psi_rb.j].z-p2oz;
-    double p2l  = sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
+    double p2l  = std::sqrt(p2ax*p2ax+p2ay*p2ay+p2az*p2az);
     if (p2l < 1e-10) {
         for (size_t k = 0; k < phi_side.size(); ++k) {
             int idx = phi_side[k];
@@ -1041,11 +1041,11 @@ static pair<bool,bool> try_crankshaft(MCState& S, double T)
     double new_ss    = S.topo.disulfide_pairs.empty() ? 0.0
                      : ss_e_side(st, S.topo.disulfide_pairs, S.in_side);
 
-    uniform_real_distribution<double> uni(0.0, 1.0);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
     bool accepted = false;
     double dE = (new_cross-old_cross) + (new_sasa-old_sasa)
               + (new_dih-old_dih)   + (new_ss-old_ss);
-    if (dE < 0.0 || uni(S.rng) < exp(-dE / T)) {
+    if (dE < 0.0 || uni(S.rng) < std::exp(-dE / T)) {
         S.curE += dE;
         accepted = true;
     } else {
@@ -1062,7 +1062,7 @@ static pair<bool,bool> try_crankshaft(MCState& S, double T)
 static void run_mc_steps(MCState& S, int steps, double T)
 {
     int ncp = static_cast<int>(S.topo.concerted_pairs.size());
-    uniform_real_distribution<double> uni(0.0, 1.0);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
     constexpr int    TUNE_FREQ  = 200;
     constexpr double TARGET_LO  = 0.28, TARGET_HI = 0.52;
     constexpr double SCALE_UP   = 1.06,  SCALE_DOWN = 0.94;
@@ -1078,8 +1078,8 @@ static void run_mc_steps(MCState& S, int steps, double T)
             S.acc_win += accepted ? 1 : 0;
             if (++S.tot_win == TUNE_FREQ) {
                 double rate = (double)S.acc_win / TUNE_FREQ;
-                if      (rate > TARGET_HI) S.cur_max = min(ANGLE_MAX, S.cur_max * SCALE_UP);
-                else if (rate < TARGET_LO) S.cur_max = max(ANGLE_MIN, S.cur_max * SCALE_DOWN);
+                if      (rate > TARGET_HI) S.cur_max = std::min(ANGLE_MAX, S.cur_max * SCALE_UP);
+                else if (rate < TARGET_LO) S.cur_max = std::max(ANGLE_MIN, S.cur_max * SCALE_DOWN);
                 S.acc_win = S.tot_win = 0;
             }
         }
@@ -1095,27 +1095,27 @@ public:
         int ndev = 0;
         cudaError_t err = cudaGetDeviceCount(&ndev);
         if (err != cudaSuccess || ndev == 0) {
-            throw runtime_error(
+            throw std::runtime_error(
                 "protein_physics_cuda: No CUDA-capable GPU found. "
                 "Use the CPU module (protein_physics) instead.");
         }
     }
 
-    static string device_name() {
+    static std::string device_name() {
         cudaDeviceProp prop{};
         CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-        return string(prop.name);
+        return std::string(prop.name);
     }
 
     /* calculate_potential: full GB/DH/LJ/SASA(+dihedral+SS if topo given)
      * energy for an arbitrary particle list. Rebuilds the neighbor list
      * from scratch every call — use only for final evaluation, not inside
      * a hot loop. */
-    double calculate_potential(const vector<Particle>& particles,
+    double calculate_potential(const std::vector<Particle>& particles,
                                const HostTopology* topo = nullptr) {
         if (particles.empty()) return 0.0;
         NeighborList nl; nl.build(particles);
-        vector<uint8_t> excluded(nl.pi.size(), 0);
+        std::vector<uint8_t> excluded(nl.pi.size(), 0);
         if (topo)
             for (size_t k = 0; k < nl.pi.size(); ++k)
                 excluded[k] = topo->is_excluded(nl.pi[k], nl.pj[k]) ? 1 : 0;
@@ -1128,18 +1128,18 @@ public:
 
     /* generate_ensemble: run 'ncand' independent torsion-angle MC chains,
      * each for 'steps' steps. Returns the ncand final conformations. */
-    vector<vector<Particle>> generate_ensemble(
-        const vector<Particle>& init,
+    std::vector<std::vector<Particle>> generate_ensemble(
+        const std::vector<Particle>& init,
         const HostTopology& topo,
         int ncand, int steps,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw invalid_argument("initial_state empty");
-        if (ncand <= 0 || steps <= 0) throw invalid_argument("ncand/steps must be positive");
-        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
+        if (ncand <= 0 || steps <= 0) throw std::invalid_argument("ncand/steps must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
 
-        vector<vector<Particle>> ens(ncand);
+        std::vector<std::vector<Particle>> ens(ncand);
         auto run_one = [&](int c) {
             MCState S;
             S.st      = init;
@@ -1147,7 +1147,7 @@ public:
             S.cur_max = max_angle;
             init_chain(S);
             run_mc_steps(S, steps, T);
-            ens[c] = move(S.st);
+            ens[c] = std::move(S.st);
         };
 
 #ifdef _OPENMP
@@ -1168,18 +1168,18 @@ public:
      * 120 times, each iteration re-marshalling the full particle array
      * and reallocating GPU buffers from scratch across the Python<->C++
      * boundary. */
-    pair<vector<vector<Particle>>, vector<double>>
+    std::pair<std::vector<std::vector<Particle>>, std::vector<double>>
     run_landscape_trajectory(
-        const vector<Particle>& init,
+        const std::vector<Particle>& init,
         const HostTopology& topo,
         int n_snapshots, int steps_per_snapshot,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw invalid_argument("initial_state empty");
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
         if (n_snapshots <= 0 || steps_per_snapshot <= 0)
-            throw invalid_argument("n_snapshots/steps_per_snapshot must be positive");
-        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
+            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
 
         MCState S;
         S.st      = init;
@@ -1187,8 +1187,8 @@ public:
         S.cur_max = max_angle;
         init_chain(S);
 
-        vector<vector<Particle>> snapshots;
-        vector<double>                energies;
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
         snapshots.reserve(n_snapshots);
         energies.reserve(n_snapshots);
 
@@ -1225,18 +1225,18 @@ public:
      * verified hot path) and this file's existing factoring already makes
      * the duplication cheap (~20 lines via init_chain/run_mc_steps, not the
      * ~220-line inline body the CPU engine has). */
-    tuple<vector<vector<Particle>>, vector<double>, double>
+    std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double>
     run_landscape_segment(
-        const vector<Particle>& init,
+        const std::vector<Particle>& init,
         const HostTopology& topo,
         int n_snapshots, int steps_per_snapshot,
         double T = 0.6,
         double max_angle = 0.12)
     {
-        if (init.empty()) throw invalid_argument("initial_state empty");
+        if (init.empty()) throw std::invalid_argument("initial_state empty");
         if (n_snapshots <= 0 || steps_per_snapshot <= 0)
-            throw invalid_argument("n_snapshots/steps_per_snapshot must be positive");
-        if (topo.rot_bonds.empty()) throw invalid_argument("topology has no rotatable bonds");
+            throw std::invalid_argument("n_snapshots/steps_per_snapshot must be positive");
+        if (topo.rot_bonds.empty()) throw std::invalid_argument("topology has no rotatable bonds");
 
         MCState S;
         S.st      = init;
@@ -1244,8 +1244,8 @@ public:
         S.cur_max = max_angle;
         init_chain(S);
 
-        vector<vector<Particle>> snapshots;
-        vector<double>                energies;
+        std::vector<std::vector<Particle>> snapshots;
+        std::vector<double>                energies;
         snapshots.reserve(n_snapshots);
         energies.reserve(n_snapshots);
 
@@ -1260,12 +1260,12 @@ public:
     /* lowest_energy_structure: scan an ensemble, return the lowest-energy
      * conformation. O(ncand) calculate_potential calls (no topology, same
      * as the CPU engine's behaviour) — call only once after MC finishes. */
-    vector<Particle> lowest_energy_structure(
-        const vector<vector<Particle>>& ens)
+    std::vector<Particle> lowest_energy_structure(
+        const std::vector<std::vector<Particle>>& ens)
     {
         if (ens.empty())
-            throw invalid_argument("ensemble empty");
-        return *min_element(
+            throw std::invalid_argument("ensemble empty");
+        return *std::min_element(
             ens.begin(), ens.end(),
             [this](const auto& a, const auto& b) {
                 return calculate_potential(a) < calculate_potential(b);
@@ -1322,7 +1322,7 @@ PYBIND11_MODULE(protein_physics_cuda, m)
     py::class_<PhysicsEngine>(m, "PhysicsEngine", py::module_local())
         .def(py::init<>())
         .def("calculate_potential",
-             [](PhysicsEngine& self, const vector<Particle>& particles,
+             [](PhysicsEngine& self, const std::vector<Particle>& particles,
                 py::object topo_obj) -> double {
                  if (topo_obj.is_none()) {
                      py::gil_scoped_release release;
@@ -1336,9 +1336,9 @@ PYBIND11_MODULE(protein_physics_cuda, m)
              py::arg("topology") = py::none())
         .def("generate_ensemble",
              [](PhysicsEngine& self,
-                const vector<Particle>& init, py::object topo_obj,
+                const std::vector<Particle>& init, py::object topo_obj,
                 int ncand, int steps,
-                double T, double max_angle) -> vector<vector<Particle>> {
+                double T, double max_angle) -> std::vector<std::vector<Particle>> {
                  HostTopology topo = extract_topology(topo_obj);
                  py::gil_scoped_release release;
                  return self.generate_ensemble(init, topo, ncand, steps, T, max_angle);
@@ -1351,10 +1351,10 @@ PYBIND11_MODULE(protein_physics_cuda, m)
              py::arg("max_angle")   = 0.12)
         .def("run_landscape_trajectory",
              [](PhysicsEngine& self,
-                const vector<Particle>& init, py::object topo_obj,
+                const std::vector<Particle>& init, py::object topo_obj,
                 int n_snapshots, int steps_per_snapshot,
                 double T, double max_angle)
-                -> pair<vector<vector<Particle>>, vector<double>> {
+                -> std::pair<std::vector<std::vector<Particle>>, std::vector<double>> {
                  HostTopology topo = extract_topology(topo_obj);
                  py::gil_scoped_release release;
                  return self.run_landscape_trajectory(
@@ -1368,10 +1368,10 @@ PYBIND11_MODULE(protein_physics_cuda, m)
              py::arg("max_angle")   = 0.12)
         .def("run_landscape_segment",
              [](PhysicsEngine& self,
-                const vector<Particle>& init, py::object topo_obj,
+                const std::vector<Particle>& init, py::object topo_obj,
                 int n_snapshots, int steps_per_snapshot,
                 double T, double max_angle)
-                -> tuple<vector<vector<Particle>>, vector<double>, double> {
+                -> std::tuple<std::vector<std::vector<Particle>>, std::vector<double>, double> {
                  HostTopology topo = extract_topology(topo_obj);
                  py::gil_scoped_release release;
                  return self.run_landscape_segment(
@@ -1384,7 +1384,7 @@ PYBIND11_MODULE(protein_physics_cuda, m)
              py::arg("temperature") = 0.6,
              py::arg("max_angle")   = 0.12)
         .def("lowest_energy_structure",
-             [](PhysicsEngine& self, const vector<vector<Particle>>& ens) {
+             [](PhysicsEngine& self, const std::vector<std::vector<Particle>>& ens) {
                  py::gil_scoped_release release;
                  return self.lowest_energy_structure(ens);
              },
